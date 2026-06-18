@@ -1,0 +1,61 @@
+# Changelog
+
+## 0.1.0 - 2026-06-14
+
+- Add normalized scorecard review contracts for `review`, plugin-managed `multi-review`, `adversarial-review`, and `plan-review`.
+- Add `plan --taskset`, `plan-review`, and bounded advisory `assisted-review` quality-loop commands.
+- Add workspace-bound plan-file reading, repo-external taskset state, validation-evidence blocks, project-instruction advisory context, and round summary indexes.
+- Harden `agy` script-wrapper execution by resolving POSIX shebang scripts through their interpreters before spawning.
+- Add quality-loop skills, natural-language routing guards, release-check guards, and fake-CLI regression tests.
+
+## 0.6.1 - 2026-06-13
+
+- Add a file-backed global resource governor for foreground reviews, Stop gates, multi-review fan-out, background jobs, and reserved workers.
+- Add bounded spawn retry handling for transient local process pressure (`EAGAIN`, `EMFILE`, `ENFILE`, `ENOBUFS`), including POSIX supervisor retry for inner `agy` startup pressure.
+- Add release-check and pytest coverage for resource-governor and spawn-retry safety.
+
+## 0.6.0 - 2026-06-12
+
+- Added agy-native capability, model catalog, and outcome classification modules.
+- Added cheap `doctor` diagnostics for local `agy`, model catalog, provider policy, and hook compatibility.
+- Hardened background job lifecycle with bounded worktree fingerprints, idempotency keys, heartbeats, and safer unread-result handling.
+- Added bounded process probe diagnostics for cancellation and lifecycle decisions.
+- Added release-check guards to prevent Claude-native/Fable/SDK behavior from leaking into Antigravity.
+
+## 0.5.4 - 2026-06-09
+
+- Resolve generated GitHub Actions workflows through the installed Antigravity plugin root instead of repo-relative runtime paths.
+- Allow `release-check` to run from an installed plugin cache where repository-level README/docs files are absent.
+- Add release guards for installed-plugin release checks and workflow plugin-root resolution.
+
+## 0.5.3 - 2026-06-08
+
+- Reframe Antigravity skills around natural-language model routing so users can ask for review, planning, rescue, and Claude-through-Antigravity without writing internal CLI flags.
+- Add release-check and pytest guards that preserve Gemini-default provider behavior, explicit Claude-through-Antigravity selection, and rejection of GPT/OpenAI model labels.
+- Keep existing `agy` invocation, model validation, hooks, workflows, and safety boundaries unchanged.
+
+## 0.5.2 - 2026-06-08
+
+- Replace the Antigravity plugin logo and composer icon with a dual-tile Antigravity + Claude Code joint-brand design.
+- Keep existing `agy` behavior, model-provider selection, hooks, workflows, release checks, and safety boundaries unchanged.
+
+## 0.5.1 - 2026-06-08
+
+- Refresh the Antigravity plugin logo and composer icon using the official Antigravity app arch mark as the base visual element.
+- Keep existing `agy` behavior, model-provider selection, hooks, workflows, release checks, and safety boundaries unchanged.
+
+## 0.5.0 - 2026-06-08
+
+- Promote Antigravity for Claude to the mature plugin-managed workflow surface: structured review output, sanitized reports, role packs, background jobs, status/result/cancel, mailbox, leases, lifecycle hooks, GitHub Actions workflow rendering and validation, release checks, and opt-in real smoke.
+- Document the explicit boundary that Antigravity for Claude uses `agy` only and does not claim Claude SDK, Gemini native-agent, or ultrareview parity.
+- Clarify that Claude-through-Antigravity is available only through explicit Antigravity provider selection.
+- Document that CI review workflows require an authenticated `agy` command and that real smoke remains opt-in.
+- Versions 0.2.0 through 0.4.0 were internal pre-release iterations and were not published as standalone marketplace releases.
+
+## 0.1.0 - 2026-06-07
+
+- Initial Antigravity for Claude plugin.
+- Document the local Antigravity CLI (`agy`) requirement and supported discovery through `agy`, `AGY_CLI_PATH`, or `ANTIGRAVITY_CLI_PATH`.
+- Add explicit Gemini/Claude model-provider switching, including Claude-through-Antigravity model selection.
+- Reject GPT/OpenAI model labels as unsupported for this plugin.
+- Cover the initial command surface: `setup`, `capabilities`, `review`, `adversarial-review`, `multi-review`, `plan`, `rescue`, `review-gate`, `real-smoke`, and `release-check`.

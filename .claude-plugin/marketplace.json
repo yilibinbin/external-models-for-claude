@@ -1,0 +1,46 @@
+{
+  "name": "external-models-for-claude",
+  "owner": {
+    "name": "fanghao",
+    "url": "https://github.com/yilibinbin"
+  },
+  "metadata": {
+    "description": "Claude Code marketplace for external model workflows: OpenAI Codex, Gemini CLI, and Google Antigravity.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "codex",
+      "source": "./plugins/codex",
+      "description": "OpenAI official plugin to use Codex from Claude Code for review and task delegation.",
+      "version": "1.0.4",
+      "category": "Productivity",
+      "author": {
+        "name": "OpenAI",
+        "url": "https://github.com/openai/codex-plugin-cc"
+      }
+    },
+    {
+      "name": "gemini-for-claude",
+      "source": "./plugins/gemini-for-claude",
+      "description": "Use Gemini CLI from Claude Code for read-only review, planning, scorecards, role-pack review teams, jobs, and opt-in stop gates.",
+      "version": "0.1.0",
+      "category": "Productivity",
+      "author": {
+        "name": "fanghao",
+        "url": "https://github.com/yilibinbin"
+      }
+    },
+    {
+      "name": "antigravity-for-claude",
+      "source": "./plugins/antigravity-for-claude",
+      "description": "Use Antigravity CLI from Claude Code for read-only review, planning, scorecards, jobs, and explicit Gemini or Claude model-provider selection.",
+      "version": "0.1.0",
+      "category": "Productivity",
+      "author": {
+        "name": "fanghao",
+        "url": "https://github.com/yilibinbin"
+      }
+    }
+  ]
+}

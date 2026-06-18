@@ -1,0 +1,3222 @@
+#!/usr/bin/env node
+
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import {
+  antigravityPreflight,
+  antigravityModelDiagnostics,
+  antigravityPrint as rawAntigravityPrint,
+  antigravityPrintAsync as rawAntigravityPrintAsync,
+  MODEL_PROVIDER_ENV,
+  MODEL_ENV,
+  normalizedModelProvider,
+  selectedModel
+} from "./lib/antigravity-runtime.mjs";
+import { classifyAgyOutcome } from "./lib/agy-outcome.mjs";
+import {
+  cancelJob,
+  claimReservedJob,
+  createJob,
+  findReusableJob,
+  finishJob,
+  listJobs,
+  markJobMetadataPersistenceFailed,
+  markJobRunning,
+  markJobViewed,
+  readJob,
+  RESERVABLE_COMMANDS,
+  reserveJob,
+  updateJob,
+  withWorkspaceJobLock
+} from "./lib/jobs.mjs";
+import { captureProcessIdentity } from "./lib/process.mjs";
+import {
+  classifyJobLiveness,
+  deriveJobIdempotencyKey,
+  isTerminalJobStatus,
+  jobHeartbeatIntervalMs,
+  maxActiveJobs
+} from "./lib/job-lifecycle.mjs";
+import { worktreeFingerprint } from "./lib/worktree-fingerprint.mjs";
+import { antigravityDoctor } from "./lib/doctor.mjs";
+import {
+  renderWorkflow,
+  validateWorkflow,
+  writeWorkflow
+} from "./lib/github-actions.mjs";
+import {
+  claimLease,
+  listLeases,
+  releaseLease
+} from "./lib/leases.mjs";
+import {
+  listMailboxThreads,
+  postMailboxMessage,
+  showMailboxThread
+} from "./lib/mailbox.mjs";
+import {
+  readPromptTemplate,
+  renderTemplate
+} from "./lib/prompt-template.mjs";
+import {
+  latestReport,
+  operationReport,
+  writeOperationReport
+} from "./lib/reports.mjs";
+import {
+  BUILT_IN_ROLE_PACKS,
+  REVIEW_ROLES,
+  resolveRoles
+} from "./lib/role-packs.mjs";
+import {
+  appendStructuredReviewInstructions,
+  extractJsonObject,
+  validateStructuredReview
+} from "./lib/structured-output.mjs";
+import {
+  PLUGIN_VERSION,
+  RELEASE_REF
+} from "./lib/version.mjs";
+import {
+  acquireResourceLease,
+  capacityBlockedMessage,
+  capacityBlockedResult,
+  ensureResourceLease,
+  multiReviewConcurrency,
+  transferResourceLease,
+  withResourceLeaseAsync,
+  withResourceLeaseSync
+} from "./lib/resource-governor.mjs";
+import { spawnSyncWithRetry } from "./lib/spawn-retry.mjs";
+import { normalizeScorecardOutput } from "./lib/scorecard.mjs";
+import { saveTaskset, readTaskset } from "./lib/tasksets.mjs";
+import { loadValidationEvidence, renderValidationEvidenceBlock } from "./lib/validation-evidence.mjs";
+import { DEFAULT_PROJECT_INSTRUCTION_FILES, renderProjectInstructionsBlock } from "./lib/project-instructions.mjs";
+import { readWorkspaceBoundPlanFile } from "./lib/plan-review-file.mjs";
+import { writeRoundSummary } from "./lib/summary-index.mjs";
+import { nextAssistedReviewAction } from "./lib/assisted-review.mjs";
+import { classifyProviderFailure } from "./lib/failure-taxonomy.mjs";
+
+const VALID_COMMANDS = new Set([
+  "setup",
+  "capabilities",
+  "doctor",
+  "review",
+  "adversarial-review",
+  "multi-review",
+  "plan-review",
+  "roles",
+  "plan",
+  "assisted-review",
+  "rescue",
+  "report",
+  "jobs",
+  "status",
+  "result",
+  "cancel",
+  "mailbox",
+  "leases",
+  "github-actions",
+  "reserve-job",
+  "run-reserved-job",
+  "__run-job",
+  "__command-probe",
+  "review-gate",
+  "real-smoke",
+  "release-check"
+]);
+const USER_VISIBLE_COMMANDS = [...VALID_COMMANDS].filter((command) => !command.startsWith("__"));
+const REVIEW_COMMANDS = new Set(["review", "adversarial-review", "plan", "rescue"]);
+const VALID_MODEL_PROVIDERS = new Set(["gemini", "claude"]);
+const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const REPO_ROOT_DIR = path.resolve(ROOT_DIR, "..", "..");
+const COMPANION_PATH = fileURLToPath(import.meta.url);
+const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const REVIEW_GATE_TIMEOUT_ENV = "ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE_TIMEOUT_MS";
+const REVIEW_GATE_DEFAULT_TIMEOUT_MS = 14 * 60 * 1000;
+const REVIEW_GATE_WRAPPER_TIMEOUT_MS = 870 * 1000;
+const REVIEW_GATE_WRAPPER_GRACE_MS = 30 * 1000;
+const BACKGROUND_SUPERVISOR_TIMEOUT_GRACE_MS = 5 * 1000;
+const CHILD_OUTPUT_MAX_BUFFER = 20 * 1024 * 1024;
+const GIT_TIMEOUT_MS = 30 * 1000;
+const GIT_MAX_BUFFER = 2 * 1024 * 1024;
+const GIT_OUTPUT_EXCERPT_BYTES = 64 * 1024;
+const UNTRACKED_FILE_LIMIT = 10;
+const UNTRACKED_BYTES_PER_FILE = 16 * 1024;
+const GIT_REPOSITORY_ENV_KEYS = new Set([
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_CONFIG",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_NOSYSTEM",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_DIR",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  "GIT_INDEX_FILE",
+  "GIT_NAMESPACE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_WORK_TREE"
+]);
+
+function spawnSync(command, args, options) {
+  return spawnSyncWithRetry(command, args, options);
+}
+
+function antigravityPrint(prompt, options = {}, env = process.env) {
+  return withResourceLeaseSync("model-call", {
+    env,
+    command: "agy",
+    ttlMs: (options.timeout || DEFAULT_TIMEOUT_MS) + 60_000
+  }, () => rawAntigravityPrint(prompt, options, env));
+}
+
+async function antigravityPrintAsync(prompt, options = {}, env = process.env) {
+  return await withResourceLeaseAsync("model-call", {
+    env,
+    command: "agy",
+    ttlMs: (options.timeout || DEFAULT_TIMEOUT_MS) + 60_000
+  }, async () => rawAntigravityPrintAsync(prompt, options, env));
+}
+
+function usage(command = "") {
+  if (command === "review") {
+    return "Usage: antigravity-companion.mjs review [--model-provider gemini|claude] [--model <label>] [--scorecard] [--structured] [--json] [focus]\n";
+  }
+  if (command === "multi-review") {
+    return "Usage: antigravity-companion.mjs multi-review [--model-provider gemini|claude] [--model <label>] [--scorecard] [--roles correctness,security,tests,release,adversarial] [--role-pack default|security|release] [--use-mailbox] [--advisory-leases] [focus]\n";
+  }
+  if (command === "plan-review") {
+    return "Usage: antigravity-companion.mjs plan-review --plan <file> [--model-provider gemini|claude] [--model <label>] [--roles correctness,security,tests,release,adversarial] [--scorecard [--json]] [focus]\n";
+  }
+  if (command === "assisted-review") {
+    return "Usage: antigravity-companion.mjs assisted-review [--model-provider gemini|claude] [--model <label>] [--taskset <id>] [--max-review-rounds 1..3] [focus]\n";
+  }
+  if (command === "roles") {
+    return "Usage: antigravity-companion.mjs roles --json\n";
+  }
+  if (command === "doctor") {
+    return "Usage: antigravity-companion.mjs doctor [--json] [--model-provider gemini|claude] [--model <label>]\n";
+  }
+  if (command === "report") {
+    return "Usage: antigravity-companion.mjs report --latest\n";
+  }
+  if (command === "mailbox") {
+    return "Usage: antigravity-companion.mjs mailbox <list|post|show> [--thread <id>] [--message <text>]\n";
+  }
+  if (command === "leases") {
+    return "Usage: antigravity-companion.mjs leases <claim|list|release> [--role <role>] [--ttl-seconds <n>] [--id <lease-id>]\n";
+  }
+  if (command === "github-actions") {
+    return "Usage: antigravity-companion.mjs github-actions <render|init|validate> [--force] [--model-provider gemini|claude] [--model <label>] [--ref <tag>] [--timeout-minutes <n>] [--path <workflow-path>]\n";
+  }
+  return "Usage: antigravity-companion.mjs <setup|capabilities|doctor|review|adversarial-review|multi-review|plan-review|roles|plan|assisted-review|rescue|report|jobs|status|result|cancel|mailbox|leases|github-actions|reserve-job|run-reserved-job|review-gate|real-smoke|release-check|__command-probe> [args]\n";
+}
+
+function readOptionValue(tokens, index, option) {
+  const value = tokens[index + 1];
+  if (value === undefined || value.startsWith("--")) {
+    throw new Error(`Missing value for ${option}.`);
+  }
+  return value;
+}
+
+function parseArgs(rawArgs) {
+  const args = {
+    positional: [],
+    modelProvider: undefined,
+    model: undefined,
+    roles: undefined,
+    rolePack: undefined,
+    help: false,
+    timeout: DEFAULT_TIMEOUT_MS,
+    quick: false,
+    full: false,
+    structured: false,
+    json: false,
+    scorecard: false,
+    validationEvidence: undefined,
+    rules: undefined,
+    plan: "",
+    taskset: false,
+    tasksetId: "",
+    maxReviewRounds: undefined,
+    latest: false,
+    background: false,
+    useMailbox: false,
+    advisoryLeases: false,
+    role: "",
+    ttlSeconds: undefined,
+    thread: "",
+    message: "",
+    id: "",
+    force: false,
+    ref: "",
+    timeoutMinutes: 0,
+    workflowPath: ""
+  };
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const token = rawArgs[index];
+    if (token === "--model-provider") {
+      args.modelProvider = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--model-provider=")) {
+      args.modelProvider = token.slice("--model-provider=".length);
+    } else if (token === "--model") {
+      args.model = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--model=")) {
+      args.model = token.slice("--model=".length);
+    } else if (token === "--roles") {
+      args.roles = readOptionValue(rawArgs, index, token)
+        .split(",")
+        .map((role) => role.trim())
+        .filter(Boolean);
+      index += 1;
+    } else if (token.startsWith("--roles=")) {
+      args.roles = token.slice("--roles=".length)
+        .split(",")
+        .map((role) => role.trim())
+        .filter(Boolean);
+    } else if (token === "--role-pack") {
+      args.rolePack = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--role-pack=")) {
+      args.rolePack = token.slice("--role-pack=".length);
+    } else if (token === "--help" || token === "-h" || token === "help") {
+      args.help = true;
+    } else if (token === "--quick") {
+      args.quick = true;
+    } else if (token === "--full") {
+      args.full = true;
+    } else if (token === "--structured") {
+      args.structured = true;
+    } else if (token === "--json") {
+      args.json = true;
+      args.structured = true;
+    } else if (token === "--scorecard") {
+      args.scorecard = true;
+    } else if (["--validation-log", "--test-summary", "--ci-summary", "--screenshot-summary"].includes(token)) {
+      args.validationEvidence = [...(args.validationEvidence ?? []), {
+        kind: token.slice(2),
+        file: readOptionValue(rawArgs, index, token)
+      }];
+      index += 1;
+    } else if (token === "--rules") {
+      args.rules = [...(args.rules ?? []), readOptionValue(rawArgs, index, token)];
+      index += 1;
+    } else if (token === "--plan") {
+      args.plan = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token === "--taskset") {
+      const maybeTasksetId = rawArgs[index + 1];
+      if (maybeTasksetId === undefined || maybeTasksetId.startsWith("--") || !maybeTasksetId.startsWith("ts-")) {
+        args.taskset = true;
+      } else {
+        args.tasksetId = readOptionValue(rawArgs, index, token);
+        index += 1;
+      }
+    } else if (token === "--max-review-rounds") {
+      const value = Number(readOptionValue(rawArgs, index, token));
+      if (!Number.isInteger(value) || value < 1 || value > 3) {
+        throw new Error("--max-review-rounds must be an integer from 1 to 3.");
+      }
+      args.maxReviewRounds = value;
+      index += 1;
+    } else if (token === "--latest") {
+      args.latest = true;
+    } else if (token === "--background") {
+      args.background = true;
+    } else if (token === "--use-mailbox") {
+      args.useMailbox = true;
+    } else if (token === "--advisory-leases") {
+      args.advisoryLeases = true;
+    } else if (token === "--role") {
+      args.role = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--role=")) {
+      args.role = token.slice("--role=".length);
+    } else if (token === "--ttl-seconds") {
+      args.ttlSeconds = Number(readOptionValue(rawArgs, index, token));
+      index += 1;
+    } else if (token.startsWith("--ttl-seconds=")) {
+      args.ttlSeconds = Number(token.slice("--ttl-seconds=".length));
+    } else if (token === "--thread") {
+      args.thread = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--thread=")) {
+      args.thread = token.slice("--thread=".length);
+    } else if (token === "--message") {
+      args.message = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--message=")) {
+      args.message = token.slice("--message=".length);
+    } else if (token === "--id") {
+      args.id = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--id=")) {
+      args.id = token.slice("--id=".length);
+    } else if (token === "--force") {
+      args.force = true;
+    } else if (token === "--ref") {
+      args.ref = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--ref=")) {
+      args.ref = token.slice("--ref=".length);
+    } else if (token === "--timeout-minutes") {
+      args.timeoutMinutes = Number(readOptionValue(rawArgs, index, token));
+      index += 1;
+    } else if (token.startsWith("--timeout-minutes=")) {
+      args.timeoutMinutes = Number(token.slice("--timeout-minutes=".length));
+    } else if (token === "--path") {
+      args.workflowPath = readOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--path=")) {
+      args.workflowPath = token.slice("--path=".length);
+    } else if (token === "--timeout-seconds") {
+      const value = Number(readOptionValue(rawArgs, index, token));
+      if (!Number.isFinite(value) || value < 1 || value > 3600) {
+        throw new Error("--timeout-seconds must be between 1 and 3600.");
+      }
+      args.timeout = Math.ceil(value * 1000);
+      index += 1;
+    } else if (token.startsWith("--timeout-seconds=")) {
+      const value = Number(token.slice("--timeout-seconds=".length));
+      if (!Number.isFinite(value) || value < 1 || value > 3600) {
+        throw new Error("--timeout-seconds must be between 1 and 3600.");
+      }
+      args.timeout = Math.ceil(value * 1000);
+    } else {
+      args.positional.push(token);
+    }
+  }
+
+  if (args.modelProvider !== undefined) {
+    args.modelProvider = String(args.modelProvider).trim().toLowerCase();
+    if (!VALID_MODEL_PROVIDERS.has(args.modelProvider)) {
+      throw new Error(`Invalid --model-provider "${args.modelProvider}". Valid values: gemini, claude.`);
+    }
+  }
+  return args;
+}
+
+const SCORECARD_COMMANDS = new Set(["review", "multi-review", "adversarial-review", "plan-review", "assisted-review"]);
+const VALIDATION_EVIDENCE_COMMANDS = new Set(["review", "multi-review", "adversarial-review", "plan", "plan-review", "assisted-review"]);
+const RULE_COMMANDS = new Set(["review", "multi-review", "adversarial-review", "plan", "plan-review", "assisted-review", "rescue"]);
+
+function validateQualityLoopArgs(command, args) {
+  if (args.scorecard && !SCORECARD_COMMANDS.has(command)) {
+    throw new Error("--scorecard is only valid for review, multi-review, adversarial-review, plan-review, and assisted-review.");
+  }
+  if (command === "plan-review" && args.json && !args.scorecard) {
+    throw new Error("--json is only valid for plan-review when --scorecard is also set.");
+  }
+  if (args.validationEvidence && !VALIDATION_EVIDENCE_COMMANDS.has(command)) {
+    throw new Error("--validation-log, --test-summary, --ci-summary, and --screenshot-summary are only valid for review, multi-review, adversarial-review, plan, plan-review, and assisted-review.");
+  }
+  if (args.rules && !RULE_COMMANDS.has(command)) {
+    throw new Error("--rules is only valid for prompt commands.");
+  }
+  if (args.plan && command !== "plan-review") {
+    throw new Error("--plan is only valid for plan-review.");
+  }
+  if (args.taskset && command !== "plan") {
+    throw new Error("--taskset without an id is only valid for plan.");
+  }
+  if (args.tasksetId && command !== "assisted-review") {
+    throw new Error("--taskset <id> is only valid for assisted-review.");
+  }
+  if (args.maxReviewRounds !== undefined && command !== "assisted-review") {
+    throw new Error("--max-review-rounds is only valid for assisted-review.");
+  }
+}
+
+function minifiedJsonFile(relativePath) {
+  const fullPath = path.join(ROOT_DIR, relativePath);
+  return JSON.stringify(JSON.parse(fs.readFileSync(fullPath, "utf8")));
+}
+
+function promptPartial(name, variables = {}) {
+  return renderTemplate(readPromptTemplate(ROOT_DIR, name), variables);
+}
+
+function scorecardPromptBlock(args) {
+  if (!args.scorecard) {
+    return "";
+  }
+  return promptPartial("scorecard", {
+    SCORECARD_OUTPUT_SCHEMA_JSON: minifiedJsonFile(path.join("schemas", "scorecard-output.schema.json"))
+  });
+}
+
+function tasksetPromptBlock(args) {
+  if (!args.taskset) {
+    return "";
+  }
+  return promptPartial("taskset", {
+    TASKSET_SCHEMA_JSON: minifiedJsonFile(path.join("schemas", "taskset.schema.json"))
+  });
+}
+
+function validationEvidencePromptBlock(args) {
+  if (args.validationEvidenceBlock !== undefined) {
+    return args.validationEvidenceBlock;
+  }
+  const evidence = loadValidationEvidence({
+    cwd: process.cwd(),
+    files: args.validationEvidence ?? []
+  });
+  args.validationEvidenceBlock = renderValidationEvidenceBlock(evidence);
+  return args.validationEvidenceBlock;
+}
+
+function projectInstructionsPromptBlock(args) {
+  if (args.projectInstructionsBlock !== undefined) {
+    return args.projectInstructionsBlock;
+  }
+  const files = [...DEFAULT_PROJECT_INSTRUCTION_FILES, ...(args.rules ?? [])];
+  return renderProjectInstructionsBlock(process.cwd(), { files });
+}
+
+function reviewOutputContract(args) {
+  if (args.scorecard) {
+    return "";
+  }
+  return [
+    "<output_contract>",
+    "## Findings",
+    "- [Severity] file:line - issue, evidence, impact, suggested direction",
+    "## Open Questions",
+    "## Residual Risk",
+    "</output_contract>"
+  ].join("\n");
+}
+
+function tasksetOutputContract(args) {
+  return [
+    tasksetPromptBlock(args),
+    "<output_contract>",
+    "Return exactly one taskset JSON object and no Markdown.",
+    "</output_contract>"
+  ].filter(Boolean).join("\n");
+}
+
+function standardPlanOutputContract() {
+  return [
+    "<output_contract>",
+    "## Observed Facts",
+    "## Inferences",
+    "## Independent Implementation Plan",
+    "## Tests",
+    "## Risks And Blind Spots",
+    "## Reconciliation Checklist",
+    "</output_contract>"
+  ].join("\n");
+}
+
+function escapeXmlText(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function escapeXmlAttribute(value) {
+  return escapeXmlText(value)
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function escapeCdata(value) {
+  return String(value ?? "").replaceAll("]]>", "]]]]><![CDATA[>");
+}
+
+function parseScorecardResult(stdout) {
+  return normalizeScorecardOutput(extractJsonObject(stdout));
+}
+
+function scorecardRoundSummary(command, scorecard, failureCategory = "") {
+  const blockingFindings = Array.isArray(scorecard?.findings)
+    ? scorecard.findings.filter((finding) => finding.blocking).length
+    : 0;
+  return {
+    command,
+    verdict: scorecard?.verdict ?? "",
+    scoreTotal: Number.isFinite(scorecard?.score?.total) ? scorecard.score.total : null,
+    threshold: Number.isFinite(scorecard?.score?.threshold) ? scorecard.score.threshold : 85,
+    blockingFindings,
+    failureCategory,
+    acceptedFindingIds: []
+  };
+}
+
+function blockingFindingIds(scorecard) {
+  return new Set((scorecard?.findings ?? [])
+    .filter((finding) => finding.blocking)
+    .map((finding) => [
+      finding.severity,
+      finding.file,
+      finding.line,
+      finding.description
+    ].join("|")));
+}
+
+function hasRepeatedBlockingFinding(rounds) {
+  if (rounds.length < 2) {
+    return false;
+  }
+  const previous = rounds.at(-2).blockingFindingIds ?? [];
+  const current = new Set(rounds.at(-1).blockingFindingIds ?? []);
+  return previous.some((id) => current.has(id));
+}
+
+function scorecardMultiReviewPayload(results, args, mode = "plugin-managed") {
+  const roleResults = results.map(({ role, result }) => {
+    if (result.status !== 0) {
+      return {
+        role,
+        status: "error",
+        error: (result.stderr || result.error || "Antigravity role review failed").trim()
+      };
+    }
+    try {
+      return {
+        role,
+        status: "ok",
+        scorecard: parseScorecardResult(result.stdout)
+      };
+    } catch (error) {
+      return {
+        role,
+        status: "error",
+        error: `Invalid scorecard output: ${error.message || String(error)}`
+      };
+    }
+  });
+  const okScorecards = roleResults.filter((entry) => entry.status === "ok").map((entry) => entry.scorecard);
+  const blockingFindings = okScorecards.reduce((sum, scorecard) => sum + scorecard.findings.filter((finding) => finding.blocking).length, 0);
+  const scoreTotal = okScorecards.length
+    ? Math.round(okScorecards.reduce((sum, scorecard) => sum + scorecard.score.total, 0) / okScorecards.length)
+    : null;
+  const errors = roleResults.filter((entry) => entry.status !== "ok");
+  return {
+    mode,
+    roles: results.map((entry) => entry.role),
+    verdict: errors.length || blockingFindings || okScorecards.some((scorecard) => scorecard.verdict !== "approve") ? "needs-attention" : "approve",
+    scoreTotal,
+    threshold: 85,
+    blockingFindings,
+    role_results: roleResults
+  };
+}
+
+function readText(relativePath) {
+  return fs.readFileSync(path.join(ROOT_DIR, relativePath), "utf8");
+}
+
+function readRepoText(relativePath) {
+  return fs.readFileSync(path.join(REPO_ROOT_DIR, relativePath), "utf8");
+}
+
+function readDistributionText(relativePath) {
+  const pluginPrefix = `plugins${path.sep}antigravity-for-claude${path.sep}`;
+  const normalized = path.normalize(relativePath);
+  if (normalized.startsWith(pluginPrefix)) {
+    return readText(normalized.slice(pluginPrefix.length));
+  }
+  return readRepoText(relativePath);
+}
+
+function exists(relativePath) {
+  return fs.existsSync(path.join(ROOT_DIR, relativePath));
+}
+
+function shippedPluginTexts(roots = [
+  "scripts",
+  "hooks",
+  "skills",
+  "prompts",
+  "templates",
+  "contracts",
+  "schemas",
+  "assets",
+  "README.md",
+  "CHANGELOG.md",
+  ".claude-plugin/plugin.json"
+]) {
+  const results = [];
+  const visit = (relativePath) => {
+    const fullPath = path.join(ROOT_DIR, relativePath);
+    if (!fs.existsSync(fullPath)) return;
+    const stat = fs.lstatSync(fullPath);
+    if (stat.isSymbolicLink()) return;
+    if (stat.isDirectory()) {
+      for (const child of fs.readdirSync(fullPath)) visit(path.join(relativePath, child));
+      return;
+    }
+    if (stat.isFile() && /\.(mjs|json|md|yml|yaml|svg)$/.test(relativePath)) {
+      results.push({ relativePath, text: fs.readFileSync(fullPath, "utf8") });
+    }
+  };
+  for (const root of roots) visit(root);
+  return results;
+}
+
+function textScanPasses(items, forbidden) {
+  return items.every(({ text }) => forbidden.every((pattern) => !pattern.test(text)));
+}
+
+function isSourceRepositoryLayout() {
+  return path.resolve(REPO_ROOT_DIR, "plugins", "antigravity-for-claude") === ROOT_DIR;
+}
+
+function repositoryInstallDocsReleaseRefCheck() {
+  return { ok: true, detail: isSourceRepositoryLayout() ? "skipped for Claude plugin" : "skipped outside source layout" };
+}
+
+function parseArgsOrExit(rawArgs) {
+  try {
+    return parseArgs(rawArgs);
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+}
+
+function gitMarker(args) {
+  return `[git output truncated or timed out for: git ${args.join(" ")}]`;
+}
+
+function boundedGitOutput(stdout, args, forceMarker = false) {
+  const text = String(stdout || "").trim();
+  const truncated = Buffer.byteLength(text, "utf8") > GIT_OUTPUT_EXCERPT_BYTES;
+  const excerpt = truncated ? text.slice(0, GIT_OUTPUT_EXCERPT_BYTES) : text;
+  return [
+    excerpt,
+    forceMarker || truncated ? gitMarker(args) : ""
+  ].filter(Boolean).join("\n");
+}
+
+function runGit(args, options = {}) {
+  const result = spawnSync("git", reviewGateGitArgs(args), {
+    cwd: options.cwd || process.cwd(),
+    env: reviewGateGitEnv(options.env ?? process.env),
+    encoding: "utf8",
+    maxBuffer: GIT_MAX_BUFFER,
+    timeout: GIT_TIMEOUT_MS,
+    killSignal: "SIGKILL"
+  });
+  if (result.error) {
+    return boundedGitOutput(result.stdout, args, true);
+  }
+  if (result.status !== 0) {
+    return "";
+  }
+  return boundedGitOutput(result.stdout, args);
+}
+
+function runGitOk(args, options = {}) {
+  const result = spawnSync("git", reviewGateGitArgs(args), {
+    cwd: options.cwd || process.cwd(),
+    env: reviewGateGitEnv(options.env ?? process.env),
+    encoding: "utf8",
+    maxBuffer: GIT_MAX_BUFFER,
+    timeout: GIT_TIMEOUT_MS,
+    killSignal: "SIGKILL"
+  });
+  const stdout = String(result.stdout || "").trim();
+  const stdoutTruncated = Buffer.byteLength(stdout, "utf8") > GIT_OUTPUT_EXCERPT_BYTES;
+  return {
+    ok: result.status === 0 && !result.error,
+    stdout: stdoutTruncated ? stdout.slice(0, GIT_OUTPUT_EXCERPT_BYTES) : stdout,
+    marker: result.error || stdoutTruncated ? gitMarker(args) : ""
+  };
+}
+
+function reviewGateTimeoutBudgetMs(env = process.env, cliTimeoutMs = undefined) {
+  const raw = env[REVIEW_GATE_TIMEOUT_ENV];
+  const requested = raw === undefined || String(raw).trim() === ""
+    ? REVIEW_GATE_DEFAULT_TIMEOUT_MS
+    : Number(raw);
+  const normalized = Number.isFinite(requested)
+    ? Math.max(1000, Math.ceil(requested))
+    : REVIEW_GATE_DEFAULT_TIMEOUT_MS;
+  const cliTimeout = Number.isFinite(cliTimeoutMs)
+    ? Math.max(1000, Math.ceil(cliTimeoutMs))
+    : normalized;
+  const wrapperCap = Math.max(0, REVIEW_GATE_WRAPPER_TIMEOUT_MS - REVIEW_GATE_WRAPPER_GRACE_MS);
+  return Math.min(normalized, cliTimeout, wrapperCap);
+}
+
+function reviewGateDeadline(timeoutMs) {
+  return {
+    expiresAt: Date.now() + Math.max(0, Math.ceil(timeoutMs || 0))
+  };
+}
+
+function reviewGateRemainingMs(deadline) {
+  return Math.max(0, Math.ceil((deadline?.expiresAt || 0) - Date.now()));
+}
+
+function reviewGateGitEnv(sourceEnv = process.env) {
+  const env = { ...(sourceEnv ?? process.env) };
+  for (const key of Object.keys(env)) {
+    if (GIT_REPOSITORY_ENV_KEYS.has(key) || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) {
+      delete env[key];
+    }
+  }
+  env.NO_COLOR = "1";
+  return env;
+}
+
+function reviewGateGitArgs(args) {
+  return [
+    "-c", "color.ui=false",
+    "-c", "color.status=false",
+    "-c", "color.diff=false",
+    "-c", "core.fsmonitor=false",
+    ...args
+  ];
+}
+
+function reviewGateGitCommand(args, options = {}) {
+  const remaining = reviewGateRemainingMs(options.deadline);
+  if (remaining <= 0) {
+    return {
+      status: 1,
+      stdout: "",
+      stderr: `review gate timeout budget exhausted before: git ${args.join(" ")}`,
+      error: "review gate timeout budget exhausted",
+      errorCode: "ETIMEOUT",
+      timedOut: true
+    };
+  }
+  const result = spawnSync("git", reviewGateGitArgs(args), {
+    cwd: options.cwd || process.cwd(),
+    env: reviewGateGitEnv(options.env ?? process.env),
+    encoding: "utf8",
+    maxBuffer: GIT_MAX_BUFFER,
+    timeout: Math.max(1, Math.min(GIT_TIMEOUT_MS, remaining)),
+    killSignal: "SIGKILL"
+  });
+  return {
+    status: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error ? String(result.error.message || result.error) : "",
+    errorCode: result.error?.code ? String(result.error.code) : "",
+    timedOut: result.error?.code === "ETIMEDOUT"
+  };
+}
+
+function reviewGateGitResult(args, options = {}) {
+  const result = reviewGateGitCommand(args, options);
+  const stdout = String(result.stdout || "").trim();
+  const stdoutTruncated = Buffer.byteLength(stdout, "utf8") > GIT_OUTPUT_EXCERPT_BYTES;
+  const output = stdoutTruncated ? stdout.slice(0, GIT_OUTPUT_EXCERPT_BYTES) : stdout;
+  const marker = result.error || stdoutTruncated ? gitMarker(args) : "";
+  return {
+    command: `git ${args.join(" ")}`,
+    args,
+    status: result.status,
+    ok: result.status === 0 && !result.error && !stdoutTruncated,
+    stdout: output,
+    output: [output, marker].filter(Boolean).join("\n"),
+    marker,
+    truncated: stdoutTruncated,
+    stderr: result.stderr,
+    error: result.error,
+    errorCode: result.errorCode,
+    timedOut: result.timedOut
+  };
+}
+
+function reviewGateGitOk(args, options = {}) {
+  return reviewGateGitResult(args, options);
+}
+
+function reviewGateGitFailureReason(label, result) {
+  const detail = [
+    result.command,
+    result.errorCode,
+    result.timedOut ? "timed out" : "",
+    result.truncated ? "output truncated" : "",
+    result.error,
+    result.stderr,
+    result.marker,
+    result.status !== 0 ? `exit ${result.status}` : ""
+  ].filter(Boolean).join("; ").trim();
+  return `${label}${detail ? `: ${detail}` : ""}`;
+}
+
+function isSafeRelativePath(relativePath) {
+  return Boolean(relativePath)
+    && !path.isAbsolute(relativePath)
+    && !relativePath.split(/[\\/]+/).includes("..");
+}
+
+function openReadOnlyNoFollow(filePath) {
+  const noFollow = fs.constants?.O_NOFOLLOW;
+  if (Number.isInteger(noFollow)) {
+    return fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+  }
+  return fs.openSync(filePath, "r");
+}
+
+function textExcerptForFile(root, relativePath) {
+  if (!isSafeRelativePath(relativePath)) {
+    return `Untracked file: ${relativePath}\n[skipped unsafe path]`;
+  }
+  const filePath = path.join(root, relativePath);
+  let stat;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch {
+    return `Untracked file: ${relativePath}\n[skipped unreadable file]`;
+  }
+  if (stat.isSymbolicLink()) {
+    return `Untracked file: ${relativePath}\n[skipped symlink]`;
+  }
+  if (!stat.isFile()) {
+    return `Untracked file: ${relativePath}\n[skipped non-file]`;
+  }
+  let fd;
+  let buffer;
+  let fdStat;
+  try {
+    fd = openReadOnlyNoFollow(filePath);
+    fdStat = fs.fstatSync(fd);
+    if (!fdStat.isFile()) {
+      return `Untracked file: ${relativePath}\n[skipped non-file]`;
+    }
+    if (Number.isFinite(stat.dev) && Number.isFinite(stat.ino)
+      && Number.isFinite(fdStat.dev) && Number.isFinite(fdStat.ino)
+      && (stat.dev !== fdStat.dev || stat.ino !== fdStat.ino)) {
+      return `Untracked file: ${relativePath}\n[skipped changed file]`;
+    }
+    buffer = Buffer.alloc(Math.min(fdStat.size, UNTRACKED_BYTES_PER_FILE + 1));
+    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    buffer = buffer.subarray(0, bytesRead);
+  } catch {
+    return `Untracked file: ${relativePath}\n[skipped unreadable file]`;
+  } finally {
+    try {
+      if (fd !== undefined) fs.closeSync(fd);
+    } catch {
+      // Ignore close errors after a best-effort bounded read.
+    }
+  }
+  if (buffer.includes(0)) {
+    return `Untracked file: ${relativePath}\n[skipped binary file]`;
+  }
+  const excerpt = buffer.subarray(0, UNTRACKED_BYTES_PER_FILE).toString("utf8");
+  const truncated = fdStat.size > UNTRACKED_BYTES_PER_FILE ? "\n[untracked file excerpt truncated]" : "";
+  return `Untracked file: ${relativePath}\n${excerpt}${truncated}`;
+}
+
+function untrackedContext(root) {
+  const listing = runGitOk(["ls-files", "--others", "--exclude-standard"], { cwd: root });
+  const files = listing.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const excerpts = files.slice(0, UNTRACKED_FILE_LIMIT).map((file) => textExcerptForFile(root, file));
+  if (files.length > UNTRACKED_FILE_LIMIT) {
+    excerpts.push(`[untracked file list truncated after ${UNTRACKED_FILE_LIMIT} files]`);
+  }
+  if (listing.marker) {
+    excerpts.push(listing.marker);
+  }
+  return excerpts.join("\n\n");
+}
+
+function reviewGateUntrackedContext(root, deadline) {
+  const listing = reviewGateGitOk(["ls-files", "--others", "--exclude-standard"], { cwd: root, deadline });
+  if (!listing.ok) {
+    return {
+      trusted: false,
+      reason: reviewGateGitFailureReason("git untracked file discovery failed", listing),
+      context: ""
+    };
+  }
+  const files = listing.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const excerpts = files.slice(0, UNTRACKED_FILE_LIMIT).map((file) => textExcerptForFile(root, file));
+  if (files.length > UNTRACKED_FILE_LIMIT) {
+    excerpts.push(`[untracked file list truncated after ${UNTRACKED_FILE_LIMIT} files]`);
+  }
+  if (listing.marker) {
+    excerpts.push(listing.marker);
+  }
+  return {
+    trusted: true,
+    reason: "",
+    context: excerpts.join("\n\n")
+  };
+}
+
+function gitContext() {
+  const rootResult = runGitOk(["rev-parse", "--show-toplevel"]);
+  const root = rootResult.ok ? rootResult.stdout : "";
+  if (!root) {
+    return "No git repository was detected. Review only the user's explicit focus text.";
+  }
+  const status = runGit(["status", "--short"], { cwd: root });
+  const stagedStat = runGit(["diff", "--no-ext-diff", "--no-textconv", "--cached", "--stat"], { cwd: root });
+  const workingStat = runGit(["diff", "--no-ext-diff", "--no-textconv", "--stat"], { cwd: root });
+  const stagedDiff = runGit(["diff", "--no-ext-diff", "--no-textconv", "--cached", "--", "."], { cwd: root });
+  const workingDiff = runGit(["diff", "--no-ext-diff", "--no-textconv", "--", "."], { cwd: root });
+  const untracked = untrackedContext(root);
+  return [
+    `Repository: ${root}`,
+    status ? `Status:\n${status}` : "Status: clean",
+    stagedStat ? `Staged diff stat:\n${stagedStat}` : "",
+    workingStat ? `Working diff stat:\n${workingStat}` : "",
+    stagedDiff ? `Staged diff:\n${stagedDiff}` : "",
+    workingDiff ? `Working diff:\n${workingDiff}` : "",
+    untracked ? `Untracked files:\n${untracked}` : ""
+  ].filter(Boolean).join("\n\n");
+}
+
+function reviewGateGitContext({ deadline } = {}) {
+  const rootResult = reviewGateGitOk(["rev-parse", "--show-toplevel"], { deadline });
+  const root = rootResult.ok ? rootResult.stdout : "";
+  if (!root) {
+    if (
+      !rootResult.ok
+      && !rootResult.error
+      && !rootResult.errorCode
+      && !rootResult.marker
+      && /not a git repository|not a git repo|outside repository/i.test(rootResult.stderr || "")
+    ) {
+      return {
+        trusted: true,
+        reviewable: false,
+        reason: "no git repository was detected",
+        context: ""
+      };
+    }
+    const detail = [
+      rootResult.errorCode,
+      rootResult.error,
+      rootResult.stderr,
+      rootResult.marker
+    ].filter(Boolean).join("; ").trim();
+    return {
+      trusted: false,
+      reason: `git root discovery failed${detail ? `: ${detail}` : ""}`,
+      context: ""
+    };
+  }
+  const status = reviewGateGitResult(["status", "--short"], { cwd: root, deadline });
+  if (!status.ok) {
+    return {
+      trusted: false,
+      reviewable: false,
+      reason: reviewGateGitFailureReason("git status failed", status),
+      context: ""
+    };
+  }
+  if (!status.stdout.trim()) {
+    return {
+      trusted: true,
+      reviewable: false,
+      reason: "no git changes",
+      context: ""
+    };
+  }
+  const stagedStat = reviewGateGitResult(["diff", "--no-ext-diff", "--no-textconv", "--cached", "--stat"], { cwd: root, deadline });
+  if (!stagedStat.ok) {
+    return {
+      trusted: false,
+      reviewable: false,
+      reason: reviewGateGitFailureReason("git staged diff stat failed", stagedStat),
+      context: ""
+    };
+  }
+  const workingStat = reviewGateGitResult(["diff", "--no-ext-diff", "--no-textconv", "--stat"], { cwd: root, deadline });
+  if (!workingStat.ok) {
+    return {
+      trusted: false,
+      reviewable: false,
+      reason: reviewGateGitFailureReason("git working diff stat failed", workingStat),
+      context: ""
+    };
+  }
+  const stagedDiff = reviewGateGitResult(["diff", "--no-ext-diff", "--no-textconv", "--cached", "--", "."], { cwd: root, deadline });
+  if (!stagedDiff.ok) {
+    return {
+      trusted: false,
+      reviewable: false,
+      reason: reviewGateGitFailureReason("git staged diff failed", stagedDiff),
+      context: ""
+    };
+  }
+  const workingDiff = reviewGateGitResult(["diff", "--no-ext-diff", "--no-textconv", "--", "."], { cwd: root, deadline });
+  if (!workingDiff.ok) {
+    return {
+      trusted: false,
+      reviewable: false,
+      reason: reviewGateGitFailureReason("git working diff failed", workingDiff),
+      context: ""
+    };
+  }
+  const untracked = reviewGateUntrackedContext(root, deadline);
+  if (!untracked.trusted) {
+    return untracked;
+  }
+  if (reviewGateRemainingMs(deadline) <= 0) {
+    return {
+      trusted: false,
+      reviewable: false,
+      reason: "review gate timeout budget exhausted after git context",
+      context: ""
+    };
+  }
+  const context = [
+    `Repository: ${root}`,
+    status.output ? `Status:\n${status.output}` : "Status: clean",
+    stagedStat.output ? `Staged diff stat:\n${stagedStat.output}` : "",
+    workingStat.output ? `Working diff stat:\n${workingStat.output}` : "",
+    stagedDiff.output ? `Staged diff:\n${stagedDiff.output}` : "",
+    workingDiff.output ? `Working diff:\n${workingDiff.output}` : "",
+    untracked.context ? `Untracked files:\n${untracked.context}` : ""
+  ].filter(Boolean).join("\n\n");
+  return { trusted: true, reviewable: true, reason: "", context };
+}
+
+function focusBlock(args) {
+  const focus = args.positional.join(" ").trim();
+  return focus ? `<focus>${focus}</focus>` : "";
+}
+
+function templatePromptFor(kind, args, preflight) {
+  const template = readPromptTemplate(ROOT_DIR, kind);
+  return renderTemplate(template, {
+    MODEL_PROVIDER: preflight?.modelProvider || args.modelProvider || process.env.ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER || "gemini",
+    MODEL: preflight?.model || args.model || "",
+    GIT_CONTEXT: gitContext(),
+    PROJECT_INSTRUCTIONS_BLOCK: projectInstructionsPromptBlock(args),
+    VALIDATION_EVIDENCE_BLOCK: validationEvidencePromptBlock(args),
+    FOCUS_BLOCK: focusBlock(args),
+    SCORECARD_BLOCK: scorecardPromptBlock(args),
+    TASKSET_BLOCK: args.taskset ? tasksetPromptBlock(args) : "",
+    OUTPUT_CONTRACT: kind === "plan" && args.taskset ? tasksetOutputContract(args) : kind === "plan" ? standardPlanOutputContract() : reviewOutputContract(args)
+  });
+}
+
+function renderCommandPrompt(command, values) {
+  const templateName = command === "multi-review" || command === "review-gate" ? `${command}-role` : command;
+  const template = readPromptTemplate(ROOT_DIR, templateName);
+  return renderTemplate(template, {
+    ROLE_NAME: values.ROLE ?? "",
+    ROLE_DIRECTIVE: values.ROLE_BRIEF ?? "",
+    MODEL_PROVIDER: values.MODEL_PROVIDER ?? "",
+    MODEL: values.MODEL ?? "",
+    GIT_CONTEXT: values.GIT_CONTEXT ?? "",
+    PROJECT_INSTRUCTIONS_BLOCK: values.PROJECT_INSTRUCTIONS_BLOCK ?? "",
+    VALIDATION_EVIDENCE_BLOCK: values.VALIDATION_EVIDENCE_BLOCK ?? "",
+    FOCUS_BLOCK: values.TASK ?? "",
+    SCORECARD_BLOCK: values.SCORECARD_BLOCK ?? "",
+    OUTPUT_CONTRACT: values.OUTPUT_CONTRACT ?? reviewOutputContract({})
+  });
+}
+
+function reviewGateEnabled() {
+  const value = String(process.env.ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE ?? "").trim().toLowerCase();
+  return value !== "" && value !== "off" && value !== "false" && value !== "0";
+}
+
+function warnReviewGate(message) {
+  process.stderr.write(`[antigravity-for-claude review-gate] ${message}\n`);
+}
+
+function parseReviewGateOutput(output) {
+  const text = String(output || "").trim();
+  const firstLine = text.split(/\r?\n/, 1)[0] || "";
+  if (firstLine.startsWith("BLOCK:")) {
+    return { kind: "block", reason: firstLine.slice("BLOCK:".length).trim() || "blocked" };
+  }
+  if (firstLine.startsWith("ALLOW:")) {
+    return { kind: "allow" };
+  }
+  return { kind: "invalid", firstLine };
+}
+
+function rawArgsWithoutBackground(rawArgs) {
+  return rawArgs.filter((arg) => arg !== "--background" && !String(arg).startsWith("--background="));
+}
+
+function sanitizeBackgroundArgs(rawArgs) {
+  return rawArgsWithoutBackground(rawArgs);
+}
+
+function jobSummary(job) {
+  if (!job) return null;
+  const liveness = classifyJobLiveness(job, { now: Date.now(), env: process.env });
+  return {
+    id: job.id,
+    command: job.command,
+    args: job.args,
+    cwd: job.cwd,
+    status: job.status,
+    liveness,
+    viewed: Boolean(job.viewed),
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    startedAt: job.startedAt,
+    endedAt: job.endedAt,
+    worker: job.worker,
+    submissionState: job.submissionState || "",
+    timeout: Number.isFinite(job.timeout) ? job.timeout : null,
+    workerPid: job.workerPid ?? job.worker?.pid ?? null,
+    lastHeartbeatAt: job.lastHeartbeatAt || "",
+    lastProgressAt: job.lastProgressAt || "",
+    resultViewedAt: job.resultViewedAt || "",
+    idempotencyKey: job.idempotencyKey || "",
+    error: job.error || "",
+    cancel: job.cancel || null
+  };
+}
+
+function jobResultPayload(job) {
+  return {
+    ...jobSummary(job),
+    stdout: job.stdout || "",
+    stderr: job.stderr || "",
+    error: job.error || ""
+  };
+}
+
+function activeBackgroundJobs(cwd = process.cwd(), env = process.env, { excludeJobId = "" } = {}) {
+  return listJobs(cwd, env)
+    .filter((job) => !excludeJobId || job.id !== excludeJobId)
+    .map((job) => ({ job, liveness: classifyJobLiveness(job, { now: Date.now(), env }) }))
+    .filter(({ liveness }) => ["queued", "healthy", "suspect"].includes(liveness.state));
+}
+
+function activeCapFailure(verb, cap) {
+  return `Refusing to ${verb} background job: maximum active background jobs (${cap}) reached.\n`;
+}
+
+function writeJson(payload) {
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+}
+
+function spawnStoredJobWorker(job, resourceLeaseId = "") {
+  const child = spawn(process.execPath, [COMPANION_PATH, "__run-job", job.id], {
+    cwd: job.cwd,
+    env: {
+      ...process.env,
+      ANTIGRAVITY_INTERNAL_DISPATCH: "1"
+    },
+    detached: process.platform !== "win32",
+    stdio: "ignore"
+  });
+  child.unref();
+  if (resourceLeaseId) {
+    transferResourceLease(resourceLeaseId, child.pid, process.env);
+  }
+  return child;
+}
+
+function queueBackgroundJob(command, rawArgs) {
+  const cwd = process.cwd();
+  const outcome = withWorkspaceJobLock(cwd, process.env, () => {
+    let args;
+    try {
+      args = parseArgs(rawArgs);
+    } catch (error) {
+      return { exitCode: 2, stderr: `${error.message || String(error)}\n` };
+    }
+    const cleanArgs = sanitizeBackgroundArgs(rawArgs);
+    const fingerprint = worktreeFingerprint(cwd, { env: process.env });
+    const preflight = antigravityPreflight(process.env, args);
+    if (!preflight.ok) {
+      return {
+        exitCode: 2,
+        stderr: `${preflight.error || `Antigravity CLI is unavailable; missing ${preflight.missing.join(", ")}.`}\n`
+      };
+    }
+    const executionControls = {
+      provider: preflight.modelProvider,
+      model: preflight.model,
+      sandbox: process.env.ANTIGRAVITY_FOR_CLAUDE_SANDBOX || "",
+      timeout: String(args.timeout || "")
+    };
+    const idempotencyKey = deriveJobIdempotencyKey({
+      command,
+      args: cleanArgs,
+      cwd,
+      workspaceFingerprint: fingerprint.fingerprint,
+      executionControls
+    });
+    if (fingerprint.status === "trusted") {
+      const reusable = findReusableJob({ command, args: cleanArgs, cwd, idempotencyKey }, process.env);
+      if (reusable) {
+        return { payload: { status: reusable.status, jobId: reusable.id, reused: true } };
+      }
+    }
+
+    const activeJobs = activeBackgroundJobs(cwd, process.env);
+    const cap = maxActiveJobs(process.env);
+    if (activeJobs.length >= cap) {
+      return {
+        exitCode: 2,
+        stderr: activeCapFailure("queue", cap)
+      };
+    }
+
+    const resourceLease = acquireResourceLease("background-job", { env: process.env, command, transferable: true });
+    if (!resourceLease.ok) {
+      return {
+        exitCode: 75,
+        stderr: `${capacityBlockedMessage("antigravity-for-claude", resourceLease)}\n`
+      };
+    }
+    const job = createJob({ command, args: cleanArgs, cwd }, process.env);
+    const stamped = updateJob(job.id, (draft) => {
+      const updatedAt = new Date().toISOString();
+      draft.idempotencyKey = idempotencyKey;
+      draft.workspaceFingerprint = fingerprint.fingerprint;
+      draft.executionControls = executionControls;
+      draft.timeout = args.timeout;
+      draft.submissionState = "queued";
+      draft.resourceLeaseId = resourceLease.lease?.id || "";
+      draft.updatedAt = updatedAt;
+      return draft;
+    }, cwd, process.env);
+    if (!stamped) {
+      const message = "Metadata persistence failed before worker start.";
+      markJobMetadataPersistenceFailed(job.id, message, cwd, process.env);
+      resourceLease.release();
+      return {
+        exitCode: 2,
+        stderr: `Failed to queue background job: ${message}\n`
+      };
+    }
+    try {
+      spawnStoredJobWorker(stamped, resourceLease.lease?.id || "");
+    } catch (error) {
+      const message = `Failed to start background job worker: ${error.message || String(error)}`;
+      finishJob(stamped.id, {
+        status: 1,
+        stdout: "",
+        stderr: `${message}\n`,
+        error: message
+      }, cwd, process.env);
+      resourceLease.release();
+      return {
+        exitCode: 2,
+        stderr: `Failed to queue background job: ${error.message || String(error)}\n`
+      };
+    }
+    return { payload: { status: "queued", jobId: stamped.id, reused: false } };
+  });
+
+  if (!outcome) {
+    process.stderr.write("Failed to queue background job: workspace job lock is busy.\n");
+    process.exit(2);
+  }
+  if (outcome.stderr) {
+    process.stderr.write(outcome.stderr);
+    process.exit(outcome.exitCode || 2);
+  }
+  writeJson(outcome.payload);
+}
+
+function writeReviewOperationReport(kind, args, result, startedAt, endedAt, parsed) {
+  try {
+    writeOperationReport(process.cwd(), operationReport({ command: kind, args, result, startedAt, endedAt, parsed }), process.env);
+  } catch {
+    // Report writes are best-effort and must not mask review output or failures.
+  }
+}
+
+function runSetupOrCapabilities(command, rawArgs) {
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help) {
+    process.stdout.write(usage());
+    return;
+  }
+  const preflight = antigravityPreflight(process.env, args);
+  const diagnostics = antigravityModelDiagnostics(process.env, args);
+  const payload = { ok: preflight.ok, provider: preflight, modelCatalog: diagnostics.modelCatalog };
+  if (command === "capabilities") {
+    payload.commands = USER_VISIBLE_COMMANDS;
+  }
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  process.exit(command === "setup" ? 0 : (preflight.ok ? 0 : 1));
+}
+
+function runReview(kind, rawArgs) {
+  const startedAt = new Date().toISOString();
+  let args;
+  try {
+    args = parseArgs(rawArgs);
+    validateQualityLoopArgs(kind, args);
+  } catch (error) {
+    const stderr = error.message || String(error);
+    const result = { status: 2, stdout: "", stderr, error: "", errorCode: "" };
+    writeReviewOperationReport(kind, {}, { ...result, outcome: classifyAgyOutcome(result) }, startedAt, new Date().toISOString());
+    process.stderr.write(`${stderr}\n`);
+    process.exit(2);
+  }
+  if (args.help) {
+    process.stdout.write(usage(kind));
+    return;
+  }
+  if (args.background) {
+    return queueBackgroundJob(kind, rawArgs);
+  }
+  const capacityProbe = acquireResourceLease("model-call", {
+    env: process.env,
+    command: "agy",
+    ttlMs: (args.timeout || DEFAULT_TIMEOUT_MS) + 60_000
+  });
+  if (!capacityProbe.ok) {
+    const result = capacityBlockedResult("antigravity-for-claude", capacityProbe);
+    const endedAt = new Date().toISOString();
+    writeReviewOperationReport(kind, args, { ...result, outcome: classifyAgyOutcome(result) }, startedAt, endedAt);
+    process.stderr.write(result.stderr);
+    process.exit(result.status);
+  }
+  capacityProbe.release();
+  const preflight = antigravityPreflight(process.env, args);
+  if (!preflight.ok) {
+    const stderr = preflight.error || `Antigravity CLI is unavailable; missing ${preflight.missing.join(", ")}.`;
+    const result = { status: 2, stdout: "", stderr, error: "", errorCode: "" };
+    const endedAt = new Date().toISOString();
+    writeReviewOperationReport(kind, args, { ...result, outcome: classifyAgyOutcome(result) }, startedAt, endedAt);
+    process.stderr.write(`${stderr}\n`);
+    process.exit(2);
+  }
+  let prompt = templatePromptFor(kind, args, preflight);
+  if ((args.structured || args.json) && !args.scorecard) {
+    prompt = appendStructuredReviewInstructions(prompt);
+  }
+  const result = antigravityPrint(prompt, { ...args, preflight }, process.env);
+  const endedAt = new Date().toISOString();
+  if (result.status !== 0) {
+    writeReviewOperationReport(kind, args, result, startedAt, endedAt);
+    process.stderr.write(`${result.stderr || result.error || "Antigravity review failed."}\n`);
+    process.exit(result.status);
+  }
+  if (kind === "plan" && args.taskset) {
+    try {
+      const taskset = saveTaskset(process.cwd(), extractJsonObject(result.stdout), process.env);
+      const stdout = `${JSON.stringify({
+        ok: true,
+        tasksetId: taskset.id,
+        statePath: taskset.path,
+        taskset
+      }, null, 2)}\n`;
+      writeReviewOperationReport(kind, args, { ...result, stdout }, startedAt, endedAt);
+      process.stdout.write(stdout);
+    } catch (error) {
+      writeReviewOperationReport(kind, args, { ...result, status: 1, stderr: error.message || String(error) }, startedAt, new Date().toISOString());
+      process.stderr.write(`Invalid taskset output: ${error.message || String(error)}\n`);
+      process.stdout.write(result.stdout);
+      process.exit(1);
+    }
+    return;
+  }
+  if (args.scorecard) {
+    try {
+      const parsed = parseScorecardResult(result.stdout);
+      const stdout = `${JSON.stringify(parsed, null, 2)}\n`;
+      writeReviewOperationReport(kind, args, { ...result, stdout }, startedAt, endedAt, parsed);
+      process.stdout.write(stdout);
+    } catch (error) {
+      writeReviewOperationReport(kind, args, { ...result, status: 1, stderr: error.message || String(error) }, startedAt, new Date().toISOString());
+      process.stderr.write(`Invalid scorecard output: ${error.message || String(error)}\n`);
+      process.stdout.write(result.stdout);
+      process.exit(1);
+    }
+    return;
+  }
+  let parsed;
+  if (args.structured || args.json) {
+    try {
+      parsed = validateStructuredReview(extractJsonObject(result.stdout));
+    } catch (error) {
+      const stderr = `Structured review output invalid: ${error.message || String(error)}`;
+      const failedResult = {
+        ...result,
+        status: 1,
+        stderr,
+        errorCode: "ESTRUCTUREDOUTPUT",
+        outcome: { kind: "malformed-output", ok: false, retryable: true, message: stderr }
+      };
+      writeReviewOperationReport(kind, args, failedResult, startedAt, new Date().toISOString());
+      process.stderr.write(`${stderr}\n`);
+      process.exit(1);
+    }
+  }
+  writeReviewOperationReport(kind, args, result, startedAt, endedAt, parsed);
+  if (args.json) {
+    process.stdout.write(`${JSON.stringify(parsed)}\n`);
+    return;
+  }
+  if (args.structured) {
+    process.stdout.write(`${JSON.stringify(parsed, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(result.stdout);
+  if (!result.stdout.endsWith("\n")) {
+    process.stdout.write("\n");
+  }
+}
+
+function runReport(rawArgs) {
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help) {
+    process.stdout.write(usage("report"));
+    return;
+  }
+  if (!args.latest) {
+    process.stderr.write("report requires --latest.\n");
+    process.exit(2);
+  }
+  process.stdout.write(`${JSON.stringify(latestReport(process.cwd(), process.env))}\n`);
+}
+
+function runRoles(rawArgs) {
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help) {
+    process.stdout.write(usage("roles"));
+    return;
+  }
+  process.stdout.write(`${JSON.stringify({ roles: REVIEW_ROLES, packs: BUILT_IN_ROLE_PACKS })}\n`);
+}
+
+function parseDoctorArgs(rawArgs) {
+  const args = {
+    help: false,
+    json: false,
+    modelProvider: undefined,
+    model: undefined
+  };
+  const readDoctorOptionValue = (tokens, index, option) => {
+    const value = readOptionValue(tokens, index, option);
+    if (value.trim() === "") {
+      throw new Error(`Missing value for ${option}.`);
+    }
+    return value;
+  };
+  const readDoctorEqualsValue = (token, option) => {
+    const value = token.slice(`${option}=`.length);
+    if (value.trim() === "") {
+      throw new Error(`Missing value for ${option}.`);
+    }
+    return value;
+  };
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const token = rawArgs[index];
+    if (token === "--help" || token === "-h" || token === "help") {
+      args.help = true;
+    } else if (token === "--json") {
+      args.json = true;
+    } else if (token === "--model-provider") {
+      args.modelProvider = readDoctorOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--model-provider=")) {
+      args.modelProvider = readDoctorEqualsValue(token, "--model-provider");
+    } else if (token === "--model") {
+      args.model = readDoctorOptionValue(rawArgs, index, token);
+      index += 1;
+    } else if (token.startsWith("--model=")) {
+      args.model = readDoctorEqualsValue(token, "--model");
+    } else {
+      throw new Error(`Unknown doctor argument: ${token}.`);
+    }
+  }
+  return args;
+}
+
+function doctorWantsJson(rawArgs) {
+  return rawArgs.includes("--json");
+}
+
+function conciseDiagnostic(value) {
+  return String(value || "")
+    .trim()
+    .split(/\r?\n/, 1)[0]
+    .trim();
+}
+
+function runDoctor(rawArgs) {
+  let args;
+  try {
+    args = parseDoctorArgs(rawArgs);
+  } catch (error) {
+    const message = error.message || String(error);
+    if (doctorWantsJson(rawArgs)) {
+      writeJson({ ok: false, error: message });
+    } else {
+      process.stderr.write(`${message}\n`);
+    }
+    process.exit(2);
+  }
+  if (args.help) {
+    process.stdout.write(usage("doctor"));
+    return;
+  }
+  const payload = antigravityDoctor(process.env, {
+    modelProvider: args.modelProvider,
+    model: args.model
+  });
+  if (args.json) {
+    writeJson(payload);
+    return;
+  }
+  const lines = [
+    `Antigravity command: ${payload.agy.command}`,
+    `Ready: ${payload.ok ? "yes" : "no"}`,
+    `Available: ${payload.agy.available ? "yes" : "no"}`,
+    `Prompt support: ${payload.agy.capabilities.prompt ? "yes" : "no"}`,
+    `Log diagnostics: ${payload.agy.capabilities.logFile ? "yes" : "no"}`,
+    `Current selection: ${payload.selected.current.ok ? `${payload.selected.current.modelProvider} ${payload.selected.current.model}` : `error - ${payload.selected.current.error}`}`,
+    `Gemini models: ${payload.models.gemini.length}`,
+    `Claude models: ${payload.models.claude.length}`,
+    `Unsupported models rejected: ${payload.models.unsupported.length}`,
+    `Hooks supported: ${payload.hooks.supportedEvents.join(", ")}`,
+    `Hooks unsupported: ${payload.hooks.unsupportedEvents.join(", ")}`
+  ];
+  if (!payload.agy.available) {
+    lines.push(`Antigravity error: ${conciseDiagnostic(payload.agy.helpError) || `help exited ${payload.agy.helpStatus}`}`);
+  }
+  if (!payload.models.available) {
+    lines.push(`Models error: ${conciseDiagnostic(payload.models.error) || `models exited ${payload.models.status}`}`);
+  }
+  for (const [provider, selection] of Object.entries(payload.selected.providers)) {
+    if (!selection.ok) {
+      lines.push(`${provider === "gemini" ? "Gemini" : "Claude"} selection error: ${selection.error}`);
+    }
+  }
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
+function requireJobId(rawArgs, command) {
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help || args.positional.length !== 1) {
+    process.stdout.write(`Usage: antigravity-companion.mjs ${command} <job-id>\n`);
+    process.exit(args.help ? 0 : 2);
+  }
+  return args.positional[0];
+}
+
+function runJobs(rawArgs) {
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help) {
+    process.stdout.write("Usage: antigravity-companion.mjs jobs\n");
+    return;
+  }
+  writeJson({ jobs: listJobs(process.cwd(), process.env).map(jobSummary) });
+}
+
+function runStatus(rawArgs) {
+  const jobId = requireJobId(rawArgs, "status");
+  const job = readJob(jobId, process.cwd(), process.env);
+  if (!job) {
+    process.stderr.write(`Unknown job "${jobId}".\n`);
+    process.exit(1);
+  }
+  writeJson(jobSummary(job));
+}
+
+function runResult(rawArgs) {
+  const jobId = requireJobId(rawArgs, "result");
+  const job = markJobViewed(jobId, process.cwd(), process.env);
+  if (!job) {
+    process.stderr.write(`Unknown job "${jobId}".\n`);
+    process.exit(1);
+  }
+  writeJson(jobResultPayload(job));
+}
+
+function runCancel(rawArgs) {
+  const jobId = requireJobId(rawArgs, "cancel");
+  const job = cancelJob(jobId, process.cwd(), process.env);
+  if (!job) {
+    process.stderr.write(`Unknown job "${jobId}".\n`);
+    process.exit(1);
+  }
+  writeJson(jobSummary(job));
+}
+
+function runMailbox(rawArgs) {
+  const [action = "", ...rest] = rawArgs;
+  const args = parseArgsOrExit(rest);
+  if (args.help || !action) {
+    process.stdout.write(usage("mailbox"));
+    process.exit(action ? 0 : 2);
+  }
+  try {
+    if (action === "list") {
+      return writeJson(listMailboxThreads(process.cwd(), process.env));
+    }
+    if (action === "post") {
+      return writeJson(postMailboxMessage({
+        thread: args.thread,
+        message: args.message,
+        cwd: process.cwd()
+      }, process.env));
+    }
+    if (action === "show") {
+      return writeJson(showMailboxThread(args.thread, process.cwd(), process.env));
+    }
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+  process.stderr.write(`Unknown mailbox action "${action}".\n`);
+  process.exit(2);
+}
+
+function runLeases(rawArgs) {
+  const [action = "", ...rest] = rawArgs;
+  const args = parseArgsOrExit(rest);
+  if (args.help || !action) {
+    process.stdout.write(usage("leases"));
+    process.exit(action ? 0 : 2);
+  }
+  try {
+    if (action === "claim") {
+      return writeJson(claimLease({
+        role: args.role,
+        ttlSeconds: args.ttlSeconds,
+        cwd: process.cwd()
+      }, process.env));
+    }
+    if (action === "list") {
+      return writeJson(listLeases(process.cwd(), process.env));
+    }
+    if (action === "release") {
+      return writeJson(releaseLease(args.id, process.cwd(), process.env));
+    }
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+  process.stderr.write(`Unknown leases action "${action}".\n`);
+  process.exit(2);
+}
+
+function githubActionOptions(args, env = process.env) {
+  const modelProvider = normalizedModelProvider(args.modelProvider || "gemini");
+  const explicitModel =
+    args.model
+    || env[MODEL_ENV]
+    || "";
+  const selected = explicitModel ? selectedModel(env, { modelProvider, model: explicitModel }) : { modelProvider, model: "" };
+  return {
+    modelProvider: selected.modelProvider,
+    model: explicitModel ? selected.model : "",
+    releaseRef: args.ref || RELEASE_REF,
+    timeoutMinutes: args.timeoutMinutes === 0 ? undefined : args.timeoutMinutes
+  };
+}
+
+function runCommandProbe(rawArgs) {
+  const payload = {
+    ok: true,
+    pluginRoot: process.env.CLAUDE_PLUGIN_ROOT || "",
+    pluginData: process.env.CLAUDE_PLUGIN_DATA || "",
+    providerOverride: process.env.ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER || "",
+    defaultModelProvider: "gemini",
+    argv: rawArgs,
+    argvCount: rawArgs.length,
+    hostileArgvDeliveredAsText: rawArgs.every((value) => typeof value === "string")
+  };
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+}
+
+function runGithubActions(rawArgs) {
+  const [action = "", ...rest] = rawArgs;
+  const args = parseArgsOrExit(rest);
+  if (args.help || !action) {
+    process.stdout.write(usage("github-actions"));
+    process.exit(action ? 0 : 2);
+  }
+  try {
+    if (action === "render") {
+      process.stdout.write(renderWorkflow(ROOT_DIR, githubActionOptions(args)));
+      return;
+    }
+    if (action === "init") {
+      const workflow = renderWorkflow(ROOT_DIR, githubActionOptions(args));
+      const target = writeWorkflow(process.cwd(), workflow, { force: args.force });
+      return writeJson({ status: "written", path: target });
+    }
+    if (action === "validate") {
+      const target = args.workflowPath || path.join(process.cwd(), ".github", "workflows", "antigravity-for-claude-review.yml");
+      const text = fs.readFileSync(target, "utf8");
+      const validation = validateWorkflow(text);
+      writeJson(validation);
+      if (!validation.ok) {
+        process.exit(1);
+      }
+      return;
+    }
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+  process.stderr.write(`Unknown github-actions action "${action}".\n`);
+  process.exit(2);
+}
+
+function runReserveJob(rawArgs) {
+  if (rawArgs.includes("--help") || rawArgs.includes("-h") || rawArgs[0] === "help" || rawArgs.length < 1) {
+    process.stdout.write("Usage: antigravity-companion.mjs reserve-job <review|adversarial-review|multi-review|plan|rescue> [args]\n");
+    process.exit(rawArgs.length < 1 ? 2 : 0);
+  }
+  const [command, ...commandArgs] = rawArgs;
+  const cwd = process.cwd();
+  const outcome = withWorkspaceJobLock(cwd, process.env, () => {
+    if (!RESERVABLE_COMMANDS.has(command)) {
+      return { exitCode: 2, stderr: `Command "${command}" cannot be reserved.\n` };
+    }
+    const cleanArgs = rawArgsWithoutBackground(commandArgs.map(String));
+    let args;
+    try {
+      args = parseArgs(cleanArgs);
+    } catch (error) {
+      return { exitCode: 2, stderr: `${error.message || String(error)}\n` };
+    }
+    const timeout = cleanArgs.some((arg) => arg === "--timeout-seconds" || arg.startsWith("--timeout-seconds="))
+      ? args.timeout
+      : null;
+    const fingerprint = worktreeFingerprint(cwd, { env: process.env });
+    const preflight = antigravityPreflight(process.env, args);
+    if (!preflight.ok) {
+      return {
+        exitCode: 2,
+        stderr: `${preflight.error || `Antigravity CLI is unavailable; missing ${preflight.missing.join(", ")}.`}\n`
+      };
+    }
+    const executionControls = {
+      provider: preflight.modelProvider,
+      model: preflight.model,
+      sandbox: process.env.ANTIGRAVITY_FOR_CLAUDE_SANDBOX || "",
+      timeout: String(args.timeout || "")
+    };
+    const idempotencyKey = deriveJobIdempotencyKey({
+      command,
+      args: cleanArgs,
+      cwd,
+      workspaceFingerprint: fingerprint.fingerprint,
+      executionControls
+    });
+    if (fingerprint.status === "trusted") {
+      const reusable = findReusableJob({ command, args: cleanArgs, cwd, idempotencyKey }, process.env);
+      if (reusable) {
+        return { payload: { status: reusable.status, jobId: reusable.id, reused: true } };
+      }
+    }
+    const cap = maxActiveJobs(process.env);
+    if (activeBackgroundJobs(cwd, process.env).length >= cap) {
+      return {
+        exitCode: 2,
+        stderr: activeCapFailure("reserve", cap)
+      };
+    }
+    const resourceLease = acquireResourceLease("background-job", { env: process.env, command, transferable: true });
+    if (!resourceLease.ok) {
+      return {
+        exitCode: 75,
+        stderr: `${capacityBlockedMessage("antigravity-for-claude", resourceLease)}\n`
+      };
+    }
+    const job = reserveJob({ command, args: cleanArgs, cwd, timeout }, process.env);
+    const stamped = updateJob(job.id, (draft) => {
+      const updatedAt = new Date().toISOString();
+      draft.idempotencyKey = idempotencyKey;
+      draft.workspaceFingerprint = fingerprint.fingerprint;
+      draft.executionControls = executionControls;
+      draft.submissionState = "reserved";
+      draft.resourceLeaseId = resourceLease.lease?.id || "";
+      draft.updatedAt = updatedAt;
+      return draft;
+    }, cwd, process.env);
+    if (!stamped) {
+      const message = "Metadata persistence failed before reserved job start.";
+      markJobMetadataPersistenceFailed(job.id, message, cwd, process.env);
+      resourceLease.release();
+      return {
+        exitCode: 2,
+        stderr: `Failed to reserve background job: ${message}\n`
+      };
+    }
+    return { payload: { status: "reserved", jobId: stamped.id, reused: false } };
+  });
+  if (!outcome) {
+    process.stderr.write("Failed to reserve background job: workspace job lock is busy.\n");
+    process.exit(2);
+  }
+  if (outcome.stderr) {
+    process.stderr.write(outcome.stderr);
+    process.exit(outcome.exitCode || 2);
+  }
+  writeJson(outcome.payload);
+}
+
+function rollbackReservedJobStart(jobId, cwd = process.cwd(), { clearResourceLease = false } = {}) {
+  updateJob(jobId, (draft) => {
+    if (isTerminalJobStatus(draft.status)) {
+      return draft;
+    }
+    draft.status = "reserved";
+    draft.submissionState = "reserved";
+    delete draft.worker;
+    delete draft.workerPid;
+    delete draft.supervisedWorker;
+    if (clearResourceLease) {
+      delete draft.resourceLeaseId;
+    }
+    draft.updatedAt = new Date().toISOString();
+    return draft;
+  }, cwd, process.env);
+}
+
+function runReservedJob(rawArgs) {
+  const jobId = requireJobId(rawArgs, "run-reserved-job");
+  const cwd = process.cwd();
+  const outcome = withWorkspaceJobLock(cwd, process.env, () => {
+    const current = readJob(jobId, cwd, process.env);
+    if (!current || current.status !== "reserved") {
+      return { exitCode: 2, stderr: `Job "${jobId}" is not reserved.\n` };
+    }
+    const cap = maxActiveJobs(process.env);
+    if (activeBackgroundJobs(cwd, process.env, { excludeJobId: jobId }).length >= cap) {
+      return {
+        exitCode: 2,
+        stderr: activeCapFailure("start reserved", cap)
+      };
+    }
+    const job = claimReservedJob(cwd, jobId, process.env);
+    if (!job) {
+      return { exitCode: 2, stderr: `Job "${jobId}" is not reserved.\n` };
+    }
+    return { job };
+  });
+  if (!outcome) {
+    process.stderr.write("Failed to start reserved background job: workspace job lock is busy.\n");
+    process.exit(2);
+  }
+  if (outcome.stderr) {
+    process.stderr.write(outcome.stderr);
+    process.exit(outcome.exitCode || 2);
+  }
+  const resourceLease = ensureResourceLease(outcome.job.resourceLeaseId, "background-job", { env: process.env, command: outcome.job.command, transferable: false });
+  if (!resourceLease.ok) {
+    rollbackReservedJobStart(outcome.job.id, cwd);
+    process.stderr.write(`${capacityBlockedMessage("antigravity-for-claude", resourceLease)}\n`);
+    process.exit(75);
+  }
+  const resourceLeaseId = resourceLease.lease?.id || outcome.job.resourceLeaseId || "";
+  const jobForWorker = {
+    ...outcome.job,
+    resourceLeaseId
+  };
+  if (resourceLeaseId && resourceLeaseId !== outcome.job.resourceLeaseId) {
+    updateJob(outcome.job.id, (draft) => {
+      draft.resourceLeaseId = resourceLeaseId;
+      draft.updatedAt = new Date().toISOString();
+      return draft;
+    }, cwd, process.env);
+  }
+  try {
+    spawnStoredJobWorker(jobForWorker, resourceLeaseId);
+  } catch (error) {
+    resourceLease.release();
+    rollbackReservedJobStart(outcome.job.id, cwd, { clearResourceLease: true });
+    process.stderr.write(`Failed to start reserved background job: ${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+  writeJson({ status: "queued", jobId: outcome.job.id });
+}
+
+function appendCapped(chunks, state, chunk) {
+  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  state.total += buffer.length;
+  if (state.kept >= CHILD_OUTPUT_MAX_BUFFER) {
+    return;
+  }
+  const available = CHILD_OUTPUT_MAX_BUFFER - state.kept;
+  const next = buffer.length > available ? buffer.subarray(0, available) : buffer;
+  chunks.push(next);
+  state.kept += next.length;
+}
+
+function childResultNeedsTreeCleanup(result) {
+  if (result.timedOut || result.signal || result.errorCode === "ETIMEDOUT") {
+    return true;
+  }
+  const failed = result.status !== 0 || Boolean(result.error);
+  if (!failed) {
+    return false;
+  }
+  return /\b(?:ETIMEDOUT|timed out|timeout|terminated by SIG(?:TERM|KILL)|Antigravity timeout)\b/i.test([
+    result.stdout,
+    result.stderr,
+    result.error
+  ].filter(Boolean).join("\n"));
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+  return results;
+}
+
+function runChildProcessAsync(command, args, options = {}) {
+  return new Promise((resolve) => {
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const stdoutState = { kept: 0, total: 0 };
+    const stderrState = { kept: 0, total: 0 };
+    let spawnError = null;
+    let timedOut = false;
+    let settled = false;
+    let killTimer = null;
+    const detached = process.platform !== "win32";
+    const child = spawn(command, args, {
+      cwd: options.cwd || process.cwd(),
+      env: options.env || process.env,
+      detached,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    if (typeof options.onSpawn === "function") {
+      try {
+        options.onSpawn(child);
+      } catch {
+        // Spawn callbacks are best-effort metadata; process supervision still runs.
+      }
+    }
+    const killChildTree = (signal) => {
+      if (detached && child.pid) {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // Fall through to direct child kill when process-group signaling is unavailable.
+        }
+      }
+      if (process.platform === "win32" && child.pid) {
+        try {
+          spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+            encoding: "utf8",
+            timeout: 5000,
+            windowsHide: true
+          });
+          return;
+        } catch {
+          // Fall through to direct child kill when taskkill is unavailable.
+        }
+      }
+      try {
+        child.kill(signal);
+      } catch {
+        // The close/error handlers will finish the result.
+      }
+    };
+
+    const timeoutTimer = Number.isFinite(options.timeout) && options.timeout > 0
+      ? setTimeout(() => {
+        timedOut = true;
+        killChildTree("SIGTERM");
+        killTimer = setTimeout(() => {
+          killChildTree("SIGKILL");
+        }, 2000);
+        killTimer.unref?.();
+      }, options.timeout)
+      : null;
+    timeoutTimer?.unref?.();
+
+    child.stdout.on("data", (chunk) => appendCapped(stdoutChunks, stdoutState, chunk));
+    child.stderr.on("data", (chunk) => appendCapped(stderrChunks, stderrState, chunk));
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      const result = {
+        status: code ?? (spawnError ? 1 : (signal ? 1 : 0)),
+        stdout,
+        stderr,
+        error: spawnError
+          ? String(spawnError.message || spawnError)
+          : (timedOut ? `Command timed out after ${options.timeout} ms.` : ""),
+        errorCode: spawnError?.code ? String(spawnError.code) : (timedOut ? "ETIMEDOUT" : ""),
+        signal: signal || "",
+        timedOut,
+        stdoutBytes: stdoutState.total,
+        stderrBytes: stderrState.total
+      };
+      if (childResultNeedsTreeCleanup(result)) {
+        killChildTree("SIGKILL");
+      }
+      resolve(result);
+    });
+  });
+}
+
+function backgroundSupervisorTimeoutMs(job) {
+  const timeout = Number(job?.timeout);
+  if (Number.isFinite(timeout) && timeout > 0) {
+    return (timeout * 2) + BACKGROUND_SUPERVISOR_TIMEOUT_GRACE_MS;
+  }
+  try {
+    const args = Array.isArray(job?.args) ? job.args.map(String) : [];
+    if (args.some((arg) => arg === "--timeout-seconds" || arg.startsWith("--timeout-seconds="))) {
+      const parsed = parseArgs(args);
+      if (Number.isFinite(parsed.timeout) && parsed.timeout > 0) {
+        return (parsed.timeout * 2) + BACKGROUND_SUPERVISOR_TIMEOUT_GRACE_MS;
+      }
+    }
+  } catch {
+    // Invalid stored arguments will fail in the child command; keep the supervisor bounded.
+  }
+  return (DEFAULT_TIMEOUT_MS * 2) + BACKGROUND_SUPERVISOR_TIMEOUT_GRACE_MS;
+}
+
+async function runStoredJob(rawArgs) {
+  if (process.env.ANTIGRAVITY_INTERNAL_DISPATCH !== "1") {
+    process.stderr.write("__run-job requires internal dispatch.\n");
+    process.exit(2);
+  }
+  const jobId = requireJobId(rawArgs, "__run-job");
+  const job = readJob(jobId, process.cwd(), process.env);
+  if (!job) {
+    process.stderr.write(`Unknown job "${jobId}".\n`);
+    process.exit(1);
+  }
+  const running = markJobRunning(jobId, {
+    pid: process.pid,
+    identity: captureProcessIdentity(process.pid)
+  }, job.cwd, process.env);
+  if (!running) {
+    process.stderr.write(`Unknown job "${jobId}".\n`);
+    process.exit(1);
+  }
+  if (isTerminalJobStatus(running.status)) {
+    process.exit(0);
+  }
+  const resourceLease = ensureResourceLease(running.resourceLeaseId, "background-job", { env: process.env, command: running.command, transferable: false });
+  if (!resourceLease.ok) {
+    const message = capacityBlockedMessage("antigravity-for-claude", resourceLease);
+    finishJob(jobId, {
+      status: 75,
+      stdout: "",
+      stderr: `${message}\n`,
+      error: message
+    }, running.cwd, process.env);
+    process.exit(75);
+  }
+
+  const heartbeat = setInterval(() => {
+    updateJob(jobId, (job) => {
+      if (isTerminalJobStatus(job.status)) {
+        return job;
+      }
+      const timestamp = new Date().toISOString();
+      job.lastHeartbeatAt = timestamp;
+      job.updatedAt = timestamp;
+      return job;
+    }, running.cwd, process.env);
+  }, jobHeartbeatIntervalMs(process.env));
+  heartbeat.unref?.();
+
+  try {
+    const result = await runChildProcessAsync(process.execPath, [COMPANION_PATH, running.command, ...running.args], {
+      cwd: running.cwd,
+      env: process.env,
+      timeout: backgroundSupervisorTimeoutMs(running),
+      onSpawn: (child) => {
+        updateJob(jobId, (job) => {
+          if (isTerminalJobStatus(job.status)) {
+            return job;
+          }
+          job.supervisedWorker = {
+            pid: child.pid,
+            identity: captureProcessIdentity(child.pid)
+          };
+          job.updatedAt = new Date().toISOString();
+          return job;
+        }, running.cwd, process.env);
+      }
+    });
+    finishJob(jobId, {
+      status: result.status ?? 1,
+      stdout: result.stdout || "",
+      stderr: result.stderr || "",
+      error: result.error || ""
+    }, running.cwd, process.env);
+  } finally {
+    clearInterval(heartbeat);
+    resourceLease.release();
+  }
+}
+
+function runReviewGate(rawArgs) {
+  if (!reviewGateEnabled()) {
+    return;
+  }
+  const args = parseArgsOrExit(rawArgs);
+  const deadline = reviewGateDeadline(reviewGateTimeoutBudgetMs(process.env, args.timeout));
+  if (args.help) {
+    process.stdout.write("Usage: antigravity-companion.mjs review-gate [--model-provider gemini|claude] [--model <label>] [focus]\n");
+    return;
+  }
+
+  let result;
+  try {
+    const context = reviewGateGitContext({ deadline });
+    if (!context.trusted) {
+      warnReviewGate(`${context.reason || "repository context unavailable"}; allowing stop`);
+      return;
+    }
+    if (!context.reviewable) {
+      return;
+    }
+    const preflightBudget = reviewGateRemainingMs(deadline);
+    if (preflightBudget <= 0) {
+      warnReviewGate("timeout budget exhausted before preflight; allowing stop");
+      return;
+    }
+    const preflight = antigravityPreflight(process.env, { ...args, timeout: preflightBudget });
+    if (reviewGateRemainingMs(deadline) <= 0) {
+      warnReviewGate("timeout budget exhausted after preflight; allowing stop");
+      return;
+    }
+    if (!preflight.ok) {
+      warnReviewGate(`runtime unavailable; allowing stop: ${preflight.error || `missing ${preflight.missing.join(", ")}`}`);
+      return;
+    }
+    const remaining = reviewGateRemainingMs(deadline);
+    if (remaining <= 0) {
+      warnReviewGate("timeout budget exhausted before model call; allowing stop");
+      return;
+    }
+    const prompt = renderCommandPrompt("review-gate", {
+      ROLE: "stop-gate",
+      ROLE_BRIEF: "Block only concrete issues that should prevent Claude Code from stopping.",
+      TASK: focusBlock(args),
+      GIT_CONTEXT: context.context,
+      MODEL_PROVIDER: preflight.modelProvider,
+      MODEL: preflight.model
+    });
+    result = antigravityPrint(prompt, { ...args, timeout: remaining, preflight }, process.env);
+  } catch (error) {
+    warnReviewGate(`runtime error; allowing stop: ${error.message || String(error)}`);
+    return;
+  }
+
+  if (result.status !== 0) {
+    warnReviewGate(`runtime failed; allowing stop: ${result.stderr || result.error || `exit ${result.status}`}`);
+    return;
+  }
+
+  const verdict = parseReviewGateOutput(result.stdout);
+  if (verdict.kind === "block") {
+    process.stdout.write(`${JSON.stringify({ decision: "block", reason: verdict.reason })}\n`);
+    return;
+  }
+  if (verdict.kind === "allow") {
+    return;
+  }
+  warnReviewGate("invalid output; allowing stop");
+}
+
+async function runMultiReview(rawArgs) {
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help) {
+    process.stdout.write(usage("multi-review"));
+    return;
+  }
+  try {
+    validateQualityLoopArgs("multi-review", args);
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+  if (args.background) {
+    return queueBackgroundJob("multi-review", rawArgs);
+  }
+  const preflight = antigravityPreflight(process.env, args);
+  if (!preflight.ok) {
+    process.stderr.write(`${preflight.error || `Antigravity CLI is unavailable; missing ${preflight.missing.join(", ")}.`}\n`);
+    process.exit(2);
+  }
+  let roles;
+  try {
+    roles = resolveRoles({ roles: args.roles, rolePack: args.rolePack });
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+  const sharedGitContext = gitContext();
+  const task = focusBlock(args);
+  const advisoryLeaseIds = [];
+  if (args.useMailbox) {
+    try {
+      postMailboxMessage({
+        thread: "multi-review",
+        message: `Started Antigravity multi-review with roles: ${roles.map((role) => role.name).join(", ")}`,
+        cwd: process.cwd()
+      }, process.env);
+    } catch (error) {
+      process.stderr.write(`[antigravity-for-claude advisory] mailbox unavailable: ${error.message || String(error)}\n`);
+    }
+  }
+  if (args.advisoryLeases) {
+    for (const role of roles) {
+      try {
+        const claim = claimLease({ role: role.name, ttlSeconds: 900, cwd: process.cwd() }, process.env);
+        advisoryLeaseIds.push(claim.leaseId);
+      } catch (error) {
+        process.stderr.write(`[antigravity-for-claude advisory] lease unavailable: ${error.message || String(error)}\n`);
+        break;
+      }
+    }
+  }
+  const concurrency = multiReviewConcurrency(process.env);
+  const results = await mapWithConcurrency(roles, concurrency, async (role) => {
+    const prompt = renderCommandPrompt("multi-review", {
+      ROLE: role.name,
+      ROLE_BRIEF: role.brief,
+      TASK: task,
+      GIT_CONTEXT: sharedGitContext,
+      MODEL_PROVIDER: preflight?.modelProvider || args.modelProvider || process.env.ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER || "gemini",
+      MODEL: preflight?.model || args.model || "",
+      PROJECT_INSTRUCTIONS_BLOCK: projectInstructionsPromptBlock(args),
+      VALIDATION_EVIDENCE_BLOCK: validationEvidencePromptBlock(args),
+      SCORECARD_BLOCK: scorecardPromptBlock(args),
+      OUTPUT_CONTRACT: reviewOutputContract(args)
+    });
+    const result = await antigravityPrintAsync(prompt, { ...args, preflight }, process.env);
+    return { role: role.name, result };
+  });
+
+  if (args.scorecard) {
+    const payload = scorecardMultiReviewPayload(results, args);
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    process.exit(payload.verdict === "approve" ? 0 : 1);
+  }
+
+  let failed = false;
+  process.stdout.write(`## Orchestration\n${concurrency <= 1 ? "sequential Antigravity role review" : `parallel Antigravity role fan-out (bounded ${concurrency} max)`}\n\n`);
+  for (const { role, result } of results) {
+    const body = result.stdout || result.stderr || result.error;
+    const timeoutNote = result.timedOut ? `${body ? "\n" : ""}[timed out]` : "";
+    process.stdout.write(`## ${role}\n${body || "No output."}${timeoutNote}\n\n`);
+    if (result.status !== 0) {
+      failed = true;
+    }
+  }
+  for (const leaseId of advisoryLeaseIds) {
+    try {
+      releaseLease(leaseId, process.cwd(), process.env);
+    } catch {
+      // Advisory leases must not affect review outcome.
+    }
+  }
+  process.exit(failed ? 1 : 0);
+}
+
+function planReviewRolePrompt(role, args, preflight) {
+  const template = readPromptTemplate(ROOT_DIR, "plan-review-role");
+  const reviewedFile = args.planFile?.relative ?? "";
+  return renderTemplate(template, {
+    ROLE_NAME: escapeXmlText(role.name),
+    ROLE_DIRECTIVE: escapeXmlText(role.brief || role.directive || ""),
+    MODEL_PROVIDER: preflight?.modelProvider || args.modelProvider || process.env.ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER || "gemini",
+    MODEL: preflight?.model || args.model || "",
+    PROJECT_INSTRUCTIONS_BLOCK: projectInstructionsPromptBlock(args),
+    VALIDATION_EVIDENCE_BLOCK: validationEvidencePromptBlock(args),
+    FOCUS_BLOCK: focusBlock(args),
+    SCORECARD_BLOCK: scorecardPromptBlock(args),
+    OUTPUT_CONTRACT: reviewOutputContract(args),
+    REVIEWED_FILE_PATH_ATTR: escapeXmlAttribute(reviewedFile),
+    REVIEWED_FILE_JSON_PATH: escapeXmlText(JSON.stringify(reviewedFile)),
+    PLAN_TEXT_CDATA: escapeCdata(args.planFile?.text ?? "")
+  });
+}
+
+async function runPlanReview(rawArgs) {
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help) {
+    process.stdout.write(usage("plan-review"));
+    return;
+  }
+  try {
+    validateQualityLoopArgs("plan-review", args);
+    if (args.background) {
+      throw new Error("plan-review does not support --background.");
+    }
+    if (!args.plan) {
+      throw new Error("--plan is required for plan-review.");
+    }
+    args.planFile = readWorkspaceBoundPlanFile(args.plan, process.cwd(), process.env);
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+  const preflight = antigravityPreflight(process.env, args);
+  if (!preflight.ok) {
+    process.stderr.write(`${preflight.error || `Antigravity CLI is unavailable; missing ${preflight.missing.join(", ")}.`}\n`);
+    process.exit(2);
+  }
+  let roles;
+  try {
+    roles = resolveRoles({ roles: args.roles, rolePack: args.rolePack });
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+  const results = [];
+  for (const role of roles) {
+    const prompt = planReviewRolePrompt(role, args, preflight);
+    const result = antigravityPrint(prompt, { ...args, preflight }, process.env);
+    results.push({ role: role.name, result });
+  }
+  if (args.scorecard) {
+    const payload = scorecardMultiReviewPayload(results, args, "plan-review");
+    payload.reviewedFile = args.planFile.relative;
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    process.exit(payload.verdict === "approve" ? 0 : 1);
+  }
+  let failed = false;
+  process.stdout.write(`# Antigravity Plan Review\n\nreviewed plan: ${args.planFile.relative}\n\n`);
+  for (const { role, result } of results) {
+    const body = result.stdout || result.stderr || result.error;
+    process.stdout.write(`## ${role}\n${body || "No output."}\n\n`);
+    if (result.status !== 0) {
+      failed = true;
+    }
+  }
+  process.exit(failed ? 1 : 0);
+}
+
+function assistedReviewPrompt(args, round) {
+  const taskset = args.tasksetLoaded?.ok ? args.tasksetLoaded.taskset : null;
+  const tasksetBlock = taskset
+    ? `<assisted_review_taskset trust="untrusted">\n${escapeXmlText(JSON.stringify(taskset, null, 2))}\n</assisted_review_taskset>`
+    : "";
+  return [
+    promptPartial("assisted-review"),
+    `<assisted_review_round>${round}</assisted_review_round>`,
+    tasksetBlock,
+    templatePromptFor("review", args, args.preflight)
+  ].filter(Boolean).join("\n\n");
+}
+
+async function runAssistedReview(rawArgs) {
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help) {
+    process.stdout.write(usage("assisted-review"));
+    return;
+  }
+  try {
+    validateQualityLoopArgs("assisted-review", args);
+    if (args.background) {
+      throw new Error("assisted-review does not support --background.");
+    }
+    args.scorecard = true;
+    args.maxReviewRounds = args.maxReviewRounds ?? 2;
+    if (args.tasksetId) {
+      args.tasksetLoaded = readTaskset(process.cwd(), args.tasksetId, process.env);
+      if (!args.tasksetLoaded.ok) {
+        throw new Error(`Unable to read taskset ${args.tasksetId}: ${args.tasksetLoaded.error}`);
+      }
+    }
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(2);
+  }
+  const preflight = antigravityPreflight(process.env, args);
+  if (!preflight.ok) {
+    process.stderr.write(`${preflight.error || `Antigravity CLI is unavailable; missing ${preflight.missing.join(", ")}.`}\n`);
+    process.exit(2);
+  }
+  args.preflight = preflight;
+  const loopId = `loop-${randomUUID()}`;
+  const rounds = [];
+  let finalAction = { action: "review" };
+  for (let round = 1; round <= args.maxReviewRounds; round += 1) {
+    const result = antigravityPrint(assistedReviewPrompt(args, round), { ...args, preflight }, process.env);
+    let scorecard = null;
+    let roundFailureCategory = "";
+    if (result.status === 0) {
+      try {
+        scorecard = parseScorecardResult(result.stdout);
+      } catch (error) {
+        process.stderr.write(`Invalid assisted-review scorecard output: ${error.message || String(error)}\n`);
+        process.stdout.write(result.stdout);
+        process.exit(1);
+      }
+    } else {
+      roundFailureCategory = classifyProviderFailure({ ...result, outcome: classifyAgyOutcome(result) });
+    }
+    const summary = {
+      ...scorecardRoundSummary("assisted-review", scorecard, roundFailureCategory),
+      blockingFindingIds: scorecard ? [...blockingFindingIds(scorecard)] : []
+    };
+    rounds.push(summary);
+    writeRoundSummary(process.cwd(), loopId, round, summary, process.env);
+    finalAction = nextAssistedReviewAction({
+      maxRounds: args.maxReviewRounds,
+      rounds,
+      repeatedBlockingFinding: hasRepeatedBlockingFinding(rounds)
+    });
+    if (finalAction.action === "stop") {
+      break;
+    }
+  }
+  const latest = rounds.at(-1) ?? {};
+  const payload = {
+    status: finalAction.reason === "threshold_met" ? "approved" : "needs_attention",
+    loopId,
+    rounds: rounds.length,
+    stopReason: finalAction.reason ?? "max_rounds",
+    scoreTotal: latest.scoreTotal ?? null,
+    threshold: latest.threshold ?? 85,
+    blockingFindings: latest.blockingFindings ?? 0,
+    nextSuggestedCommand: "antigravity-review --scorecard --json"
+  };
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  process.exit(payload.status === "approved" ? 0 : 1);
+}
+
+function releaseCheckResult(ok, name, detail = "") {
+  return { ok, name, detail };
+}
+
+function expectedSkills() {
+  return [
+    "antigravity-review",
+    "antigravity-adversarial-review",
+    "antigravity-multi-review",
+    "antigravity-plan",
+    "antigravity-plan-review",
+    "antigravity-assisted-review",
+    "antigravity-rescue",
+    "antigravity-review-gate",
+    "antigravity-github-actions-review",
+    "antigravity-role-packs",
+    "antigravity-status",
+    "antigravity-result",
+    "antigravity-cancel",
+    "antigravity-collaboration-loop",
+    "antigravity-mailbox",
+    "antigravity-leases"
+  ];
+}
+
+function expectedPublicCommands() {
+  return [
+    "review",
+    "adversarial-review",
+    "multi-review",
+    "doctor",
+    "plan",
+    "plan-review",
+    "assisted-review",
+    "rescue",
+    "review-gate",
+    "real-smoke",
+    "release-check",
+    "report",
+    "roles",
+    "jobs",
+    "status",
+    "result",
+    "cancel",
+    "reserve-job",
+    "run-reserved-job",
+    "mailbox",
+    "leases",
+    "github-actions"
+  ];
+}
+
+function runReleaseCheck(rawArgs) {
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help) {
+    process.stdout.write("Usage: antigravity-companion.mjs release-check\n");
+    return;
+  }
+
+  let manifest = {};
+  try {
+    manifest = JSON.parse(readText(".claude-plugin/plugin.json"));
+  } catch (error) {
+    process.stderr.write(`release-check failed: cannot read manifest: ${error.message || String(error)}\n`);
+    process.exit(1);
+  }
+
+  const companion = readText("scripts/antigravity-companion.mjs");
+  const runtime = readText("scripts/lib/antigravity-runtime.mjs");
+  const versionHelper = readText("scripts/lib/version.mjs");
+  const githubActions = readText("scripts/lib/github-actions.mjs");
+  const jobs = readText("scripts/lib/jobs.mjs");
+  const reports = readText("scripts/lib/reports.mjs");
+  const state = readText("scripts/lib/state.mjs");
+  const resourceGovernor = readText("scripts/lib/resource-governor.mjs");
+  const spawnRetry = readText("scripts/lib/spawn-retry.mjs");
+  const processModule = readText("scripts/lib/process.mjs");
+  const worktreeFingerprintModule = readText("scripts/lib/worktree-fingerprint.mjs");
+  const mailbox = readText("scripts/lib/mailbox.mjs");
+  const leases = readText("scripts/lib/leases.mjs");
+  const readme = readText("README.md");
+  const changelog = readText("CHANGELOG.md");
+  const antigravityDocs = `${readme}\n${changelog}`;
+  let naturalLanguageRoutingContract = {
+    routedModelSkills: [],
+    requiredAnchors: [],
+    requiredPolicyPhrases: [],
+    requiredMarkers: [],
+    skillMarkers: {},
+    userExamplesStart: "",
+    userExamplesEnd: "",
+    forbiddenUserExampleSubstrings: [],
+    githubActionsInitForbiddenSubstrings: [],
+    githubActionsInitForbiddenPaths: []
+  };
+  let naturalLanguageRoutingContractLoaded = false;
+  try {
+    naturalLanguageRoutingContract = JSON.parse(readText(path.join("contracts", "natural-language-routing.json")));
+    naturalLanguageRoutingContractLoaded = true;
+  } catch {
+    naturalLanguageRoutingContractLoaded = false;
+  }
+  const routedSkillDocs = (naturalLanguageRoutingContract.routedModelSkills || []).map((skillName) => ({
+    skillName,
+    text: exists(path.join("skills", skillName, "SKILL.md")) ? readText(path.join("skills", skillName, "SKILL.md")) : ""
+  }));
+  const routedSkillsHaveNaturalLanguageRouting = routedSkillDocs.every(({ text }) =>
+    (naturalLanguageRoutingContract.requiredAnchors || []).every((anchor) => text.includes(anchor))
+      && (naturalLanguageRoutingContract.requiredPolicyPhrases || []).every((phrase) => text.includes(phrase))
+      && (naturalLanguageRoutingContract.requiredMarkers || []).every((marker) => text.includes(marker))
+  );
+  const routedSkillsHaveExpectedMarkers = routedSkillDocs.every(({ skillName, text }) =>
+    ((naturalLanguageRoutingContract.skillMarkers || {})[skillName] || []).every((marker) => text.includes(marker))
+  );
+  const extractMarkdownSection = (text, startMarker, endMarker) => {
+    const start = text.indexOf(startMarker);
+    if (start === -1) {
+      return "";
+    }
+    const bodyStart = start + startMarker.length;
+    const end = text.indexOf(endMarker, bodyStart);
+    if (end === -1) {
+      return "";
+    }
+    return text.slice(bodyStart, end);
+  };
+  const sourceSlice = (text, startMarker, endMarker) => {
+    const start = text.indexOf(startMarker);
+    if (start === -1) {
+      return "";
+    }
+    const end = text.indexOf(endMarker, start + startMarker.length);
+    if (end === -1) {
+      return "";
+    }
+    return text.slice(start, end);
+  };
+  const routedSkillUserExamplesHideInternalFlags = routedSkillDocs.every(({ text }) => {
+    const routingStart = text.indexOf("## Natural-Language Model Routing");
+    if (routingStart === -1) {
+      return false;
+    }
+    const userExamples = extractMarkdownSection(
+      text.slice(routingStart),
+      naturalLanguageRoutingContract.userExamplesStart,
+      naturalLanguageRoutingContract.userExamplesEnd
+    );
+    return userExamples
+      && (naturalLanguageRoutingContract.forbiddenUserExampleSubstrings || []).every((forbidden) => !userExamples.includes(forbidden));
+  });
+  const repoTextIfExists = (relativePath) => {
+    try {
+      return readDistributionText(relativePath);
+    } catch {
+      return "";
+    }
+  };
+  const githubActionsForbiddenPathDocs = (naturalLanguageRoutingContract.githubActionsInitForbiddenPaths || [])
+    .map((relativePath) => ({ relativePath, text: repoTextIfExists(relativePath) }));
+  const pluginPathPrefix = `plugins${path.sep}antigravity-for-claude${path.sep}`;
+  const githubActionsForbiddenPluginPathsExist = githubActionsForbiddenPathDocs
+    .filter(({ relativePath }) => path.normalize(relativePath).startsWith(pluginPathPrefix))
+    .every(({ text }) => Boolean(text));
+  const githubActionsInitHidesInternalFlags = githubActionsForbiddenPathDocs
+    .filter(({ text }) => Boolean(text))
+    .every(({ text }) => {
+      return text
+        && (naturalLanguageRoutingContract.githubActionsInitForbiddenSubstrings || []).every((forbidden) => !text.includes(forbidden));
+    });
+  const hooks = exists("hooks/hooks.json") ? readText("hooks/hooks.json") : "";
+  const commandTexts = shippedPluginTexts(["commands"]);
+  const commandFiles = new Set(commandTexts.map(({ relativePath }) => path.basename(relativePath)));
+  const expectedClaudeCommands = [
+    "setup.md",
+    "review.md",
+    "adversarial-review.md",
+    "multi-review.md",
+    "plan-review.md",
+    "plan.md",
+    "assisted-review.md",
+    "status.md",
+    "result.md",
+    "cancel.md",
+    "roles.md",
+    "github-actions.md"
+  ];
+  const commandArgumentSafetyOk = commandTexts.length > 0
+    && commandTexts.every(({ text }) =>
+      text.includes("disable-model-invocation: true")
+        && text.includes("${CLAUDE_PLUGIN_ROOT}/scripts/antigravity-companion.mjs")
+        && !text.includes('"$ARGUMENTS"')
+        && !text.includes("CO" + "DEX_PLUGIN" + "_ROOT")
+    );
+  const defaultProviderIsGeminiOnly = [
+    'args.modelProvider || "gemini"',
+    'envProvider && envProvider !== "claude"',
+    'MODEL_PROVIDER: preflight?.modelProvider || args.modelProvider || process.env.ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER || "gemini"'
+  ].every((needle) => companion.includes(needle) || runtime.includes(needle));
+  const renderedWorkflow = renderWorkflow(ROOT_DIR, { releaseRef: RELEASE_REF });
+  const workflowValidation = validateWorkflow(renderedWorkflow);
+  const repositoryInstallDocs = repositoryInstallDocsReleaseRefCheck();
+  const matureCommands = expectedPublicCommands();
+  const manifestDescription = String(manifest.description || "");
+  const printHotPath = runtime.match(/export function antigravityPrintArgs[\s\S]*?export function antigravityPrint\(/)?.[0] || "";
+  const preflightHotPath = sourceSlice(runtime, "export function antigravityPreflight", "function timeoutMsToAgyDuration");
+  const untrackedExcerptHotPath = sourceSlice(companion, "function openReadOnlyNoFollow", "function untrackedContext");
+  const normalGitHotPath = sourceSlice(companion, "function runGit", "function reviewGateTimeoutBudgetMs");
+  const normalGitContextHotPath = sourceSlice(companion, "function gitContext", "function reviewGateGitContext");
+  const reviewGateGitHotPath = sourceSlice(companion, "function reviewGateGitEnv", "function isSafeRelativePath");
+  const reviewGateContextHotPath = sourceSlice(companion, "function reviewGateGitContext", "function reviewGateEnabled");
+  const reviewGateRuntimeHotPath = sourceSlice(companion, "function runReviewGate", "async function runMultiReview");
+  const reserveJobHotPath = sourceSlice(companion, "function runReserveJob", "function appendCapped");
+  const activeJobsHotPath = sourceSlice(companion, "function activeBackgroundJobs", "function spawnStoredJobWorker");
+  const backgroundSupervisorHotPath = sourceSlice(companion, "function childResultNeedsTreeCleanup", "function runReviewGate");
+  const resourceGovernorHotPath = sourceSlice(companion, "function antigravityPrint", "function usage");
+  const resourceGovernorBackgroundHotPath = `${sourceSlice(companion, "function spawnStoredJobWorker", "function queueBackgroundJob")}\n${sourceSlice(companion, "function queueBackgroundJob", "function writeReviewOperationReport")}\n${sourceSlice(companion, "function runReserveJob", "function appendCapped")}\n${sourceSlice(companion, "async function runStoredJob", "function runReviewGate")}\n${sourceSlice(companion, "async function mapWithConcurrency", "function runChildProcessAsync")}\n${sourceSlice(companion, "async function runMultiReview", "function releaseCheckResult")}`;
+  const untrackedSymlinkSafeOk = [
+    "fs.constants?.O_NOFOLLOW",
+    "fs.lstatSync(filePath)",
+    "openReadOnlyNoFollow(filePath)",
+    "fs.fstatSync(fd)",
+    "stat.isSymbolicLink()",
+    "[skipped symlink]",
+    "[skipped changed file]"
+  ].every((needle) => untrackedExcerptHotPath.includes(needle));
+  const normalGitContextHardeningOk = [
+    'spawnSync("git", reviewGateGitArgs(args)',
+    "env: reviewGateGitEnv(options.env ?? process.env)",
+    '"diff", "--no-ext-diff", "--no-textconv", "--cached", "--stat"',
+    '"diff", "--no-ext-diff", "--no-textconv", "--stat"',
+    '"diff", "--no-ext-diff", "--no-textconv", "--cached", "--", "."',
+    '"diff", "--no-ext-diff", "--no-textconv", "--", "."'
+  ].every((needle) => normalGitHotPath.includes(needle) || normalGitContextHotPath.includes(needle));
+  const reviewGateGitHardeningOk = [
+    "GIT_REPOSITORY_ENV_KEYS.has(key)",
+    "GIT_CONFIG_(KEY|VALUE)",
+    'env.NO_COLOR = "1"',
+    '"color.ui=false"',
+    '"color.status=false"',
+    '"color.diff=false"',
+    '"core.fsmonitor=false"',
+    'spawnSync("git", reviewGateGitArgs(args)',
+    "env: reviewGateGitEnv(options.env ?? process.env)"
+  ].every((needle) => reviewGateGitHotPath.includes(needle))
+    && [
+      '["diff", "--no-ext-diff", "--no-textconv", "--cached", "--stat"]',
+      '["diff", "--no-ext-diff", "--no-textconv", "--stat"]',
+      '["diff", "--no-ext-diff", "--no-textconv", "--cached", "--", "."]',
+      '["diff", "--no-ext-diff", "--no-textconv", "--", "."]'
+    ].every((needle) => reviewGateContextHotPath.includes(needle));
+  const reviewGateReviewableFirstOk = [
+    "reviewable: false",
+    "reason: \"no git changes\"",
+    "const context = reviewGateGitContext({ deadline });",
+    "if (!context.reviewable)",
+    "const preflight = antigravityPreflight"
+  ].every((needle) => reviewGateContextHotPath.includes(needle) || reviewGateRuntimeHotPath.includes(needle))
+    && reviewGateRuntimeHotPath.indexOf("const context = reviewGateGitContext({ deadline });") >= 0
+    && reviewGateRuntimeHotPath.indexOf("const context = reviewGateGitContext({ deadline });") < reviewGateRuntimeHotPath.indexOf("const preflight = antigravityPreflight");
+  const stateGitHardeningOk = [
+    "function sanitizedGitEnv",
+    "GIT_REPOSITORY_ENV_KEYS.has(key)",
+    "GIT_CONFIG_(KEY|VALUE)",
+    "env.NO_COLOR = \"1\"",
+    "function hardenedGitArgs",
+    "\"core.fsmonitor=false\"",
+    "spawnSync(\"git\", hardenedGitArgs",
+    "env: sanitizedGitEnv(env)",
+    "gitSignalTimeoutMs(env)",
+    "killSignal: \"SIGKILL\""
+  ].every((needle) => state.includes(needle));
+  const backgroundSupervisorHardeningOk = [
+    "function childResultNeedsTreeCleanup",
+    "childResultNeedsTreeCleanup(result)",
+    'killChildTree("SIGKILL")',
+    'const detached = process.platform !== "win32";',
+    "detached,",
+    "process.kill(-child.pid, signal)",
+    '"taskkill.exe"',
+    "job.supervisedWorker =",
+    "(timeout * 2) + BACKGROUND_SUPERVISOR_TIMEOUT_GRACE_MS",
+    "(DEFAULT_TIMEOUT_MS * 2) + BACKGROUND_SUPERVISOR_TIMEOUT_GRACE_MS"
+  ].every((needle) => backgroundSupervisorHotPath.includes(needle));
+  const windowsDescendantCleanupOk = [
+    "cleanupWindowsDescendantsByParentPid",
+    "ParentProcessId = $parent",
+    "Stop-Process -Id $childPid",
+    "cleanupWindowsProcessTree(result.pid",
+    "cleanupWindowsProcessTree(child.pid"
+  ].every((needle) => runtime.includes(needle));
+  const posixSyncSupervisorOk = [
+    "const POSIX_SYNC_SUPERVISOR",
+    "function runCommandWithPosixSupervisor",
+    "detached: true",
+    "process.kill(-child.pid, signal)",
+    "parentPid: process.pid",
+    "parentMonitor",
+    "normalizePosixScriptInvocation(command, args)",
+    "return runCommandWithPosixSupervisor(invocation.command, invocation.args, options, env)"
+  ].every((needle) => runtime.includes(needle));
+  const reservedJobResourceGuardOk = [
+    "RESERVABLE_COMMANDS.has(command)",
+    "withWorkspaceJobLock(cwd, process.env",
+    "worktreeFingerprint(cwd",
+    "antigravityPreflight(process.env, args)",
+    "deriveJobIdempotencyKey",
+    "findReusableJob",
+    "activeBackgroundJobs(cwd, process.env).length >= cap",
+    "reserveJob({ command, args: cleanArgs, cwd, timeout }",
+    "excludeJobId: jobId",
+    "claimReservedJob(cwd, jobId"
+  ].every((needle) => reserveJobHotPath.includes(needle))
+    && [
+      "function activeBackgroundJobs",
+      "classifyJobLiveness",
+      "[\"queued\", \"healthy\", \"suspect\"]",
+      "excludeJobId"
+    ].every((needle) => activeJobsHotPath.includes(needle));
+  const globalResourceGovernorOk = [
+    "ANTIGRAVITY_FOR_CLAUDE_RESOURCE_LOCK_DIR",
+    "ANTIGRAVITY_FOR_CLAUDE_GLOBAL_MAX_MODEL_CALLS",
+    "ANTIGRAVITY_FOR_CLAUDE_GLOBAL_MAX_BACKGROUND_JOBS",
+    "ANTIGRAVITY_FOR_CLAUDE_MULTI_REVIEW_MAX_PARALLEL",
+    "global-resource-locks",
+    "transferable",
+    "capacity_blocked"
+  ].every((needle) => resourceGovernor.includes(needle))
+    && [
+      'withResourceLeaseSync("model-call"',
+      'withResourceLeaseAsync("model-call"'
+    ].every((needle) => resourceGovernorHotPath.includes(needle))
+    && [
+      'acquireResourceLease("background-job"',
+      'ensureResourceLease(running.resourceLeaseId, "background-job"',
+      "transferResourceLease(resourceLeaseId, child.pid",
+      "multiReviewConcurrency(process.env)",
+      "sequential Antigravity role review",
+      "capacityBlockedMessage(\"antigravity-for-claude\""
+    ].every((needle) => resourceGovernorBackgroundHotPath.includes(needle));
+  const spawnRetrySafetyOk = [
+    "EAGAIN",
+    "EMFILE",
+    "ENFILE",
+    "ENOBUFS",
+    "spawnSyncWithRetry"
+  ].every((needle) => spawnRetry.includes(needle))
+    && [
+      "POSIX_SYNC_SUPERVISOR_ATTEMPTS",
+      "isTransientRunCommandFailure"
+    ].every((needle) => runtime.includes(needle))
+    && [
+      companion,
+      runtime,
+      processModule,
+      state,
+      worktreeFingerprintModule
+    ].every((text) => text.includes("spawnSyncWithRetry"));
+  const shippedTexts = shippedPluginTexts();
+  const userFacingTexts = shippedPluginTexts(["README.md", "CHANGELOG.md", "skills", "assets"]);
+  const unsupportedReviewGateSetupPatterns = [
+    /setup --enable-review-gate/i,
+    /--review-gate-mode/i
+  ];
+  const executableTexts = shippedPluginTexts([
+    "scripts",
+    "hooks",
+    "prompts",
+    "templates",
+    "contracts",
+    "schemas",
+    ".claude-plugin/plugin.json"
+  ]);
+  const docsTexts = shippedPluginTexts(["README.md", "CHANGELOG.md", "skills"]);
+  const doctorText = shippedTexts.find(({ relativePath }) => relativePath === "scripts/lib/doctor.mjs")?.text || "";
+  const claudeWord = "cla" + "ude";
+  const fableWord = "Fa" + "ble";
+  const fallbackModelFlag = "--fallback-" + "model";
+  const ultrareviewWord = "ultra" + "review";
+  const ucWord = "ultra" + "code";
+  const forbiddenClaudeNativePatterns = [
+    new RegExp(`${claudeWord}-${fableWord}`, "i"),
+    new RegExp(`${fableWord} 5`, "i"),
+    new RegExp(`@anthropic-ai/${claudeWord}-agent-sdk`, "i"),
+    new RegExp(fallbackModelFlag, "i"),
+    new RegExp(`${claudeWord} ${ultrareviewWord}`, "i"),
+    new RegExp(ucWord, "i")
+  ];
+  const forbiddenRawClaudeExecutionPatterns = [
+    new RegExp(`\\b(?:spawn|spawnSync|execFile|execFileSync)\\(\\s*["']${claudeWord}["']`, "i"),
+    new RegExp(`\\b(?:exec|execSync)\\(\\s*["'][^"']*\\b${claudeWord}\\b`, "i"),
+    new RegExp(`\\b(?:command|cmd|binary|executable)\\s*[:=]\\s*["']${claudeWord}["']`, "i"),
+    new RegExp(`\\b${claudeWord}\\s+-p\\b`, "i")
+  ];
+  const forbiddenLocalPathPatterns = [
+    /(?:^|[\s"'=])~(?:\/|\\)[^\r\n"'`<>|]*/,
+    /(?:^|[\s"'=])\/(?:Users|home|private\/var\/folders|root|Volumes)[^\r\n"'`<>|]*/,
+    /(?:^|[\s"'=])[A-Za-z]:(?:\\{1,2}|\/)[^\r\n"'`<>|]*/
+  ];
+  const qualityLoopSurfaceOk = [
+    "prompts/scorecard.md",
+    "prompts/taskset.md",
+    "prompts/assisted-review.md",
+    "prompts/plan-review-role.md",
+    "schemas/scorecard-output.schema.json",
+    "schemas/taskset.schema.json",
+    "scripts/lib/assisted-review.mjs",
+    "scripts/lib/failure-taxonomy.mjs",
+    "scripts/lib/plan-review-file.mjs",
+    "scripts/lib/project-instructions.mjs",
+    "scripts/lib/scorecard.mjs",
+    "scripts/lib/state-ids.mjs",
+    "scripts/lib/summary-index.mjs",
+    "scripts/lib/tasksets.mjs",
+    "scripts/lib/validation-evidence.mjs",
+    "skills/antigravity-plan-review/SKILL.md",
+    "skills/antigravity-assisted-review/SKILL.md"
+  ].every((relativePath) => exists(relativePath))
+    && ["\"plan-review\"", "\"assisted-review\"", "--scorecard", "--taskset"].every((needle) => companion.includes(needle))
+    && runtime.includes("normalizePosixScriptInvocation")
+    && ["plan-review", "assisted-review", "--scorecard", "--taskset"].every((needle) => antigravityDocs.includes(needle));
+  const checks = [
+    releaseCheckResult(manifest.name === "antigravity-for-claude", "manifest-name"),
+    releaseCheckResult(manifest.version === PLUGIN_VERSION, "manifest-version"),
+    releaseCheckResult(versionHelper.includes(`PLUGIN_VERSION = "${manifest.version}"`), "version-helper"),
+    releaseCheckResult(readme.includes(`Version: ${PLUGIN_VERSION}`) && changelog.includes(`## ${PLUGIN_VERSION} `), "docs-version-aligned"),
+    releaseCheckResult(RELEASE_REF === `antigravity-for-claude-v${PLUGIN_VERSION}`, "release-ref-derived"),
+    releaseCheckResult(repositoryInstallDocs.ok, "repository-install-docs-release-ref", repositoryInstallDocs.detail),
+    releaseCheckResult(exists("skills") && exists("skills/README.md"), "skills-present"),
+    releaseCheckResult(manifestDescription.includes("explicit Gemini or Claude model-provider selection"), "manifest-model-policy"),
+    releaseCheckResult(exists("commands") && expectedClaudeCommands.every((file) => commandFiles.has(file)), "claude-commands-present"),
+    releaseCheckResult(commandArgumentSafetyOk, "command-argument-safety"),
+    releaseCheckResult(hooks.includes("${CLAUDE_PLUGIN_ROOT}") && !hooks.includes("CO" + "DEX_PLUGIN" + "_ROOT"), "hooks-use-claude-plugin-root"),
+    releaseCheckResult(defaultProviderIsGeminiOnly, "default-provider-gemini"),
+    releaseCheckResult(state.includes("CLAUDE_PLUGIN_DATA") && state.includes("ANTIGRAVITY_FOR_CLAUDE_DATA"), "claude-data-state"),
+    releaseCheckResult(textScanPasses(shippedTexts, [
+      new RegExp("ANTIGRAVITY_FOR_" + "CODEX"),
+      new RegExp("CO" + "DEX_PLUGIN_" + "ROOT"),
+      new RegExp("CO" + "DEX_PLUGIN_" + "DATA"),
+      new RegExp("antigravity-for-" + "codex"),
+      new RegExp("claude-for-" + "codex"),
+      new RegExp("\\." + "codex/")
+    ]), "no-codex-host-leakage"),
+    releaseCheckResult(exists("scripts/lib/agy-capabilities.mjs"), "agy-capabilities-module"),
+    releaseCheckResult(exists("scripts/lib/agy-outcome.mjs"), "agy-outcome-module"),
+    releaseCheckResult(
+      exists("scripts/lib/doctor.mjs")
+        && companion.includes('"doctor"')
+        && doctorText.includes("runDoctorCommand")
+        && doctorText.includes("typeof result.then"),
+      "doctor-command"
+    ),
+    releaseCheckResult(exists("scripts/lib/job-lifecycle.mjs") && exists("scripts/lib/worktree-fingerprint.mjs"), "job-lifecycle-fingerprint"),
+    releaseCheckResult(exists("scripts/lib/hook-compat.mjs"), "hook-compat-module"),
+    releaseCheckResult(textScanPasses(executableTexts, forbiddenClaudeNativePatterns), "no-claude-native-executable-leakage"),
+    releaseCheckResult(textScanPasses(executableTexts, forbiddenRawClaudeExecutionPatterns), "no-raw-claude-executable-invocation"),
+    releaseCheckResult(docsTexts.some(({ text }) => text.includes("not Antigravity features") || text.includes("does not claim Claude SDK")), "docs-negative-claude-boundary"),
+    releaseCheckResult(textScanPasses(shippedTexts, forbiddenLocalPathPatterns), "no-local-absolute-paths"),
+    releaseCheckResult(exists("assets/composer-icon.svg") && exists("assets/logo.svg"), "assets-present"),
+    releaseCheckResult(companion.includes("ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE_TIMEOUT_MS"), "review-gate-timeout-env"),
+    releaseCheckResult(normalGitContextHardeningOk, "normal-git-context-hardening"),
+    releaseCheckResult(reviewGateGitHardeningOk, "review-gate-git-hardening"),
+    releaseCheckResult(reviewGateReviewableFirstOk, "review-gate-reviewable-first"),
+    releaseCheckResult(stateGitHardeningOk, "state-git-hardening"),
+    releaseCheckResult(untrackedSymlinkSafeOk, "untracked-symlink-safe"),
+    releaseCheckResult(backgroundSupervisorHardeningOk, "background-supervisor-hardening"),
+    releaseCheckResult(windowsDescendantCleanupOk, "windows-descendant-cleanup"),
+    releaseCheckResult(posixSyncSupervisorOk, "posix-sync-timeout-cleanup"),
+    releaseCheckResult(reservedJobResourceGuardOk, "reserved-job-resource-guard"),
+    releaseCheckResult(globalResourceGovernorOk, "global-resource-governor"),
+    releaseCheckResult(spawnRetrySafetyOk, "spawn-retry-safety"),
+    releaseCheckResult(qualityLoopSurfaceOk, "quality-loop-surface"),
+    releaseCheckResult(textScanPasses(userFacingTexts, unsupportedReviewGateSetupPatterns), "no-unsupported-review-gate-setup-command"),
+    releaseCheckResult(companion.includes("deriveJobIdempotencyKey") && companion.includes("worktreeFingerprint"), "background-idempotency-fingerprint"),
+    releaseCheckResult(githubActionsForbiddenPluginPathsExist, "skills-natural-language-routing-paths"),
+    releaseCheckResult(
+      naturalLanguageRoutingContractLoaded
+        && routedSkillsHaveNaturalLanguageRouting
+        && routedSkillsHaveExpectedMarkers
+        && routedSkillUserExamplesHideInternalFlags
+        && githubActionsForbiddenPluginPathsExist
+        && githubActionsInitHidesInternalFlags,
+      "skills-natural-language-routing"
+    ),
+    releaseCheckResult(antigravityDocs.includes("operational maturity for plugin-managed workflows"), "docs-maturity-boundary"),
+    releaseCheckResult(antigravityDocs.includes("does not claim Claude SDK, Gemini native-agent, or ultrareview parity"), "docs-no-unsupported-parity"),
+    releaseCheckResult(antigravityDocs.includes("Claude-through-Antigravity is an explicit Antigravity model-provider choice"), "docs-claude-through-antigravity-boundary"),
+    releaseCheckResult(antigravityDocs.includes("real smoke remains opt-in") || antigravityDocs.includes("real-smoke` is opt-in"), "docs-real-smoke-opt-in"),
+    releaseCheckResult(antigravityDocs.includes("CI runs require an authenticated `agy`"), "docs-ci-authenticated-agy"),
+    releaseCheckResult(companion.includes('"real-smoke"') && companion.includes('"release-check"'), "valid-commands"),
+    releaseCheckResult(matureCommands.every((commandName) => USER_VISIBLE_COMMANDS.includes(commandName)), "all-mature-commands"),
+    releaseCheckResult(!USER_VISIBLE_COMMANDS.includes("__run-job"), "capabilities-hide-internal"),
+    releaseCheckResult(runtime.includes("GPT/OpenAI") && runtime.includes("/\\b(gpt|openai)\\b/i"), "model-policy-rejects-openai"),
+    releaseCheckResult(runtime.includes("--prompt") && runtime.includes("--print-timeout"), "agy-prompt-timeout-argv"),
+    releaseCheckResult(runtime.includes("--log-file") && runtime.includes("antigravityLogDiagnostic") && runtime.includes("EEMPTYOUTPUT"), "agy-empty-output-log-diagnostics"),
+    releaseCheckResult(!/args\.push\(\s*["']--print["']/.test(runtime), "no-print-argv"),
+    releaseCheckResult(!runtime.includes("--dangerously-skip-permissions") || runtime.includes("forbidden"), "dangerous-permission-guard"),
+    releaseCheckResult(hooks.includes("${CLAUDE_PLUGIN_ROOT}") && hooks.includes("antigravity-review-gate.mjs"), "hooks-discovery"),
+    releaseCheckResult(exists("hooks/antigravity-review-gate.mjs"), "hook-wrapper"),
+    releaseCheckResult(exists("hooks/session-lifecycle.mjs") && exists("hooks/unread-result.mjs"), "lifecycle-hooks"),
+    releaseCheckResult(exists("templates/github-actions/antigravity-for-claude-review.yml"), "github-actions-template"),
+    releaseCheckResult(renderedWorkflow.includes(RELEASE_REF), "github-actions-release-ref"),
+    releaseCheckResult(renderWorkflow(ROOT_DIR).includes(RELEASE_REF), "github-actions-default-ref-derived"),
+    releaseCheckResult(workflowValidation.checks.some((check) => check.name === "plugin-root-resolved" && check.ok), "github-actions-plugin-root-resolved"),
+    releaseCheckResult(workflowValidation.checks.some((check) => check.name === "no-repo-relative-runtime-path" && check.ok), "github-actions-no-repo-relative-runtime-path"),
+    releaseCheckResult(
+      preflightHotPath.includes("antigravityModelCatalog(env, { timeout: options.modelCatalogTimeout })")
+        && preflightHotPath.includes("selectedModel(env, { ...options, models: catalog.models })")
+        && runtime.includes("timeout: options.timeout || 10 * 1000"),
+      "model-catalog-bounded-preflight"
+    ),
+    releaseCheckResult(companion.includes("antigravityModelDiagnostics") && companion.includes("modelCatalog"), "model-catalog-diagnostics"),
+    releaseCheckResult(jobs.includes("stateDirForCwd") && mailbox.includes("stateDirForCwd") && leases.includes("stateDirForCwd"), "repo-external-state"),
+    releaseCheckResult(reports.includes("stdoutBytes") && !reports.includes("stdout:"), "reports-omit-raw-output"),
+    ...expectedSkills().map((skill) => releaseCheckResult(exists(path.join("skills", skill, "SKILL.md")), `skill-${skill}`)),
+    ...workflowValidation.checks.map((check) => releaseCheckResult(check.ok, `workflow-${check.name}`, check.detail))
+  ];
+
+  const failures = checks.filter((check) => !check.ok);
+  if (args.json) {
+    process.stdout.write(`${JSON.stringify({ ok: failures.length === 0, checks }, null, 2)}\n`);
+  } else {
+    for (const check of checks) {
+      process.stdout.write(`${check.ok ? "PASS" : "FAIL"} ${check.name}${check.detail ? ` - ${check.detail}` : ""}\n`);
+    }
+  }
+  if (failures.length) {
+    process.stderr.write(`release-check failed: ${failures.map((failure) => failure.name).join(", ")}\n`);
+    process.exit(1);
+  }
+}
+
+async function runRealSmoke(rawArgs) {
+  if (process.env.ANTIGRAVITY_FOR_CLAUDE_REAL_SMOKE !== "1") {
+    process.stderr.write("real-smoke is opt-in. Set ANTIGRAVITY_FOR_CLAUDE_REAL_SMOKE=1 to run Antigravity CLI smoke checks.\n");
+    process.exit(2);
+  }
+  const args = parseArgsOrExit(rawArgs);
+  if (args.help) {
+    process.stdout.write("Usage: antigravity-companion.mjs real-smoke [--quick|--full] [--model-provider gemini|claude] [--model <label>] [--timeout-seconds <n>]\n");
+    return;
+  }
+
+  const providers = args.modelProvider ? [args.modelProvider] : ["gemini", "claude"];
+  const results = [];
+  const modelArgs = args.model ? ["--model", args.model] : [];
+  const runCommandSmoke = (provider, label, commandArgs, extraEnv = {}) => {
+    const result = spawnSync(process.execPath, [COMPANION_PATH, ...commandArgs], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        ...extraEnv,
+        ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER: provider
+      },
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: args.timeout || DEFAULT_TIMEOUT_MS,
+      killSignal: "SIGKILL"
+    });
+    const output = `${result.stdout || ""}\n${result.stderr || ""}`;
+    const ok = label === "review-gate"
+      ? (result.status ?? 1) === 0 && !result.stderr
+      : (result.status ?? 1) === 0 && output.includes("ANTIGRAVITY_FOR_CLAUDE_SMOKE_OK");
+    return {
+      provider,
+      label,
+      ok,
+      result: {
+        status: result.status ?? 1,
+        stdout: result.stdout || "",
+        stderr: result.stderr || "",
+        error: result.error ? String(result.error.message || result.error) : ""
+      }
+    };
+  };
+  for (const provider of providers) {
+    const diagnostics = antigravityModelDiagnostics(process.env, { ...args, modelProvider: provider });
+    process.stdout.write(`INFO real-smoke ${provider} modelCatalog ${JSON.stringify(diagnostics.modelCatalog)}\n`);
+    const smokeArgs = {
+      ...args,
+      modelProvider: provider,
+      timeout: args.timeout || (args.quick ? 4 * 60 * 1000 : DEFAULT_TIMEOUT_MS)
+    };
+    if (args.full) {
+      const commandChecks = [
+        ["direct", ["review", "--model-provider", provider, ...modelArgs, "Return exactly ANTIGRAVITY_FOR_CLAUDE_SMOKE_OK."]],
+        ["structured", ["review", "--model-provider", provider, ...modelArgs, "--structured", "Return a valid structured review JSON and include ANTIGRAVITY_FOR_CLAUDE_SMOKE_OK."], {}],
+        ["multi-review", ["multi-review", "--model-provider", provider, ...modelArgs, "--roles", "correctness,security", "Include ANTIGRAVITY_FOR_CLAUDE_SMOKE_OK."], {}],
+        ["review-gate", ["review-gate", "--model-provider", provider, ...modelArgs], { ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE: "on" }]
+      ];
+      for (const [label, commandArgs, extraEnv] of commandChecks) {
+        const item = runCommandSmoke(provider, label, commandArgs, extraEnv);
+        results.push({ ...item, diagnostics });
+        process.stdout.write(`${item.ok ? "PASS" : "FAIL"} real-smoke ${provider} ${label}\n`);
+        if (!item.ok) {
+          process.stdout.write(`${item.result.stdout || item.result.stderr || item.result.error || "no output"}\n`);
+        }
+      }
+      const startedAt = new Date().toISOString();
+      const reportResult = results.find((item) => item.provider === provider && item.label === "direct")?.result || { status: 1, stdout: "", stderr: "", error: "missing direct smoke result" };
+      try {
+        writeOperationReport(process.cwd(), operationReport({
+          command: "real-smoke",
+          args: { ...smokeArgs, modelProvider: provider },
+          result: reportResult,
+          startedAt,
+          endedAt: new Date().toISOString()
+        }), process.env);
+        process.stdout.write(`PASS real-smoke ${provider} report\n`);
+      } catch (error) {
+        results.push({ provider, label: "report", ok: false, result: { status: 1, stdout: "", stderr: "", error: error.message || String(error) }, diagnostics });
+        process.stdout.write(`FAIL real-smoke ${provider} report\n${error.message || String(error)}\n`);
+      }
+    } else {
+      const result = await antigravityPrintAsync("Return exactly ANTIGRAVITY_FOR_CLAUDE_SMOKE_OK.", smokeArgs, process.env);
+      const ok = result.status === 0 && result.stdout.includes("ANTIGRAVITY_FOR_CLAUDE_SMOKE_OK");
+      results.push({ provider, label: provider, ok, result, diagnostics });
+      process.stdout.write(`${ok ? "PASS" : "FAIL"} real-smoke ${provider}\n`);
+      if (!ok) {
+        process.stdout.write(`${result.stdout || result.stderr || result.error || "no output"}\n`);
+      }
+    }
+  }
+  if (results.some((item) => !item.ok)) {
+    process.exit(1);
+  }
+}
+
+async function main() {
+  const [command = "", ...rest] = process.argv.slice(2);
+  if (!command || command === "--help" || command === "-h" || command === "help") {
+    process.stdout.write(usage());
+    return;
+  }
+  if (!VALID_COMMANDS.has(command)) {
+    process.stderr.write(`Unknown command "${command}".\n`);
+    process.exit(2);
+  }
+  if (command === "setup" || command === "capabilities") {
+    return runSetupOrCapabilities(command, rest);
+  }
+  if (command === "report") {
+    return runReport(rest);
+  }
+  if (command === "roles") {
+    return runRoles(rest);
+  }
+  if (command === "doctor") {
+    return runDoctor(rest);
+  }
+  if (command === "jobs") {
+    return runJobs(rest);
+  }
+  if (command === "status") {
+    return runStatus(rest);
+  }
+  if (command === "result") {
+    return runResult(rest);
+  }
+  if (command === "cancel") {
+    return runCancel(rest);
+  }
+  if (command === "mailbox") {
+    return runMailbox(rest);
+  }
+  if (command === "leases") {
+    return runLeases(rest);
+  }
+  if (command === "github-actions") {
+    return runGithubActions(rest);
+  }
+  if (command === "reserve-job") {
+    return runReserveJob(rest);
+  }
+  if (command === "run-reserved-job") {
+    return runReservedJob(rest);
+  }
+  if (command === "__run-job") {
+    return runStoredJob(rest);
+  }
+  if (command === "__command-probe") {
+    return runCommandProbe(rest);
+  }
+  if (command === "multi-review") {
+    return runMultiReview(rest);
+  }
+  if (command === "plan-review") {
+    return runPlanReview(rest);
+  }
+  if (command === "assisted-review") {
+    return runAssistedReview(rest);
+  }
+  if (command === "review-gate") {
+    return runReviewGate(rest);
+  }
+  if (command === "real-smoke") {
+    return runRealSmoke(rest);
+  }
+  if (command === "release-check") {
+    return runReleaseCheck(rest);
+  }
+  if (REVIEW_COMMANDS.has(command)) {
+    return runReview(command, rest);
+  }
+}
+
+main().catch((error) => {
+  process.stderr.write(`${error.stack || error.message || String(error)}\n`);
+  process.exit(1);
+});

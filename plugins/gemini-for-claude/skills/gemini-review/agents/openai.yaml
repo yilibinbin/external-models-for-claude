@@ -1,0 +1,5 @@
+interface:
+  display_name: "Gemini Review"
+  short_description: "Run read-only Gemini CLI review from Claude Code"
+  brand_color: "#4F46E5"
+  default_prompt: "Use Gemini for Claude to run a read-only Gemini review of the current git changes and summarize actionable findings."

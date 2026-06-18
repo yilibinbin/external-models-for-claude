@@ -1,0 +1,4948 @@
+#!/usr/bin/env node
+
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import {
+  cancelJob,
+  claimReservedJob,
+  createJob,
+  finishJob,
+  listJobs,
+  markJobRunning,
+  readJob,
+  reserveJob,
+  resultForJob,
+  updateJob
+} from "./lib/jobs.mjs";
+import {
+  StateReadError,
+  canonicalWorkspaceRoot,
+  currentSessionFileForCwd,
+  getConfig,
+  readJson,
+  readStateReport,
+  setConfig,
+  stateFileForCwd,
+  turnBaselineFileForCwd
+} from "./lib/state.mjs";
+import { GIT_TIMEOUT_MS } from "./lib/workspace.mjs";
+import { extractJsonObject, validateAdversarialJson } from "./lib/structured-output.mjs";
+import { loadPromptTemplate, renderPromptTemplate } from "./lib/prompt-template.mjs";
+import { renderStructuredReview, validateStructuredReview } from "./lib/render-review.mjs";
+import {
+  ContextProviderError,
+  parseContextOptions,
+  resolveContext,
+  resolveProviderSelection
+} from "./lib/context-provider.mjs";
+import {
+  readReviewJson,
+  renderReviewComment,
+  renderWorkflow,
+  reviewToAnnotations,
+  validateWorkflow,
+  workflowPath,
+  writeWorkflow
+} from "./lib/github-actions.mjs";
+import {
+  ADVERSARIAL_LENSES,
+  DEFAULT_ADVERSARIAL_LENSES,
+  DEFAULT_MULTI_REVIEW_ROLES,
+  REVIEW_ROLES,
+  defaultRoleObjects,
+  hashRolePack,
+  listRolePacks,
+  resolveExplicitRoles,
+  resolveRolePack,
+  rolePackGateCompatible,
+  rolePackNativeAgentsCompatible,
+  rolePackReportMetadata,
+  rolePackSummary,
+  rolesForPack,
+  validateBuiltInRolePacks,
+  validateRolePackFile
+} from "./lib/role-packs.mjs";
+import {
+  listMailboxThreads,
+  mailboxSummary,
+  postMailboxMessage,
+  showMailboxThread
+} from "./lib/mailbox.mjs";
+import {
+  claimLease,
+  leaseSummary,
+  listLeases,
+  releaseLease
+} from "./lib/leases.mjs";
+import { mailboxDirForCwd, leasesDirForCwd } from "./lib/state.mjs";
+import { formatProgressEvent, progressEventsFromStderr } from "./lib/progress.mjs";
+import {
+  acquireResourceLease,
+  capacityBlockedMessage,
+  ensureResourceLease,
+  multiReviewConcurrency,
+  transferResourceLease,
+  withResourceLeaseAsync,
+  withResourceLeaseSync
+} from "./lib/resource-governor.mjs";
+import { spawnSyncWithRetry } from "./lib/spawn-retry.mjs";
+import { normalizeScorecardOutput } from "./lib/scorecard.mjs";
+import { saveTaskset, readTaskset } from "./lib/tasksets.mjs";
+import { loadValidationEvidence, renderValidationEvidenceBlock } from "./lib/validation-evidence.mjs";
+import { DEFAULT_PROJECT_INSTRUCTION_FILES, renderProjectInstructionsBlock } from "./lib/project-instructions.mjs";
+import { readWorkspaceBoundPlanFile } from "./lib/plan-review-file.mjs";
+import { writeRoundSummary } from "./lib/summary-index.mjs";
+import { nextAssistedReviewAction } from "./lib/assisted-review.mjs";
+import { classifyProviderFailure } from "./lib/failure-taxonomy.mjs";
+
+const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const VALID_COMMANDS = new Set(["setup", "capabilities", "report", "real-smoke", "release-check", "github-actions", "roles", "mailbox", "leases", "review", "adversarial-review", "multi-review", "plan-review", "plan", "assisted-review", "status", "review-gate", "jobs", "result", "cancel", "rescue", "recommend-execution-mode", "sessions", "__run-job", "reserve-job", "run-reserved-job"]);
+const BACKGROUND_CAPABLE_COMMANDS = new Set(["review", "adversarial-review", "multi-review", "assisted-review", "rescue"]);
+const VALID_SCOPES = new Set(["auto", "working-tree", "branch"]);
+const VALID_REVIEW_GATE_MODES = new Set(["multi-role"]);
+const VALID_AGENT_TEAMS = new Set(["plugin", "native-agents"]);
+const GEMINI_CLI_PATH_ENV = "GEMINI_CLI_PATH";
+const REVIEW_GATE_ENV = "GEMINI_FOR_CLAUDE_REVIEW_GATE";
+const REVIEW_GATE_TIMEOUT_MS = 15 * 60 * 1000;
+const REVIEW_GATE_ROLE_TIMEOUT_MS = 2 * 60 * 1000;
+const REPORT_VERSION = 1;
+const JSON_BLOCK_SCAN_LIMIT = 512 * 1024;
+const JSON_BLOCK_CANDIDATE_LIMIT = 32;
+const REVIEW_GIT_TIMEOUT_MS = 30 * 1000;
+let geminiHelpReportCache = null;
+
+function spawnSync(command, args, options) {
+  return spawnSyncWithRetry(command, args, options);
+}
+
+function run(command, args, options = {}) {
+  const isGit = command === "git";
+  const result = spawnSync(command, args, {
+    cwd: options.cwd ?? process.cwd(),
+    env: options.env ?? process.env,
+    encoding: "utf8",
+    input: options.input,
+    maxBuffer: 20 * 1024 * 1024,
+    timeout: options.timeout ?? (isGit ? REVIEW_GIT_TIMEOUT_MS : 15 * 60 * 1000),
+    killSignal: options.killSignal ?? (isGit ? "SIGKILL" : undefined)
+  });
+
+  return {
+    status: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error ? String(result.error.message ?? result.error) : "",
+    errorCode: result.error?.code ? String(result.error.code) : ""
+  };
+}
+
+function git(args) {
+  return run("git", args);
+}
+
+function isExecutable(filePath) {
+  try {
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findOnPath(commandName) {
+  const searchPath = process.env.PATH || "";
+  for (const entry of searchPath.split(path.delimiter)) {
+    if (!entry) {
+      continue;
+    }
+    const candidate = path.join(entry, commandName);
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+  return "";
+}
+
+function splitShebang(line) {
+  const text = String(line || "").replace(/^#!/, "").trim();
+  if (!text) return null;
+  const parts = text.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((part) => part.replace(/^(['"])(.*)\1$/, "$2")) ?? [];
+  return parts.length ? parts : null;
+}
+
+function normalizePosixScriptInvocation(command, args = []) {
+  if (process.platform === "win32" || !path.isAbsolute(command)) {
+    return { command, args };
+  }
+  let header = "";
+  try {
+    header = fs.readFileSync(command, { encoding: "utf8", flag: "r" }).split(/\r?\n/, 1)[0] || "";
+  } catch {
+    return { command, args };
+  }
+  if (!header.startsWith("#!")) {
+    return { command, args };
+  }
+  const shebang = splitShebang(header);
+  if (!shebang) {
+    return { command, args };
+  }
+  const [interpreter, ...interpreterArgs] = shebang;
+  return { command: interpreter, args: [...interpreterArgs, command, ...args] };
+}
+
+function expandExecutableCandidates(pattern) {
+  const parts = path.resolve(pattern).split(path.sep);
+  const results = [];
+
+  function visit(index, current) {
+    if (index >= parts.length) {
+      results.push(current || path.sep);
+      return;
+    }
+    const part = parts[index];
+    if (!part) {
+      visit(index + 1, path.sep);
+      return;
+    }
+    if (part !== "*") {
+      visit(index + 1, path.join(current || path.sep, part));
+      return;
+    }
+    const dir = current || path.sep;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        visit(index + 1, path.join(dir, entry.name));
+      }
+    }
+  }
+
+  visit(0, "");
+  return results;
+}
+
+function candidateGeminiCommands() {
+  const executableNames = process.platform === "win32" ? ["gemini.cmd", "gemini.exe", "gemini"] : ["gemini"];
+  const home = process.env.HOME || os.homedir();
+  const candidates = [];
+  const add = (candidate) => {
+    if (candidate) {
+      candidates.push(candidate);
+    }
+  };
+  const addBin = (dir) => {
+    for (const name of executableNames) {
+      add(dir ? path.join(dir, name) : "");
+    }
+  };
+
+  addBin(path.join(home, ".local", "bin"));
+  addBin(path.join(home, "bin"));
+  addBin(path.join(home, ".npm-global", "bin"));
+  addBin(path.join(home, ".volta", "bin"));
+  addBin(path.join(home, ".asdf", "shims"));
+  addBin(path.join(home, ".bun", "bin"));
+  addBin(path.join(home, ".deno", "bin"));
+  addBin(process.env.PNPM_HOME);
+  addBin(process.env.NPM_CONFIG_PREFIX ? path.join(process.env.NPM_CONFIG_PREFIX, "bin") : "");
+  addBin(process.env.npm_config_prefix ? path.join(process.env.npm_config_prefix, "bin") : "");
+  addBin(process.env.HOMEBREW_PREFIX ? path.join(process.env.HOMEBREW_PREFIX, "bin") : "");
+
+  for (const pattern of [
+    path.join(home, ".nvm", "versions", "node", "*", "bin", "gemini"),
+    path.join(home, ".fnm", "node-versions", "*", "installation", "bin", "gemini"),
+    path.join(home, ".asdf", "installs", "nodejs", "*", "bin", "gemini")
+  ]) {
+    candidates.push(...expandExecutableCandidates(pattern));
+  }
+
+  for (const dir of ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]) {
+    addBin(dir);
+  }
+  return [...new Set(candidates)];
+}
+
+function geminiCommand() {
+  const configuredPath = process.env[GEMINI_CLI_PATH_ENV];
+  if (configuredPath && isExecutable(configuredPath)) {
+    return configuredPath;
+  }
+  const pathCommand = findOnPath("gemini");
+  if (pathCommand) {
+    return pathCommand;
+  }
+  for (const candidate of candidateGeminiCommands()) {
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+  return "gemini";
+}
+
+function runGemini(args, options = {}) {
+  const invocation = normalizePosixScriptInvocation(geminiCommand(), args);
+  return run(invocation.command, invocation.args, options);
+}
+
+function hasBinary(name) {
+  return run(name, ["--version"]).status === 0;
+}
+
+function hasGemini() {
+  return runGemini(["--version"]).status === 0;
+}
+
+function geminiHelpReport() {
+  const result = runGemini(["--help"]);
+  const help = result.stdout || result.stderr || "";
+  const requiredFlags = ["--prompt", "--output-format", "--approval-mode", "--skip-trust"];
+  if (process.env.GEMINI_FOR_CLAUDE_SANDBOX === "on") {
+    requiredFlags.push("--sandbox");
+  }
+  const missing = requiredFlags.filter((flag) => !help.includes(flag));
+  return {
+    checked: result.status === 0,
+    ok: result.status === 0 && missing.length === 0,
+    missing,
+    requiredFlags,
+    capabilities: geminiCapabilitiesFromHelp(help),
+    error: result.status === 0 ? "" : (result.stderr || result.error || "gemini --help failed").trim()
+  };
+}
+
+function geminiCapabilitiesFromHelp(help) {
+  const text = String(help ?? "");
+  return {
+    resume: text.includes("--resume"),
+    sessionId: text.includes("--session-id"),
+    sessionFile: text.includes("--session-file"),
+    listSessions: text.includes("--list-sessions"),
+    worktree: text.includes("--worktree"),
+    includeDirectories: text.includes("--include-directories"),
+    streamJson: text.includes("stream-json"),
+    extensionsCommand: /\bextensions\b/.test(text),
+    mcpCommand: /\bmcp\b/.test(text),
+    skillsCommand: /\bskills\b/.test(text),
+    hooksCommand: /\bhooks\b/.test(text),
+    allowedMcpServerNames: text.includes("--allowed-mcp-server-names"),
+    policy: text.includes("--policy"),
+    adminPolicy: text.includes("--admin-policy"),
+    rawOutput: text.includes(["--raw", "output"].join("-")),
+    acceptRawOutputRisk: text.includes(["--accept", "raw", "output", "risk"].join("-"))
+  };
+}
+
+function currentGeminiCapabilities() {
+  if (!geminiHelpReportCache) {
+    geminiHelpReportCache = geminiHelpReport();
+  }
+  return geminiHelpReportCache.capabilities;
+}
+
+function requireGeminiCapability(capability, flag) {
+  const capabilities = currentGeminiCapabilities();
+  if (!capabilities[capability]) {
+    throw new Error(`Gemini CLI does not report support for ${flag}. Run setup to inspect available capabilities.`);
+  }
+}
+
+function hasHead() {
+  return git(["rev-parse", "--verify", "HEAD"]).status === 0;
+}
+
+function hasBaseRef(base) {
+  return git(["rev-parse", "--verify", `${base}^{commit}`]).status === 0;
+}
+
+function parseArgs(argv) {
+  const tokens = normalizeArgv(argv);
+  const parsed = { _: [], paths: [] };
+  for (let index = 0; index < tokens.length; index += 1) {
+    const arg = tokens[index];
+    if (arg === "--base") {
+      parsed.base = readOptionValue(tokens, index, arg);
+      index += 1;
+    } else if (arg === "--scope") {
+      parsed.scope = readOptionValue(tokens, index, arg);
+      index += 1;
+    } else if (arg === "--path" || arg === "--paths") {
+      const path = readOptionValue(tokens, index, arg);
+      parsed.paths.push(path);
+      parsed.path = path;
+      index += 1;
+    } else if (arg === "--model") {
+      parsed.model = readOptionValue(tokens, index, arg);
+      index += 1;
+    } else if (arg === "--effort") {
+      parsed.effort = readOptionValue(tokens, index, arg);
+      index += 1;
+    } else if (arg === "--roles") {
+      const roles = readOptionValue(tokens, index, arg)
+        .split(",")
+        .map((role) => role.trim());
+      if (roles.some((role) => !role)) {
+        throw new Error("Missing role in --roles.");
+      }
+      parsed.roles = [...(parsed.roles ?? []), ...roles];
+      index += 1;
+    } else if (arg === "--role") {
+      const role = readOptionValue(tokens, index, arg).trim();
+      if (!role) {
+        throw new Error("Missing value for --role.");
+      }
+      parsed.roles = [...(parsed.roles ?? []), role];
+      index += 1;
+    } else if (arg === "--role-pack") {
+      parsed.rolePack = readOptionValue(tokens, index, arg).trim();
+      if (!parsed.rolePack) {
+        throw new Error("Missing value for --role-pack.");
+      }
+      index += 1;
+    } else if (arg === "--role-pack-file") {
+      throw new Error("--role-pack-file is validate/inspect-only and is not accepted by review commands.");
+    } else if (arg === "--adversarial-lenses") {
+      const lenses = readOptionValue(tokens, index, arg)
+        .split(",")
+        .map((lens) => lens.trim());
+      if (lenses.some((lens) => !lens)) {
+        throw new Error("Missing lens in --adversarial-lenses.");
+      }
+      parsed.adversarialLenses = [...(parsed.adversarialLenses ?? []), ...lenses];
+      index += 1;
+    } else if (arg === "--adversarial-lens") {
+      const lens = readOptionValue(tokens, index, arg).trim();
+      if (!lens) {
+        throw new Error("Missing value for --adversarial-lens.");
+      }
+      parsed.adversarialLenses = [...(parsed.adversarialLenses ?? []), lens];
+      index += 1;
+    } else if (arg === "--background") {
+      parsed.background = true;
+    } else if (arg === "--wait") {
+      parsed.wait = true;
+    } else if (arg === "--json" || arg === "--json-output") {
+      parsed.jsonOutput = true;
+    } else if (arg === "--scorecard") {
+      parsed.scorecard = true;
+      parsed.jsonOutput = true;
+    } else if (["--validation-log", "--test-summary", "--ci-summary", "--screenshot-summary"].includes(arg)) {
+      parsed.validationEvidence = [...(parsed.validationEvidence ?? []), {
+        kind: arg.slice(2),
+        file: readOptionValue(tokens, index, arg)
+      }];
+      index += 1;
+    } else if (arg === "--rules") {
+      parsed.rules = [...(parsed.rules ?? []), readOptionValue(tokens, index, arg)];
+      index += 1;
+    } else if (arg === "--plan") {
+      parsed.plan = readOptionValue(tokens, index, arg);
+      index += 1;
+    } else if (arg === "--taskset") {
+      const maybeTasksetId = tokens[index + 1];
+      if (maybeTasksetId === undefined || maybeTasksetId.startsWith("--") || !maybeTasksetId.startsWith("ts-")) {
+        parsed.taskset = true;
+      } else {
+        parsed.tasksetId = readOptionValue(tokens, index, arg);
+        index += 1;
+      }
+    } else if (arg === "--max-review-rounds") {
+      const value = Number(readOptionValue(tokens, index, arg));
+      if (!Number.isInteger(value) || value < 1 || value > 3) {
+        throw new Error("--max-review-rounds must be an integer from 1 to 3.");
+      }
+      parsed.maxReviewRounds = value;
+      index += 1;
+    } else if (arg === "--structured" || arg === "--review-json") {
+      parsed.structuredReview = true;
+    } else if (arg === "--agent-team") {
+      parsed.agentTeam = readOptionValue(tokens, index, arg).trim();
+      if (!parsed.agentTeam) {
+        throw new Error("Missing value for --agent-team.");
+      }
+      index += 1;
+    } else if (arg.startsWith("--agent-team=")) {
+      parsed.agentTeam = arg.slice("--agent-team=".length);
+      if (!parsed.agentTeam) {
+        throw new Error("Missing value for --agent-team.");
+      }
+    } else if (arg === "--native-structured") {
+      parsed.nativeStructured = true;
+    } else if (arg === "--stream-progress") {
+      parsed.streamProgress = true;
+    } else if (arg === "--native-agents") {
+      parsed.nativeAgents = true;
+      parsed.agentTeam = parsed.agentTeam ?? "native-agents";
+    } else if (arg === "--use-mailbox") {
+      parsed.useMailbox = true;
+    } else if (arg === "--advisory-leases") {
+      parsed.advisoryLeases = true;
+    } else if (arg === "--context-provider") {
+      parsed.contextProvider = readOptionValue(tokens, index, arg);
+      index += 1;
+    } else if (arg.startsWith("--context-provider=")) {
+      parsed.contextProvider = arg.slice("--context-provider=".length);
+      if (!parsed.contextProvider) {
+        throw new Error("Missing value for --context-provider.");
+      }
+    } else if (arg === "--context-budget") {
+      parsed.contextBudget = readOptionValue(tokens, index, arg);
+      index += 1;
+    } else if (arg.startsWith("--context-budget=")) {
+      parsed.contextBudget = arg.slice("--context-budget=".length);
+      if (!parsed.contextBudget) {
+        throw new Error("Missing value for --context-budget.");
+      }
+    } else if (arg === "--context-timeout-ms") {
+      parsed.contextTimeoutMs = readOptionValue(tokens, index, arg);
+      index += 1;
+    } else if (arg.startsWith("--context-timeout-ms=")) {
+      parsed.contextTimeoutMs = arg.slice("--context-timeout-ms=".length);
+      if (!parsed.contextTimeoutMs) {
+        throw new Error("Missing value for --context-timeout-ms.");
+      }
+    } else if (arg === "--context-strict") {
+      parsed.contextStrict = true;
+    } else if (arg.startsWith("--resume=")) {
+      parsed.resume = arg.slice("--resume=".length) || "latest";
+    } else if (arg === "--resume") {
+      parsed.resume = "latest";
+    } else if (arg === "--fresh") {
+      parsed.fresh = true;
+    } else if (arg === "--session-id") {
+      parsed.sessionId = readOptionValue(tokens, index, arg);
+      index += 1;
+    } else if (arg.startsWith("--session-id=")) {
+      parsed.sessionId = arg.slice("--session-id=".length);
+      if (!parsed.sessionId) {
+        throw new Error("Missing value for --session-id.");
+      }
+    } else if (arg.startsWith("--worktree=")) {
+      parsed.worktree = arg.slice("--worktree=".length) || true;
+    } else if (arg === "--worktree") {
+      parsed.worktree = true;
+    } else if (arg === "--write") {
+      parsed.write = true;
+    } else {
+      parsed._.push(arg);
+    }
+  }
+  return parsed;
+}
+
+function resolveReviewRoles(args) {
+  if (args.rolePack !== undefined && args.roles !== undefined) {
+    throw new Error("--role-pack conflicts with --roles/--role.");
+  }
+  if (args.rolePack !== undefined) {
+    const pack = resolveRolePack(args.rolePack);
+    args.rolePackSummary = rolePackSummary(pack);
+    args.rolePack = pack;
+    return rolesForPack(pack);
+  }
+  if (args.roles === undefined) {
+    return [];
+  }
+  if (!args.roles.length) {
+    throw new Error("Missing value for --roles.");
+  }
+  return resolveExplicitRoles(args.roles);
+}
+
+function resolveAdversarialLenses(args) {
+  const requested = args.adversarialLenses === undefined
+    ? DEFAULT_ADVERSARIAL_LENSES
+    : args.adversarialLenses;
+  if (!requested.length) {
+    throw new Error("Missing value for --adversarial-lenses.");
+  }
+
+  const validLenses = Object.keys(ADVERSARIAL_LENSES).sort();
+  const seenLenses = new Set();
+  for (const lens of requested) {
+    if (!Object.hasOwn(ADVERSARIAL_LENSES, lens)) {
+      throw new Error(`Unknown adversarial lens "${lens}". Valid lenses: ${validLenses.join(", ")}.`);
+    }
+    if (seenLenses.has(lens)) {
+      throw new Error(`Duplicate adversarial lens "${lens}".`);
+    }
+    seenLenses.add(lens);
+  }
+  return requested.map((name) => ({
+    name,
+    ...ADVERSARIAL_LENSES[name]
+  }));
+}
+
+function normalizeAgentTeam(args, command) {
+  if (args.nativeAgents && command !== "multi-review") {
+    throw new Error("--native-agents is only valid for multi-review.");
+  }
+  if (args.agentTeam !== undefined && command !== "multi-review") {
+    throw new Error("--agent-team is only valid for multi-review.");
+  }
+  if (args.agentTeam !== undefined && !VALID_AGENT_TEAMS.has(args.agentTeam)) {
+    throw new Error(`Invalid --agent-team "${args.agentTeam}". Valid values: plugin, native-agents.`);
+  }
+  if (args.nativeAgents && args.agentTeam && args.agentTeam !== "native-agents") {
+    throw new Error("--native-agents conflicts with --agent-team plugin.");
+  }
+  if (args.nativeStructured && (command !== "multi-review" || args.agentTeam !== "native-agents")) {
+    throw new Error("--native-structured is only valid for multi-review --agent-team native-agents.");
+  }
+  if (args.streamProgress && command !== "multi-review") {
+    throw new Error("--stream-progress is only valid for multi-review.");
+  }
+  args.agentTeam = args.agentTeam ?? "plugin";
+  args.nativeAgents = args.agentTeam === "native-agents";
+}
+
+const SCORECARD_COMMANDS = new Set(["review", "multi-review", "adversarial-review", "plan-review", "assisted-review"]);
+const VALIDATION_EVIDENCE_COMMANDS = new Set(["review", "multi-review", "adversarial-review", "plan", "plan-review", "assisted-review"]);
+const RULE_COMMANDS = new Set(["review", "multi-review", "adversarial-review", "plan", "plan-review", "assisted-review", "rescue"]);
+
+function validateQualityLoopArgs(command, args) {
+  if (args.scorecard && !SCORECARD_COMMANDS.has(command)) {
+    throw new Error("--scorecard is only valid for review, multi-review, adversarial-review, plan-review, and assisted-review.");
+  }
+  if (command === "plan-review" && args.jsonOutput && !args.scorecard) {
+    throw new Error("--json is only valid for plan-review when --scorecard is also set.");
+  }
+  if (args.validationEvidence && !VALIDATION_EVIDENCE_COMMANDS.has(command)) {
+    throw new Error("--validation-log, --test-summary, --ci-summary, and --screenshot-summary are only valid for review, multi-review, adversarial-review, plan, plan-review, and assisted-review.");
+  }
+  if (args.rules && !RULE_COMMANDS.has(command)) {
+    throw new Error("--rules is only valid for prompt commands.");
+  }
+  if (args.plan !== undefined && command !== "plan-review") {
+    throw new Error("--plan is only valid for plan-review.");
+  }
+  if (args.taskset && command !== "plan") {
+    throw new Error("--taskset without an id is only valid for plan.");
+  }
+  if (args.tasksetId && command !== "assisted-review") {
+    throw new Error("--taskset <id> is only valid for assisted-review.");
+  }
+  if (args.maxReviewRounds !== undefined && command !== "assisted-review") {
+    throw new Error("--max-review-rounds is only valid for assisted-review.");
+  }
+}
+
+function readOptionValue(tokens, index, optionName) {
+  const value = tokens[index + 1];
+  if (value === undefined || value === "" || value.startsWith("--")) {
+    throw new Error(`Missing value for ${optionName}.`);
+  }
+  return value;
+}
+
+function normalizeArgv(argv) {
+  if (argv.length !== 1 || !argv[0]?.trim()) {
+    return argv;
+  }
+  return splitArgumentString(argv[0]);
+}
+
+function isHelpArg(value) {
+  return value === "--help" || value === "-h" || value === "help";
+}
+
+function publicCommands() {
+  return Array.from(VALID_COMMANDS).filter((name) => !name.startsWith("__"));
+}
+
+function printUsage(commandName = "") {
+  const command = commandName ? ` ${commandName}` : "";
+  process.stdout.write(`Usage: gemini-companion.mjs${command} [args]\n`);
+  if (!commandName) {
+    process.stdout.write(`Commands: ${publicCommands().join(", ")}\n`);
+    process.stdout.write("Run `gemini-companion.mjs <command> --help` for command-specific usage.\n");
+    return;
+  }
+  switch (commandName) {
+    case "review":
+      process.stdout.write("Review current git context with Gemini in read-only mode.\n");
+      process.stdout.write("Options: [--scope auto|working-tree|branch] [--base <ref>] [--path <path>] [--json|--structured] [focus]\n");
+      break;
+    case "adversarial-review":
+      process.stdout.write("Run an adversarial read-only Gemini review.\n");
+      process.stdout.write("Options: [--scope auto|working-tree|branch] [--base <ref>] [--path <path>] [--json] [focus]\n");
+      break;
+    case "multi-review":
+      process.stdout.write("Run Gemini role-based read-only review without editing files.\n");
+      process.stdout.write("Options: [--roles <list>|--role-pack <pack>] [--scorecard] [--agent-team plugin|native-agents] [--scope auto|working-tree|branch] [--base <ref>] [--path <path>] [focus]\n");
+      break;
+    case "plan-review":
+      process.stdout.write("Run Gemini role-based read-only review of a saved plan file.\n");
+      process.stdout.write("Options: --plan <file> [--roles <list>|--role-pack <pack>] [--scorecard [--json]] [focus]\n");
+      break;
+    case "assisted-review":
+      process.stdout.write("Run a bounded advisory Gemini scorecard review loop.\n");
+      process.stdout.write("Options: [--taskset <id>] [--max-review-rounds 1..3] [--validation-log <file>] [focus]\n");
+      break;
+    case "review-gate":
+      process.stdout.write("Run the opt-in Stop hook review gate for current git changes.\n");
+      process.stdout.write("Options: [--enable|--disable|--status] [--role-pack <pack>] [--roles <list>]\n");
+      break;
+    case "real-smoke":
+      process.stdout.write("Run opt-in live Gemini CLI smoke checks when enabled by environment.\n");
+      process.stdout.write("Options: [--quick|--full] [--model <name>] [--roles <list>] [--timeout-seconds <n>] [--include-native]\n");
+      break;
+    default:
+      process.stdout.write("Use this command with its documented options. This help path does not invoke Gemini.\n");
+      break;
+  }
+}
+
+function splitArgumentString(value) {
+  const tokens = [];
+  let current = "";
+  let quote = null;
+  let escaping = false;
+  let tokenStarted = false;
+
+  function pushToken() {
+    if (tokenStarted) {
+      tokens.push(current);
+      current = "";
+      tokenStarted = false;
+    }
+  }
+
+  for (const char of value) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      tokenStarted = true;
+      continue;
+    }
+    if (char === "\\") {
+      escaping = true;
+      tokenStarted = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      tokenStarted = true;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      pushToken();
+      continue;
+    }
+    current += char;
+    tokenStarted = true;
+  }
+
+  if (escaping) {
+    current += "\\";
+  }
+  if (quote) {
+    throw new Error("Unmatched quote in arguments.");
+  }
+  pushToken();
+  return tokens;
+}
+
+function formatCommandResult(label, result) {
+  const output = result.stdout.trim();
+  const stderr = result.stderr.trim() || result.error.trim();
+  return [
+    `${label}:`,
+    output || "(empty)",
+    result.status === 0 || !stderr ? "" : `stderr: ${stderr}`
+  ].filter(Boolean).join("\n");
+}
+
+function changedFilesFromStatus(status) {
+  const files = status.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean);
+
+  return {
+    status: status.status,
+    stdout: files.join("\n"),
+    stderr: status.stderr,
+    error: status.error
+  };
+}
+
+function safeResult(stdout) {
+  return {
+    status: 0,
+    stdout,
+    stderr: "",
+    error: ""
+  };
+}
+
+function countStatusFiles(stdout) {
+  return String(stdout ?? "").split("\n").filter((line) => line.trim()).length;
+}
+
+function shortstatFileCount(stdout) {
+  const match = String(stdout ?? "").match(/(\d+)\s+files?\s+changed/);
+  return match ? Number(match[1]) : 0;
+}
+
+function shortstatChangedLines(stdout) {
+  const text = String(stdout ?? "");
+  const insertions = Number(text.match(/(\d+)\s+insertions?/)?.[1] ?? 0);
+  const deletions = Number(text.match(/(\d+)\s+deletions?/)?.[1] ?? 0);
+  return insertions + deletions;
+}
+
+function gitStatus(cwd, args) {
+  return run("git", args, {
+    cwd,
+    timeout: 10000,
+    env: {
+      ...process.env,
+      LC_ALL: "C",
+      LANG: "C"
+    }
+  });
+}
+
+function recommendExecutionMode(rawArgs) {
+  let args;
+  try {
+    args = parseArgs(rawArgs);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  const cwd = process.cwd();
+  const commands = [];
+  const repo = gitStatus(cwd, ["rev-parse", "--show-toplevel"]);
+  if (repo.status !== 0) {
+    return {
+      recommendation: "foreground",
+      reason: "not a git repository",
+      reviewable: false,
+      fileCountEstimate: 0,
+      changedLineEstimate: 0,
+      hasUntracked: false,
+      git: { repository: false, error: (repo.stderr || repo.error || "").trim() },
+      commands
+    };
+  }
+
+  const status = gitStatus(cwd, ["status", "--short", "--untracked-files=all"]);
+  commands.push("git status --short --untracked-files=all");
+  const statusFileCount = countStatusFiles(status.stdout);
+  const hasUntracked = String(status.stdout).split("\n").some((line) => line.startsWith("??"));
+  const staged = gitStatus(cwd, ["diff", "--shortstat", "--cached"]);
+  commands.push("git diff --shortstat --cached");
+  const unstaged = gitStatus(cwd, ["diff", "--shortstat"]);
+  commands.push("git diff --shortstat");
+
+  let branch = null;
+  if (args.base) {
+    const baseExists = hasBaseRef(args.base);
+    if (baseExists && hasHead()) {
+      const branchStat = gitStatus(cwd, ["diff", "--shortstat", `${args.base}...HEAD`]);
+      commands.push(`git diff --shortstat ${args.base}...HEAD`);
+      branch = {
+        available: branchStat.status === 0,
+        base: args.base,
+        fileCount: shortstatFileCount(branchStat.stdout),
+        changedLines: shortstatChangedLines(branchStat.stdout),
+        error: branchStat.status === 0 ? "" : (branchStat.stderr || branchStat.error || "").trim()
+      };
+    } else {
+      branch = {
+        available: false,
+        base: args.base,
+        fileCount: 0,
+        changedLines: 0,
+        error: "base ref or HEAD is unavailable"
+      };
+    }
+  }
+
+  const fileCountEstimate = Math.max(
+    statusFileCount,
+    shortstatFileCount(staged.stdout) + shortstatFileCount(unstaged.stdout),
+    branch?.fileCount ?? 0
+  );
+  const changedLineEstimate = shortstatChangedLines(staged.stdout)
+    + shortstatChangedLines(unstaged.stdout)
+    + (branch?.changedLines ?? 0);
+  const reviewable = statusFileCount > 0 || (branch?.fileCount ?? 0) > 0;
+  let recommendation = "foreground";
+  let reason = "empty working tree or branch scope";
+  if (branch && !branch.available) {
+    recommendation = "background";
+    reason = "branch base unavailable; manual/background review recommended";
+  } else if (!reviewable) {
+    recommendation = "foreground";
+  } else if (hasUntracked || fileCountEstimate > 2 || changedLineEstimate > 50) {
+    recommendation = "background";
+    reason = "review appears larger than a small foreground review";
+  } else {
+    recommendation = "foreground";
+    reason = "small review scope";
+  }
+
+  return {
+    recommendation,
+    reason,
+    reviewable,
+    fileCountEstimate,
+    changedLineEstimate,
+    hasUntracked,
+    git: {
+      repository: true,
+      headAvailable: hasHead(),
+      branch
+    },
+    commands
+  };
+}
+
+function collectGitContext(options) {
+  const scope = options.scope ?? "auto";
+  const base = options.base;
+  const paths = options.paths?.length ? options.paths : options.path ? [options.path] : [];
+  const pathLabel = paths.join(" ");
+  const pathArgs = paths.length ? ["--", ...paths] : [];
+  const headExists = hasHead();
+  const baseExists = Boolean(base) && headExists && hasBaseRef(base);
+  const baseEffective = !base
+    ? ""
+    : !headExists
+      ? "unavailable (HEAD missing)"
+      : baseExists
+        ? base
+        : "unavailable (base ref missing)";
+  const baseIssue = !base
+    ? ""
+    : !headExists
+      ? "base ignored because HEAD is unavailable"
+      : !baseExists
+        ? "base ignored because requested base ref is unavailable"
+        : "";
+  const includeWorkingTree = scope === "auto" || scope === "working-tree";
+  const includeBaseBranch = (scope === "auto" || scope === "branch") && Boolean(base);
+  const includeHeadNameOnly = scope === "auto" && !base;
+
+  const status = includeWorkingTree ? git(["status", "--short", "--untracked-files=all", ...pathArgs]) : null;
+  const stagedStat = includeWorkingTree ? git(["diff", "--cached", "--stat", ...pathArgs]) : null;
+  const stagedDiff = includeWorkingTree ? git(["diff", "--cached", ...pathArgs]) : null;
+  const unstagedStat = includeWorkingTree ? git(["diff", "--stat", ...pathArgs]) : null;
+  const unstagedDiff = includeWorkingTree ? git(["diff", ...pathArgs]) : null;
+  const branchStat = includeBaseBranch
+    ? baseExists
+      ? git(["diff", "--stat", `${base}...HEAD`, ...pathArgs])
+      : safeResult(`(${baseIssue}; branch diff skipped)`)
+    : null;
+  const branchDiff = includeBaseBranch
+    ? baseExists
+      ? git(["diff", `${base}...HEAD`, ...pathArgs])
+      : safeResult(`(${baseIssue}; branch diff skipped)`)
+    : null;
+  const branchNameOnly = includeBaseBranch
+    ? baseExists
+      ? git(["diff", "--name-only", `${base}...HEAD`, ...pathArgs])
+      : includeWorkingTree && status
+        ? changedFilesFromStatus(status)
+        : safeResult(`(${baseIssue}; branch name-only skipped)`)
+    : includeHeadNameOnly && headExists
+      ? git(["diff", "--name-only", "HEAD", ...pathArgs])
+      : includeHeadNameOnly && status
+        ? changedFilesFromStatus(status)
+        : null;
+
+  return [
+    "<git_context>",
+    `cwd: ${process.cwd()}`,
+    `scope: ${scope}`,
+    `base requested: ${base ?? ""}`,
+    `base effective: ${baseEffective}`,
+    baseIssue,
+    `paths: ${pathLabel}`,
+    "",
+    status
+      ? formatCommandResult(`git status --short --untracked-files=all${paths.length ? ` -- ${pathLabel}` : ""}`, status)
+      : "",
+    "",
+    stagedStat
+      ? formatCommandResult(`git diff --cached --stat${paths.length ? ` -- ${pathLabel}` : ""}`, stagedStat)
+      : "",
+    "",
+    stagedDiff
+      ? formatCommandResult(`git diff --cached${paths.length ? ` -- ${pathLabel}` : ""}`, stagedDiff)
+      : "",
+    "",
+    unstagedStat
+      ? formatCommandResult(`git diff --stat${paths.length ? ` -- ${pathLabel}` : ""}`, unstagedStat)
+      : "",
+    "",
+    unstagedDiff
+      ? formatCommandResult(`git diff${paths.length ? ` -- ${pathLabel}` : ""}`, unstagedDiff)
+      : "",
+    "",
+    branchStat
+      ? formatCommandResult(
+          baseExists
+            ? `git diff --stat ${base}...HEAD${paths.length ? ` -- ${pathLabel}` : ""}`
+            : "branch diff skipped",
+          branchStat
+        )
+      : scope === "auto"
+        ? "branch diff:\n(empty)"
+        : "",
+    "",
+    branchDiff
+      ? formatCommandResult(
+          baseExists
+            ? `git diff ${base}...HEAD${paths.length ? ` -- ${pathLabel}` : ""}`
+            : "branch diff skipped",
+          branchDiff
+        )
+      : "",
+    "",
+    branchNameOnly
+      ? base
+      ? baseExists
+        ? formatCommandResult(`git diff --name-only ${base}...HEAD${paths.length ? ` -- ${pathLabel}` : ""}`, branchNameOnly)
+        : formatCommandResult("changed files from git status fallback", branchNameOnly)
+      : includeHeadNameOnly && headExists
+        ? formatCommandResult(`git diff --name-only HEAD${paths.length ? ` -- ${pathLabel}` : ""}`, branchNameOnly)
+        : formatCommandResult("changed files from git status fallback", branchNameOnly)
+      : "",
+    "</git_context>"
+  ].filter((line) => line !== "").join("\n");
+}
+
+function geminiPrintArgs(prompt, options = {}) {
+  const args = [
+    "--skip-trust",
+    "--approval-mode",
+    "plan",
+    "--output-format",
+    "json"
+  ];
+
+  if (options.model) {
+    args.push("--model", options.model);
+  }
+  if (process.env.GEMINI_FOR_CLAUDE_SANDBOX === "on") {
+    args.push("--sandbox");
+  }
+  if (options.resume && !options.fresh) {
+    args.push("--resume", options.resume === true ? "latest" : String(options.resume));
+  }
+  if (options.sessionId) {
+    args.push("--session-id", options.sessionId);
+  }
+  if (options.worktree) {
+    args.push("--worktree");
+    if (options.worktree !== true) {
+      args.push(String(options.worktree));
+    }
+  }
+  if (options.includeDirectories?.length) {
+    for (const includeDirectory of options.includeDirectories) {
+      args.push("--include-directories", includeDirectory);
+    }
+  }
+  args.push("--prompt", prompt);
+  return args;
+}
+
+function geminiPrint(prompt, options = {}) {
+  return withResourceLeaseSync("model-call", {
+    command: "gemini",
+    ttlMs: (options.timeout || 15 * 60 * 1000) + 60_000
+  }, () => geminiPrintUnguarded(prompt, options));
+}
+
+function geminiPrintUnguarded(prompt, options = {}) {
+  const result = runGemini(geminiPrintArgs(prompt, options), { timeout: options.timeout, cwd: options.cwd });
+  if (result.status !== 0) {
+    return result;
+  }
+  const parsed = parseGeminiJson(result.stdout);
+  return {
+    ...result,
+    status: parsed.ok ? 0 : 1,
+    stdout: parsed.response,
+    stderr: parsed.ok ? result.stderr : parsed.error
+  };
+}
+
+function reportRoot(env = process.env) {
+  const base = env.CLAUDE_PLUGIN_DATA
+    ? path.resolve(env.CLAUDE_PLUGIN_DATA)
+    : env.GEMINI_FOR_CLAUDE_DATA
+    ? path.resolve(env.GEMINI_FOR_CLAUDE_DATA)
+    : path.join(os.homedir(), ".claude", "gemini-for-claude");
+  return path.join(base, "reports");
+}
+
+function reportFile(env = process.env) {
+  return path.join(reportRoot(env), "latest.json");
+}
+
+function sanitizeReportPayload(payload) {
+  const metadata = payload.contextMetadata || {};
+  const safe = {
+    version: REPORT_VERSION,
+    timestamp: new Date().toISOString(),
+    command: payload.command || "",
+    cwdHash: createHash("sha256").update(canonicalWorkspaceRoot(payload.cwd || process.cwd())).digest("hex"),
+    status: Number.isInteger(payload.status) ? payload.status : 0,
+    geminiAvailable: Boolean(payload.geminiAvailable),
+    contextProvider: String(metadata.contextProvider || ""),
+    contextStatus: String(metadata.contextStatus || "disabled"),
+    contextBytes: Number(metadata.contextBytes || 0),
+    contextDurationMs: Number(metadata.contextDurationMs || 0),
+    contextFailureReason: String(metadata.contextFailureReason || "disabled"),
+    contextDegraded: Boolean(metadata.contextDegraded)
+  };
+  if (payload.rolePack) {
+    safe.rolePack = {
+      name: String(payload.rolePack.name || ""),
+      source: String(payload.rolePack.source || ""),
+      schema_version: Number(payload.rolePack.schema_version || 0),
+      hash: String(payload.rolePack.hash || ""),
+      roles: Array.isArray(payload.rolePack.roles) ? payload.rolePack.roles.map((role) => String(role)) : [],
+      gate_compatible: Boolean(payload.rolePack.gate_compatible),
+      native_agents_compatible: Boolean(payload.rolePack.native_agents_compatible)
+    };
+  }
+  if (payload.mailbox) {
+    safe.mailbox = {
+      enabled: Boolean(payload.mailbox.enabled),
+      threadIdHash: String(payload.mailbox.threadIdHash || ""),
+      messageCount: Number(payload.mailbox.messageCount || 0),
+      writeFailures: Number(payload.mailbox.writeFailures || 0)
+    };
+  }
+  if (payload.leases) {
+    safe.leases = {
+      enabled: Boolean(payload.leases.enabled),
+      claimed: Number(payload.leases.claimed || 0),
+      conflicts: Number(payload.leases.conflicts || 0),
+      degraded: Boolean(payload.leases.degraded)
+    };
+  }
+  return safe;
+}
+
+function writeOperationReport(payload) {
+  const safe = sanitizeReportPayload(payload);
+  const file = reportFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${Date.now().toString(36)}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(safe, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return safe;
+}
+
+function emitProgress(args, event, metadata = {}) {
+  if (!args.streamProgress) {
+    return;
+  }
+  const safeMetadata = Object.fromEntries(
+    Object.entries(metadata).filter(([, value]) => ["string", "number", "boolean"].includes(typeof value))
+  );
+  const payload = {
+    event,
+    mode: args.nativeAgents ? "native-agents" : "plugin-managed",
+    roles: Array.isArray(args.reviewRoles) ? args.reviewRoles.map((role) => role.name) : [],
+    ...safeMetadata
+  };
+  process.stderr.write(formatProgressEvent(payload));
+}
+
+function jsonValidation(stdout, validate, failureMessage) {
+  for (const value of jsonCandidatesFromOutput(stdout)) {
+    try {
+      if (validate(value)) {
+        return [];
+      }
+    } catch {
+      continue;
+    }
+  }
+  return [failureMessage];
+}
+
+function jsonCandidatesFromOutput(stdout) {
+  const text = String(stdout ?? "").trim();
+  if (!text) {
+    return [];
+  }
+  const candidates = [text];
+  for (const line of text.split(/\r?\n/)) {
+    const candidate = line.trim();
+    if (candidate.startsWith("{") || candidate.startsWith("[")) {
+      candidates.push(candidate);
+    }
+  }
+  for (const candidate of jsonBlockCandidates(text)) {
+    candidates.push(candidate);
+  }
+  const values = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    try {
+      values.push(JSON.parse(candidate));
+    } catch {
+      // Ignore noisy lines and malformed fragments; schema validation still
+      // decides whether any parsed payload is acceptable for this smoke check.
+    }
+  }
+  return values;
+}
+
+function jsonBlockCandidates(text) {
+  const blocks = [];
+  if (text.length > JSON_BLOCK_SCAN_LIMIT) {
+    return blocks;
+  }
+  const starts = [];
+  for (let index = 0; index < text.length && starts.length < JSON_BLOCK_CANDIDATE_LIMIT; index += 1) {
+    if ((text[index] === "{" || text[index] === "[") && looksLikeJsonStart(text, index)) {
+      starts.push(index);
+    }
+  }
+  const seen = new Set();
+  for (const start of starts) {
+    if (blocks.length >= JSON_BLOCK_CANDIDATE_LIMIT) break;
+    const block = scanJsonBlockFrom(text, start);
+    if (block && !seen.has(block)) {
+      seen.add(block);
+      blocks.push(block);
+    }
+  }
+  return blocks;
+}
+
+function looksLikeJsonStart(text, index) {
+  const opener = text[index];
+  let next = "";
+  for (let cursor = index + 1; cursor < text.length; cursor += 1) {
+    if (!/\s/.test(text[cursor])) {
+      next = text[cursor];
+      break;
+    }
+  }
+  if (opener === "{") {
+    return next === "\"" || next === "}";
+  }
+  return next === "{" || next === "[" || next === "\"" || next === "]" || next === "-" || /[0-9tfn]/.test(next);
+}
+
+function scanJsonBlockFrom(text, start) {
+  const pairs = { "{": "}", "[": "]" };
+  const stack = [pairs[text[start]]];
+  let inString = false;
+  let escaped = false;
+  for (let index = start + 1; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+    } else if (pairs[char]) {
+      stack.push(pairs[char]);
+    } else if (stack.length && char === stack[stack.length - 1]) {
+      stack.pop();
+      if (!stack.length) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+  return "";
+}
+
+function validateCapabilitiesSmoke(stdout) {
+  return jsonValidation(
+    stdout,
+    (value) => Boolean(value?.capabilities && value?.defaults?.rawOutputAllowed === false),
+    "capabilities did not return expected JSON diagnostics"
+  );
+}
+
+function validateReviewJsonSmoke(stdout) {
+  return jsonValidation(
+    stdout,
+    (value) => typeof value?.verdict === "string" && Array.isArray(value?.findings),
+    "review-json did not return expected structured review JSON"
+  );
+}
+
+function validateNativeAgentStructuredSmoke(stdout) {
+  return jsonValidation(
+    stdout,
+    (value) => value?.mode === "native-agents" && Array.isArray(value?.role_results),
+    "native-agent-structured did not return expected aggregate JSON"
+  );
+}
+
+function nativeStructuredSmokeStatusOk(result) {
+  const aggregates = jsonCandidatesFromOutput(result.stdout)
+    .filter((value) => value?.mode === "native-agents" && Array.isArray(value?.role_results));
+  if (!aggregates.length) {
+    return false;
+  }
+  if (result.status === 0) {
+    return true;
+  }
+  return aggregates.some((aggregate) => aggregate.role_results.some((entry) => entry?.status === "error"));
+}
+
+function printReport(rawArgs) {
+  const tokens = normalizeArgv(rawArgs);
+  if (tokens.length && !tokens.every((token) => token === "--latest" || token === "--json")) {
+    console.error("Usage: gemini-companion.mjs report [--latest] [--json]");
+    process.exit(2);
+  }
+  const file = reportFile();
+  if (!fs.existsSync(file)) {
+    process.stdout.write(`${JSON.stringify({ available: false, reportFile: file }, null, 2)}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(fs.readFileSync(file, "utf8"));
+}
+
+function printCapabilities() {
+  const preflight = geminiHelpReport();
+  const cwd = process.cwd();
+  const leases = listLeases(cwd);
+  const mailbox = listMailboxThreads(cwd);
+  process.stdout.write(`${JSON.stringify({
+    available: hasGemini(),
+    command: geminiCommand(),
+    preflight,
+    capabilities: preflight.capabilities,
+    rolePacks: {
+      available: true,
+      builtIn: listRolePacks().map((pack) => pack.name)
+    },
+    mailbox: {
+      directory: mailboxDirForCwd(cwd),
+      threadCount: mailbox.threads.length
+    },
+    leases: {
+      directory: leasesDirForCwd(cwd),
+      activeCount: leases.active.length,
+      degraded: leases.degraded,
+      primitive: leases.primitive
+    },
+    defaults: {
+      extensionExecution: "disabled",
+      mcpExecution: "disabled",
+      hooksExecution: "claude-hook-only",
+      reviewOutputFormat: "json",
+      rawOutputAllowed: false,
+      nativeAgentsDefault: false
+    }
+  }, null, 2)}\n`);
+  process.exit(preflight.ok ? 0 : 1);
+}
+
+function defaultContextMetadata() {
+  return {
+    contextProvider: "",
+    contextStatus: "disabled",
+    contextBytes: 0,
+    contextDurationMs: 0,
+    contextFailureReason: "disabled",
+    contextDegraded: false
+  };
+}
+
+async function resolveCommandContext(args, { allowProviderErrors = false } = {}) {
+  try {
+    parseContextOptions(args);
+    const resolved = await resolveContext(args, { cwd: process.cwd(), env: process.env, run });
+    return resolved;
+  } catch (error) {
+    if (error instanceof ContextProviderError && allowProviderErrors) {
+      return {
+        block: "",
+        metadata: {
+          ...defaultContextMetadata(),
+          contextStatus: "unavailable",
+          contextFailureReason: error.reason || "unsafe-config",
+          contextDegraded: true
+        },
+        warning: error.message || String(error)
+      };
+    }
+    throw error;
+  }
+}
+
+function scanFileForForbidden(filePath, forbidden) {
+  if (!fs.existsSync(filePath)) {
+    return [`missing file: ${filePath}`];
+  }
+  const text = fs.readFileSync(filePath, "utf8");
+  return forbidden.filter((needle) => text.includes(needle)).map((needle) => `${filePath} contains forbidden string ${needle}`);
+}
+
+function checkRequiredClaudePluginSurface() {
+  const failures = [];
+  for (const relative of [
+    ".claude-plugin/plugin.json",
+    "commands",
+    "skills",
+    "hooks",
+    "scripts",
+    "schemas",
+    "prompts",
+    "assets/templates"
+  ]) {
+    const fullPath = path.join(ROOT_DIR, relative);
+    if (!fs.existsSync(fullPath)) {
+      failures.push(`missing required Claude plugin surface: ${relative}`);
+    }
+  }
+  return failures;
+}
+
+function checkCommandArgumentSafety() {
+  const failures = [];
+  const commandsDir = path.join(ROOT_DIR, "commands");
+  if (!fs.existsSync(commandsDir)) {
+    return ["missing commands directory"];
+  }
+  const files = fs.readdirSync(commandsDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+    .map((entry) => path.join(commandsDir, entry.name));
+  if (files.length === 0) {
+    failures.push("commands directory has no markdown commands");
+  }
+  for (const file of files) {
+    const text = fs.readFileSync(file, "utf8");
+    for (const unsafe of ['"$ARGUMENTS"', "`$ARGUMENTS`", "\\\"$ARGUMENTS\\\""]) {
+      if (text.includes(unsafe)) {
+        failures.push(`${file} publishes unsafe direct $ARGUMENTS shell interpolation`);
+      }
+    }
+  }
+  return failures;
+}
+
+function realSmokeOptions(rawArgs = []) {
+  const tokens = normalizeArgv(rawArgs);
+  const options = {
+    mode: "quick",
+    includeNative: false,
+    model: "",
+    modelFromArg: false,
+    timeoutMs: undefined,
+    roles: undefined
+  };
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--quick") {
+      options.mode = "quick";
+    } else if (token === "--full") {
+      options.mode = "full";
+      options.includeNative = true;
+    } else if (token === "--include-native") {
+      options.includeNative = true;
+    } else if (token === "--model") {
+      options.model = normalizeRealSmokeModel(readOptionValue(tokens, index, token));
+      options.modelFromArg = true;
+      index += 1;
+    } else if (token.startsWith("--model=")) {
+      options.model = normalizeRealSmokeModel(token.slice("--model=".length));
+      options.modelFromArg = true;
+    } else if (token === "--timeout-seconds") {
+      options.timeoutMs = parseRealSmokeTimeout(readOptionValue(tokens, index, token));
+      index += 1;
+    } else if (token.startsWith("--timeout-seconds=")) {
+      options.timeoutMs = parseRealSmokeTimeout(token.slice("--timeout-seconds=".length));
+    } else if (token === "--roles") {
+      options.roles = parseRealSmokeRoles(readOptionValue(tokens, index, token));
+      index += 1;
+    } else if (token.startsWith("--roles=")) {
+      options.roles = parseRealSmokeRoles(token.slice("--roles=".length));
+    } else {
+      throw new Error(`Unknown real-smoke option "${token}".`);
+    }
+  }
+  if (!options.timeoutMs) {
+    options.timeoutMs = options.mode === "full" || options.includeNative ? 10 * 60 * 1000 : 5 * 60 * 1000;
+  }
+  if (!options.roles) {
+    options.roles = options.mode === "quick" ? ["tests"] : ["correctness", "tests"];
+  }
+  if (!options.modelFromArg) {
+    options.model = normalizeRealSmokeModel(process.env.GEMINI_FOR_CLAUDE_REAL_SMOKE_MODEL || process.env.GEMINI_FOR_CLAUDE_MODEL || "");
+  }
+  delete options.modelFromArg;
+  return options;
+}
+
+function normalizeRealSmokeModel(value) {
+  const model = String(value || "").trim();
+  if (!model) {
+    return "";
+  }
+  if (model.startsWith("-") || !/^[A-Za-z0-9._:@/-]+$/.test(model)) {
+    throw new Error("Invalid --model value.");
+  }
+  return model;
+}
+
+function parseRealSmokeTimeout(value) {
+  const seconds = Number(value);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 1800) {
+    throw new Error("--timeout-seconds must be an integer from 1 to 1800.");
+  }
+  return seconds * 1000;
+}
+
+function parseRealSmokeRoles(value) {
+  const roles = String(value || "").split(",").map((role) => role.trim()).filter(Boolean);
+  if (!roles.length) {
+    throw new Error("Missing role in --roles.");
+  }
+  for (const role of roles) {
+    if (!Object.hasOwn(REVIEW_ROLES, role)) {
+      throw new Error(`Unknown role in --roles: ${role}.`);
+    }
+  }
+  return roles;
+}
+
+function createRealSmokeWorkspace() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gemini-for-claude-smoke-"));
+  const target = path.join(dir, "review-target.txt");
+  try {
+    fs.writeFileSync(target, "before\n", "utf8");
+    const gitOptions = { cwd: dir, encoding: "utf8", timeout: GIT_TIMEOUT_MS, killSignal: "SIGKILL" };
+    const init = spawnSync("git", ["init"], gitOptions);
+    if (init.status !== 0) {
+      throw new Error(`real-smoke workspace git init failed: ${gitFailureDetail(init)}`);
+    }
+    const add = spawnSync("git", ["add", "review-target.txt"], gitOptions);
+    if (add.status !== 0) {
+      throw new Error(`real-smoke workspace git add failed: ${gitFailureDetail(add)}`);
+    }
+    const commit = spawnSync("git", ["-c", "user.name=Gemini for Claude Smoke", "-c", "user.email=gemini-for-claude-smoke@example.invalid", "-c", "commit.gpgsign=false", "commit", "-m", "Initial smoke fixture"], gitOptions);
+    if (commit.status !== 0) {
+      throw new Error(`real-smoke workspace git commit failed: ${gitFailureDetail(commit)}`);
+    }
+    fs.writeFileSync(target, "before\nafter\n", "utf8");
+    return dir;
+  } catch (error) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function gitFailureDetail(result) {
+  return result.stderr || result.stdout || result.error?.message || result.error?.code || "unknown error";
+}
+
+async function runRealSmoke(rawArgs = []) {
+  if (process.env.GEMINI_FOR_CLAUDE_REAL_SMOKE !== "1") {
+    console.error("real-smoke is opt-in. Set GEMINI_FOR_CLAUDE_REAL_SMOKE=1 to run live Gemini CLI smoke checks.");
+    process.exit(2);
+  }
+  let options;
+  try {
+    options = realSmokeOptions(rawArgs);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  try {
+    options.smokeCwd = createRealSmokeWorkspace();
+  } catch (error) {
+    process.stderr.write(`${error.message || String(error)}\n`);
+    process.exit(1);
+  }
+  const checks = {};
+  const failures = [];
+  try {
+    for (const smoke of realSmokeChecks(options)) {
+      const started = Date.now();
+      const result = await smoke.run();
+      const validation = validateSmokeResult(smoke.name, result, smoke.validate);
+      const statusOk = validation.statusOk ?? result.status === 0;
+      const resultError = String(result.error || "");
+      checks[smoke.name] = {
+        status: result.status,
+        ok: statusOk && validation.failures.length === 0,
+        durationMs: Date.now() - started,
+        timedOut: result.timedOut || result.errorCode === "ETIMEDOUT" || resultError.includes("ETIMEDOUT"),
+        outputTooLarge: result.errorCode === "EOUTPUT" || resultError.includes("EOUTPUT"),
+        ...validation.metadata
+      };
+      if (!statusOk) failures.push(`${smoke.name} failed with status ${result.status}`);
+      if (checks[smoke.name].timedOut) failures.push(`${smoke.name} timed out after ${Math.round(options.timeoutMs / 1000)} seconds`);
+      if (checks[smoke.name].outputTooLarge) failures.push(`${smoke.name} exceeded output limit`);
+      failures.push(...validation.failures);
+    }
+  } finally {
+    fs.rmSync(options.smokeCwd, { recursive: true, force: true });
+  }
+
+  const payload = {
+    ok: failures.length === 0,
+    mode: options.mode,
+    quick: options.mode === "quick",
+    includeNative: options.includeNative,
+    model: options.model || "gemini-cli-default",
+    timeoutSeconds: Math.round(options.timeoutMs / 1000),
+    roles: options.roles,
+    checks,
+    failures
+  };
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  process.exit(payload.ok ? 0 : 1);
+}
+
+function validateSmokeResult(name, result, validate = () => ({ metadata: {}, failures: [] })) {
+  try {
+    const validation = validate(result);
+    return {
+      metadata: validation?.metadata || {},
+      statusOk: validation?.statusOk,
+      failures: Array.isArray(validation?.failures) ? validation.failures : [`${name} returned invalid smoke validation metadata`]
+    };
+  } catch {
+    return { metadata: {}, failures: [`${name} smoke validation failed unexpectedly`] };
+  }
+}
+
+function runSmokeCommand(command, args, options) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd ?? process.cwd(),
+      env: options.env ?? process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    let outputTooLarge = false;
+    const timeoutMs = options.timeout ?? 15 * 60 * 1000;
+    function killGroup(signal) {
+      try {
+        process.kill(-child.pid, signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          // Process may already be gone.
+        }
+      }
+    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup("SIGTERM");
+      setTimeout(() => {
+        if (!settled) killGroup("SIGKILL");
+      }, 2000).unref();
+    }, timeoutMs);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (stdout.length > 20 * 1024 * 1024) {
+        outputTooLarge = true;
+        stdout = stdout.slice(0, 20 * 1024 * 1024);
+        child.stdout.destroy();
+        child.stderr.destroy();
+        killGroup("SIGKILL");
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+      if (stderr.length > 20 * 1024 * 1024) {
+        outputTooLarge = true;
+        stderr = stderr.slice(0, 20 * 1024 * 1024);
+        child.stdout.destroy();
+        child.stderr.destroy();
+        killGroup("SIGKILL");
+      }
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status: 1, stdout, stderr, error: String(error.message ?? error), errorCode: error.code ? String(error.code) : "", timedOut });
+    });
+    child.on("close", (status, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        status: timedOut ? 1 : status ?? 1,
+        stdout,
+        stderr: signal ? `${stderr}${stderr ? "\n" : ""}terminated by ${signal}` : stderr,
+        error: timedOut ? "ETIMEDOUT" : outputTooLarge ? "EOUTPUT" : "",
+        errorCode: timedOut ? "ETIMEDOUT" : outputTooLarge ? "EOUTPUT" : "",
+        timedOut
+      });
+    });
+  });
+}
+
+function realSmokeChecks(options) {
+  const commonScopeArgs = ["--scope", "working-tree", "--path", "."];
+  const smokeRoleArgs = ["--roles", options.roles.join(",")];
+  const modelArgs = options.model ? ["--model", options.model] : [];
+  const companion = fileURLToPath(import.meta.url);
+  const node = process.execPath;
+  const checks = [
+    {
+      name: "capabilities",
+      run: () => runSmokeCommand(node, [companion, "capabilities"], { cwd: options.smokeCwd, timeout: options.timeoutMs }),
+      validate: (result) => ({ metadata: {}, failures: validateCapabilitiesSmoke(result.stdout) })
+    },
+    {
+      name: "review-json",
+      run: () => runSmokeCommand(node, [companion, "review", "--json", ...modelArgs, ...commonScopeArgs], { cwd: options.smokeCwd, timeout: options.timeoutMs }),
+      validate: (result) => {
+        const failures = validateReviewJsonSmoke(result.stdout);
+        return { metadata: {}, statusOk: result.status === 0 && failures.length === 0, failures };
+      }
+    },
+    {
+      name: "multi-review-stream-progress",
+      run: () => runSmokeCommand(node, [companion, "multi-review", ...modelArgs, ...smokeRoleArgs, "--stream-progress", ...commonScopeArgs], { cwd: options.smokeCwd, timeout: options.timeoutMs }),
+      validate: validateStreamProgressSmoke
+    }
+  ];
+  if (options.includeNative) {
+    checks.push(
+      {
+        name: "native-agent-structured",
+        run: () => runSmokeCommand(node, [companion, "multi-review", ...modelArgs, "--agent-team", "native-agents", "--native-structured", ...smokeRoleArgs, ...commonScopeArgs], { cwd: options.smokeCwd, timeout: options.timeoutMs }),
+        validate: (result) => {
+          const failures = validateNativeAgentStructuredSmoke(result.stdout);
+          return { metadata: {}, statusOk: nativeStructuredSmokeStatusOk(result), failures };
+        }
+      }
+    );
+  }
+  return checks;
+}
+
+function validateStreamProgressSmoke(result) {
+  const progress = progressEventsFromStderr(result.stderr);
+  const pluginEvents = progress.events.filter((event) => event.mode === "plugin-managed");
+  const eventNames = pluginEvents.map((event) => String(event.event || ""));
+  const hasStarted = eventNames.includes("multi-review started");
+  const hasFinished = eventNames.includes("multi-review finished");
+  const stderrProgressEvents = hasStarted && hasFinished;
+  const validationFailures = [];
+  if (!stderrProgressEvents) validationFailures.push("multi-review-stream-progress did not emit expected sanitized start and finish progress events");
+  if (progress.malformedCount) validationFailures.push("multi-review-stream-progress emitted malformed progress events");
+  if (progress.malformedPrefixCount) validationFailures.push("multi-review-stream-progress emitted malformed progress prefixes");
+  return {
+    metadata: {
+      stderrProgressEvents,
+      progressEvents: eventNames,
+      malformedProgressEvents: progress.malformedCount,
+      malformedProgressPrefixes: progress.malformedPrefixCount
+    },
+    statusOk: result.status === 0 && stderrProgressEvents && progress.malformedCount === 0 && progress.malformedPrefixCount === 0,
+    failures: validationFailures
+  };
+}
+
+function releaseCheckOptions(rawArgs = []) {
+  const tokens = normalizeArgv(rawArgs);
+  const options = { ciSimulate: false, json: false };
+  for (const token of tokens) {
+    if (token === "--ci-simulate") {
+      options.ciSimulate = true;
+    } else if (token === "--json") {
+      options.json = true;
+    } else {
+      throw new Error(`Unknown release-check option "${token}".`);
+    }
+  }
+  return options;
+}
+
+function runReleaseCheck(rawArgs = []) {
+  let options;
+  try {
+    options = releaseCheckOptions(rawArgs);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  const failures = [];
+  const manifestPath = path.join(ROOT_DIR, ".claude-plugin", "plugin.json");
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    if (manifest.name !== "gemini-for-claude") failures.push("manifest name mismatch");
+    if (manifest.version !== "0.1.0") failures.push(`manifest version is ${manifest.version}, expected 0.1.0`);
+    const legacyPluginName = ["gemini", "for", "codex"].join("-");
+    if (JSON.stringify(manifest).includes(legacyPluginName)) failures.push(`manifest contains ${legacyPluginName}`);
+  } catch (error) {
+    failures.push(`manifest parse failed: ${error.message || String(error)}`);
+  }
+  const forbiddenStrings = claudeHostForbiddenStrings();
+  for (const file of releaseCheckTextFiles()) {
+    failures.push(...scanFileForForbidden(file, forbiddenStrings));
+  }
+  failures.push(...checkRequiredClaudePluginSurface());
+  failures.push(...checkCommandArgumentSafety());
+  failures.push(...checkClaudeHooksSafety());
+  const payload = {
+    ok: failures.length === 0,
+    checks: {
+      manifest: true,
+      claudeHostLeakage: true,
+      commandArgumentSafety: true,
+      requiredSurface: true,
+      hooks: true,
+      ciSimulateAccepted: options.ciSimulate
+    },
+    failures
+  };
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  process.exit(payload.ok ? 0 : 1);
+}
+
+function claudeHostForbiddenStrings() {
+  return [
+    [["COD", "EX"].join(""), "PLUGIN_ROOT"].join("_"),
+    [["COD", "EX"].join(""), "PLUGIN_DATA"].join("_"),
+    ["GEMINI", ["FOR", "COD", "EX"].join("_")].join("_"),
+    [".", "codex", "-plugin"].join(""),
+    [".", "codex", "/"].join(""),
+    ["gemini", "for", "codex"].join("-"),
+    ["Gemini", "for", "Codex"].join(" ")
+  ];
+}
+
+function releaseCheckTextFiles() {
+  const files = [];
+  for (const relative of ["commands", "skills", "hooks", "scripts", "schemas", "prompts", "templates", "assets/templates"]) {
+    collectTextFiles(path.join(ROOT_DIR, relative), files);
+  }
+  files.push(path.join(ROOT_DIR, ".claude-plugin", "plugin.json"));
+  return files;
+}
+
+function collectTextFiles(dir, files) {
+  if (!fs.existsSync(dir)) return;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      collectTextFiles(fullPath, files);
+    } else if (entry.isFile() && /\.(json|md|mjs|yaml|yml|svg)$/.test(entry.name)) {
+      files.push(fullPath);
+    }
+  }
+}
+
+function checkClaudeHooksSafety() {
+  const failures = [];
+  const hooksPath = path.join(ROOT_DIR, "hooks", "hooks.json");
+  try {
+    const hooksText = fs.readFileSync(hooksPath, "utf8");
+    const hooks = JSON.parse(hooksText);
+    if (!hooks.hooks?.Stop) failures.push("hooks manifest does not register Stop");
+    if (!hooksText.includes("${CLAUDE_PLUGIN_ROOT}")) failures.push("hooks must use ${CLAUDE_PLUGIN_ROOT}");
+    if (hooksText.includes(["GEMINI", "PLUGIN_ROOT"].join("_"))) failures.push("hooks must not use GEMINI plugin root fallback");
+  } catch (error) {
+    failures.push(`hooks manifest parse failed: ${error.message || String(error)}`);
+  }
+  const stateDefaults = fs.readFileSync(path.join(ROOT_DIR, "scripts", "lib", "state.mjs"), "utf8");
+  if (!stateDefaults.includes("reviewGateEnabled: false")) {
+    failures.push("Stop gate default must remain disabled");
+  }
+  const gateWrapper = fs.readFileSync(path.join(ROOT_DIR, "hooks", "gemini-review-gate.mjs"), "utf8");
+  if (!gateWrapper.includes("process.exitCode = 0")) {
+    failures.push("Stop gate wrapper must fail open");
+  }
+  return failures;
+}
+
+function checkQualityLoopSurface() {
+  const failures = [];
+  const companion = fs.readFileSync(path.join(ROOT_DIR, "scripts", "gemini-companion.mjs"), "utf8");
+  const runtime = fs.readFileSync(path.join(ROOT_DIR, "scripts", "lib", "gemini-runtime.mjs"), "utf8");
+  const readme = fs.readFileSync(path.join(ROOT_DIR, "README.md"), "utf8");
+  const expectedFiles = [
+    "prompts/scorecard.md",
+    "prompts/taskset.md",
+    "prompts/assisted-review.md",
+    "prompts/plan-review-role.md",
+    "schemas/scorecard-output.schema.json",
+    "schemas/taskset.schema.json",
+    "scripts/lib/assisted-review.mjs",
+    "scripts/lib/failure-taxonomy.mjs",
+    "scripts/lib/plan-review-file.mjs",
+    "scripts/lib/project-instructions.mjs",
+    "scripts/lib/scorecard.mjs",
+    "scripts/lib/state-ids.mjs",
+    "scripts/lib/summary-index.mjs",
+    "scripts/lib/tasksets.mjs",
+    "scripts/lib/validation-evidence.mjs",
+    "skills/gemini-plan-review/SKILL.md",
+    "skills/gemini-assisted-review/SKILL.md"
+  ];
+  for (const relativePath of expectedFiles) {
+    if (!fs.existsSync(path.join(ROOT_DIR, relativePath))) {
+      failures.push(`quality-loop file missing: ${relativePath}`);
+    }
+  }
+  for (const token of ["\"plan-review\"", "\"assisted-review\"", "--scorecard", "--taskset", "normalizePosixScriptInvocation"]) {
+    if (!companion.includes(token)) {
+      failures.push(`companion quality-loop surface missing ${token}`);
+    }
+  }
+  if (!runtime.includes("normalizePosixScriptInvocation")) {
+    failures.push("gemini runtime missing POSIX script invocation normalization");
+  }
+  for (const token of ["plan-review", "assisted-review", "--scorecard", "--taskset"]) {
+    if (!readme.includes(token)) {
+      failures.push(`README missing ${token} docs`);
+    }
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function checkResourceGovernorSafety() {
+  const failures = [];
+  const companion = fs.readFileSync(path.join(ROOT_DIR, "scripts", "gemini-companion.mjs"), "utf8");
+  const governorPath = path.join(ROOT_DIR, "scripts", "lib", "resource-governor.mjs");
+  if (!fs.existsSync(governorPath)) {
+    return { ok: false, failures: ["resource governor module missing"] };
+  }
+  const governor = fs.readFileSync(governorPath, "utf8");
+  const requiredGovernorTokens = [
+    "GEMINI_FOR_CLAUDE_RESOURCE_LOCK_DIR",
+    "GEMINI_FOR_CLAUDE_GLOBAL_MAX_MODEL_CALLS",
+    "GEMINI_FOR_CLAUDE_GLOBAL_MAX_BACKGROUND_JOBS",
+    "GEMINI_FOR_CLAUDE_MULTI_REVIEW_MAX_PARALLEL",
+    "global-resource-locks",
+    "transferable",
+    "capacity_blocked"
+  ];
+  for (const token of requiredGovernorTokens) {
+    if (!governor.includes(token)) {
+      failures.push(`resource governor missing ${token}`);
+    }
+  }
+  const requiredCompanionTokens = [
+    'withResourceLeaseSync("model-call"',
+    'withResourceLeaseAsync("model-call"',
+    'acquireResourceLease("background-job"',
+    "transferResourceLease(resourceLease.lease?.id, child.pid)",
+    'ensureResourceLease(job.resourceLeaseId, "background-job"',
+    "multiReviewConcurrency()",
+    "sequential Gemini CLI role review",
+    "capacityBlockedMessage(\"gemini-for-claude\""
+  ];
+  for (const token of requiredCompanionTokens) {
+    if (!companion.includes(token)) {
+      failures.push(`companion resource governor hot path missing ${token}`);
+    }
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function checkGithubActionsCi() {
+  const failures = [];
+  try {
+    const plain = renderWorkflow(ROOT_DIR);
+    const annotated = renderWorkflow(ROOT_DIR, { annotations: true });
+    const plainValidation = validateWorkflow(plain);
+    const annotationValidation = validateWorkflow(annotated, { annotations: true });
+    if (!plainValidation.ok) {
+      failures.push(...plainValidation.checks.filter((check) => !check.ok).map((check) => `github actions default failed: ${check.name}`));
+    }
+    if (!annotationValidation.ok) {
+      failures.push(...annotationValidation.checks.filter((check) => !check.ok).map((check) => `github actions annotations failed: ${check.name}`));
+    }
+    if (!plain.includes("npm install -g @anthropic-ai/claude-code")) failures.push("github actions missing Claude Code CLI install");
+    if (!plain.includes("git -C \"$marketplace_dir\" fetch --depth 1 origin \"$GEMINI_FOR_CLAUDE_RELEASE_REF\"")) failures.push("github actions missing immutable Gemini release ref checkout");
+    if (plain.includes("pull_request_target")) failures.push("github actions contains pull_request_target");
+  } catch (error) {
+    failures.push(`github actions CI simulation failed: ${error.message || String(error)}`);
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function checkRawOutputSafety() {
+  const failures = [];
+  const dangerous = [
+    ["--raw", "output"].join("-"),
+    ["--accept", "raw", "output", "risk"].join("-")
+  ];
+  for (const file of scriptTextFiles()) {
+    const text = fs.readFileSync(file, "utf8");
+    for (const token of dangerous) {
+      if (text.includes(token)) {
+        failures.push(`${file} contains forbidden Gemini review flag ${token}`);
+      }
+    }
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function scriptTextFiles() {
+  const files = [path.join(ROOT_DIR, "scripts", "gemini-companion.mjs")];
+  const libDir = path.join(ROOT_DIR, "scripts", "lib");
+  collectMjsFiles(libDir, files);
+  return files;
+}
+
+function collectMjsFiles(dir, files) {
+  if (!fs.existsSync(dir)) return;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      collectMjsFiles(fullPath, files);
+    } else if (entry.isFile() && entry.name.endsWith(".mjs")) {
+      files.push(fullPath);
+    }
+  }
+}
+
+function releaseTextFiles() {
+  return [
+    path.join(ROOT_DIR, "README.md"),
+    ...scriptTextFiles()
+  ];
+}
+
+function checkGitTimeoutSafety() {
+  const failures = [];
+  const workspacePath = path.join(ROOT_DIR, "scripts", "lib", "workspace.mjs");
+  const workspace = fs.readFileSync(workspacePath, "utf8");
+  const workspaceTimeoutMs = readTimeoutConstantMs(workspace, "GIT_TIMEOUT_MS");
+  const companion = fs.readFileSync(path.join(ROOT_DIR, "scripts", "gemini-companion.mjs"), "utf8");
+  const reviewTimeoutMs = readTimeoutConstantMs(companion, "REVIEW_GIT_TIMEOUT_MS");
+  if (!Number.isInteger(workspaceTimeoutMs) || workspaceTimeoutMs <= 0 || workspaceTimeoutMs > 300_000) {
+    failures.push("GIT_TIMEOUT_MS must be a positive bounded timeout constant");
+  }
+  if (!Number.isInteger(reviewTimeoutMs) || reviewTimeoutMs <= 0 || reviewTimeoutMs > 300_000) {
+    failures.push("REVIEW_GIT_TIMEOUT_MS must be a positive bounded timeout constant");
+  }
+  if (!/const\s+isGit\s*=\s*command\s*===\s*"git"/.test(companion)
+    || !/timeout:\s*options\.timeout\s*\?\?\s*\(isGit\s*\?\s*REVIEW_GIT_TIMEOUT_MS\s*:\s*15\s*\*\s*60\s*\*\s*1000\)/.test(companion)
+    || !/killSignal:\s*options\.killSignal\s*\?\?\s*\(isGit\s*\?\s*"SIGKILL"\s*:\s*undefined\)/.test(companion)) {
+    failures.push("run() git wrapper must use a bounded timeout and killSignal SIGKILL");
+  }
+  const gitFiles = [
+    ...scriptTextFiles(),
+    ...mjsFilesIn(path.join(ROOT_DIR, "hooks"))
+  ];
+  for (const file of gitFiles) {
+    failures.push(...checkGitSpawnSafety(file));
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function checkSpawnRetrySafety() {
+  const failures = [];
+  const retryPath = path.join(ROOT_DIR, "scripts", "lib", "spawn-retry.mjs");
+  if (!fs.existsSync(retryPath)) {
+    return { ok: false, failures: ["spawn retry module missing"] };
+  }
+  const retry = fs.readFileSync(retryPath, "utf8");
+  const companion = fs.readFileSync(path.join(ROOT_DIR, "scripts", "gemini-companion.mjs"), "utf8");
+  const runtime = fs.readFileSync(path.join(ROOT_DIR, "scripts", "lib", "gemini-runtime.mjs"), "utf8");
+  const workspace = fs.readFileSync(path.join(ROOT_DIR, "scripts", "lib", "workspace.mjs"), "utf8");
+  const rolePacks = fs.readFileSync(path.join(ROOT_DIR, "scripts", "lib", "role-packs.mjs"), "utf8");
+  const processModule = fs.readFileSync(path.join(ROOT_DIR, "scripts", "lib", "process.mjs"), "utf8");
+  for (const token of ["EAGAIN", "EMFILE", "ENFILE", "ENOBUFS", "spawnSyncWithRetry"]) {
+    if (!retry.includes(token)) {
+      failures.push(`spawn retry missing ${token}`);
+    }
+  }
+  for (const [name, text] of Object.entries({ companion, runtime, workspace, rolePacks, processModule })) {
+    if (!text.includes("spawnSyncWithRetry")) {
+      failures.push(`${name} does not use spawnSyncWithRetry`);
+    }
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function readTimeoutConstantMs(text, name) {
+  const match = String(text).match(new RegExp(`(?:export\\s+)?const\\s+${name}\\s*=\\s*([0-9_]+(?:\\s*\\*\\s*[0-9_]+)*)\\s*;`));
+  if (!match) {
+    return NaN;
+  }
+  return match[1]
+    .split("*")
+    .map((part) => Number(part.trim().replaceAll("_", "")))
+    .reduce((product, value) => Number.isFinite(value) ? product * value : NaN, 1);
+}
+
+function checkGitSpawnSafety(file) {
+  const text = fs.readFileSync(file, "utf8");
+  const failures = [];
+  const safeSharedOptions = /const\s+gitOptions\s*=\s*\{(?=[^}]*\btimeout\s*:\s*GIT_TIMEOUT_MS)(?=[^}]*\bkillSignal\s*:\s*"SIGKILL")[^}]*\}/s.test(text);
+  const pattern = /spawnSync\("git",[\s\S]*?\);/g;
+  const matches = [...text.matchAll(pattern)];
+  for (const match of matches) {
+    const snippet = match[0];
+    if (/,\s*gitOptions\s*\);/.test(snippet) && safeSharedOptions) {
+      continue;
+    }
+    const literalTimeout = snippet.match(/\btimeout\s*:\s*(\d+(?:\s*\*\s*\d+)?)/);
+    if (!/\btimeout\s*:\s*GIT_TIMEOUT_MS/.test(snippet) && !literalTimeout) {
+      failures.push(`${file} git subprocesses must use a positive timeout`);
+    } else if (literalTimeout) {
+      const value = readTimeoutConstantMs(`const TIMEOUT = ${literalTimeout[1]};`, "TIMEOUT");
+      if (!Number.isInteger(value) || value <= 0 || value > 300_000) {
+        failures.push(`${file} git subprocesses must use a positive bounded timeout`);
+      }
+    }
+    if (!/\bkillSignal\s*:\s*"SIGKILL"/.test(snippet)) {
+      failures.push(`${file} git subprocesses must use killSignal SIGKILL`);
+    }
+  }
+  return failures;
+}
+
+function mjsFilesIn(dir) {
+  const files = [];
+  collectMjsFiles(dir, files);
+  return files;
+}
+
+function checkExternalSurfaceSafety() {
+  const failures = [];
+  const hooks = fs.readFileSync(path.join(ROOT_DIR, "hooks", "hooks.json"), "utf8");
+  const workflow = renderWorkflow(ROOT_DIR);
+  const forbidden = [
+    "gemini extensions",
+    "gemini mcp",
+    "--allowed-mcp-server-names",
+    "--mcp-config",
+    "--settings",
+    "--agent-team native-agents",
+    "--native-structured",
+    "--stream-progress"
+  ];
+  for (const token of forbidden) {
+    if (hooks.includes(token)) failures.push(`hooks unexpectedly contain ${token}`);
+    if (workflow.includes(token)) failures.push(`default GitHub Actions workflow unexpectedly contains ${token}`);
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function checkNativeOrchestrationSafety() {
+  const failures = [];
+  const companion = fs.readFileSync(path.join(ROOT_DIR, "scripts", "gemini-companion.mjs"), "utf8");
+  const readme = fs.readFileSync(path.join(ROOT_DIR, "README.md"), "utf8");
+  const multiSkill = fs.readFileSync(path.join(ROOT_DIR, "skills", "gemini-multi-review", "SKILL.md"), "utf8");
+  const rolePackSkill = fs.readFileSync(path.join(ROOT_DIR, "skills", "gemini-role-packs", "SKILL.md"), "utf8");
+  const hooks = fs.readFileSync(path.join(ROOT_DIR, "hooks", "hooks.json"), "utf8");
+  const workflow = renderWorkflow(ROOT_DIR);
+  for (const token of ["--agent-team", "native-agents", "--native-structured", "--stream-progress"]) {
+    if (!companion.includes(token)) failures.push(`companion missing ${token}`);
+  }
+  if (!readme.includes("--agent-team native-agents")) failures.push("README missing --agent-team native-agents docs");
+  if (!readme.includes("--native-structured")) failures.push("README missing --native-structured docs");
+  if (!readme.includes("--stream-progress")) failures.push("README missing --stream-progress docs");
+  if (!multiSkill.includes("--agent-team native-agents")) failures.push("gemini-multi-review skill missing --agent-team native-agents");
+  if (!rolePackSkill.includes("--agent-team native-agents")) failures.push("gemini-role-packs skill missing --agent-team native-agents");
+  for (const unsafe of ["--agent-team native-agents", "--native-structured", "--stream-progress"]) {
+    if (hooks.includes(unsafe)) failures.push(`hooks unexpectedly contain ${unsafe}`);
+    if (workflow.includes(unsafe)) failures.push(`default GitHub Actions workflow unexpectedly contains ${unsafe}`);
+  }
+  if (readme.includes("@anthropic-ai/claude-agent-sdk") || readme.includes("ultrareview")) {
+    failures.push("README contains Claude-native SDK or ultrareview residue");
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function checkCoordinationFixtures() {
+  const failures = [];
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "gemini-for-claude-coordination-"));
+  const workspace = path.join(temp, "workspace");
+  const data = path.join(temp, "data");
+  fs.mkdirSync(workspace, { recursive: true });
+  try {
+    const summary = "AKIA\u001b[31mABCDEFGHIJKLMNOP /home/example/secret";
+    const message = postMailboxMessage(workspace, {
+      threadId: "thread-release-check",
+      jobId: "job-release-check",
+      role: "correctness",
+      command: "multi-review",
+      mode: "manual",
+      status: "note",
+      source: "manual",
+      summary
+    }, { ...process.env, GEMINI_FOR_CLAUDE_DATA: data });
+    if (message.summary.includes("AKIA") || message.summary.includes("/home/example")) {
+      failures.push("mailbox sanitizer fixture leaked secret or path");
+    }
+    const first = claimLease(workspace, { path: "file.txt", role: "correctness", ttl: "60s", mode: "manual" }, { ...process.env, GEMINI_FOR_CLAUDE_DATA: data });
+    const second = claimLease(workspace, { path: "file.txt", role: "security", ttl: "60s", mode: "manual" }, { ...process.env, GEMINI_FOR_CLAUDE_DATA: data });
+    if (first.status !== "claimed" || second.status !== "conflict") {
+      failures.push("lease atomic same-path fixture did not produce one winner and one conflict");
+    }
+    const concurrent = runConcurrentLeaseFixture(workspace, data);
+    if (!concurrent.ok) {
+      failures.push(concurrent.reason);
+    }
+  } catch (error) {
+    failures.push(`coordination fixture failed: ${error.message || String(error)}`);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function runConcurrentLeaseFixture(workspace, data) {
+  const script = `
+    import { spawn } from "node:child_process";
+    import fs from "node:fs";
+    import path from "node:path";
+    const [modulePath, workspace, data] = process.argv.slice(1);
+    const start = path.join(data, "start");
+    fs.mkdirSync(data, { recursive: true });
+    const childCode = \`
+      import fs from "node:fs";
+      const [modulePath, workspace, data, start, role] = process.argv.slice(1);
+      const m = await import(modulePath);
+      while (!fs.existsSync(start)) { await new Promise((resolve) => setTimeout(resolve, 5)); }
+      const result = m.claimLease(workspace, {path:"concurrent.txt", role, ttl:"60s", mode:"manual"}, {GEMINI_FOR_CLAUDE_DATA: data, HOME: process.env.HOME});
+      console.log(JSON.stringify(result));
+    \`;
+    function run(role) {
+      return new Promise((resolve) => {
+        const child = spawn(process.execPath, ["--input-type=module", "-e", childCode, modulePath, workspace, data, start, role], { stdio: ["ignore", "pipe", "pipe"] });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => stdout += chunk);
+        child.stderr.on("data", (chunk) => stderr += chunk);
+        child.on("close", (status) => resolve({status, stdout, stderr}));
+      });
+    }
+    const children = [run("correctness"), run("security")];
+    fs.writeFileSync(start, "go");
+    const results = await Promise.all(children);
+    console.log(JSON.stringify(results));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script, path.join(ROOT_DIR, "scripts", "lib", "leases.mjs"), workspace, data], {
+    encoding: "utf8",
+    timeout: 10_000,
+    maxBuffer: 1024 * 1024
+  });
+  if ((result.status ?? 1) !== 0) {
+    return { ok: false, reason: `concurrent lease fixture failed: ${result.stderr || result.error || result.status}` };
+  }
+  try {
+    const rows = JSON.parse(result.stdout.trim()).map((row) => JSON.parse(row.stdout));
+    const claimed = rows.filter((row) => row.status === "claimed").length;
+    const conflicts = rows.filter((row) => row.status === "conflict").length;
+    return claimed === 1 && conflicts === 1
+      ? { ok: true }
+      : { ok: false, reason: `concurrent lease fixture expected one claim and one conflict, got ${result.stdout.trim()}` };
+  } catch (error) {
+    return { ok: false, reason: `concurrent lease fixture parse failed: ${error.message || String(error)}` };
+  }
+}
+
+function checkRolePacks() {
+  const failures = [];
+  const builtIns = validateBuiltInRolePacks();
+  failures.push(...builtIns.failures.map((failure) => `role pack invalid: ${failure}`));
+  try {
+    const packs = listRolePacks();
+    const expected = ["backend", "default", "docs", "frontend", "minimal", "release", "security", "testing"];
+    const names = packs.map((pack) => pack.name).sort();
+    if (JSON.stringify(names) !== JSON.stringify(expected)) {
+      failures.push(`role pack names mismatch: ${names.join(", ")}`);
+    }
+    for (const pack of packs) {
+      if (!/^sha256:[a-f0-9]{64}$/.test(pack.hash)) {
+        failures.push(`role pack ${pack.name} hash is not stable sha256 metadata`);
+      }
+    }
+  } catch (error) {
+    failures.push(`role pack check failed: ${error.message || String(error)}`);
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function releaseCheckProviderFixtures() {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "gemini-for-claude-release-check-"));
+  const workspace = path.join(temp, "workspace");
+  const external = path.join(temp, "external");
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.mkdirSync(external, { recursive: true });
+  const provider = path.join(external, "provider-bin");
+  fs.writeFileSync(provider, "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+  const config = path.join(external, "providers.json");
+  const failures = [];
+  try {
+    fs.writeFileSync(config, JSON.stringify({
+      providers: {
+        safe: {
+          command: [provider],
+          env: { GEMINI_CONTEXT_PROVIDER_MODE: "summary" }
+        }
+      },
+      defaultProvider: "safe"
+    }), { encoding: "utf8", mode: 0o600 });
+    const selected = parseContextOptions({ contextProvider: "safe" });
+    const resolved = {
+      env: { ...process.env, GEMINI_FOR_CLAUDE_CONTEXT_CONFIG: config }
+    };
+    const safeSelection = resolveProviderSelectionForReleaseCheck(selected, workspace, resolved.env);
+    if (safeSelection.status !== "selected") failures.push("safe provider fixture did not select");
+    fs.writeFileSync(config, JSON.stringify({
+      providers: { unsafe: { command: [path.join(workspace, "provider")] } },
+      defaultProvider: "unsafe"
+    }), { encoding: "utf8", mode: 0o600 });
+    fs.writeFileSync(path.join(workspace, "provider"), "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+    expectContextFixtureFailure("workspace provider executable should fail", { contextProvider: "unsafe" }, workspace, resolved.env, failures);
+    fs.writeFileSync(config, JSON.stringify({
+      providers: { shell: { command: ["/bin/sh"] } },
+      defaultProvider: "shell"
+    }), { encoding: "utf8", mode: 0o600 });
+    expectContextFixtureFailure("shell trampoline should fail", { contextProvider: "shell" }, workspace, resolved.env, failures);
+    fs.writeFileSync(config, JSON.stringify({
+      providers: { badenv: { command: [provider], env: { SECRET: "x" } } },
+      defaultProvider: "badenv"
+    }), { encoding: "utf8", mode: 0o600 });
+    expectContextFixtureFailure("unsafe env key should fail", { contextProvider: "badenv" }, workspace, resolved.env, failures);
+    fs.writeFileSync(config, JSON.stringify({
+      providers: { rel: { command: ["provider"] } },
+      defaultProvider: "rel"
+    }), { encoding: "utf8", mode: 0o600 });
+    expectContextFixtureFailure("relative executable should fail", { contextProvider: "rel" }, workspace, resolved.env, failures);
+  } catch (error) {
+    failures.push(`provider fixture exception: ${error.message || String(error)}`);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function resolveProviderSelectionForReleaseCheck(options, cwd, env) {
+  return resolveProviderSelection(options, cwd, env);
+}
+
+function expectContextFixtureFailure(label, options, cwd, env, failures) {
+  try {
+    resolveProviderSelectionForReleaseCheck(parseContextOptions(options), cwd, env);
+    failures.push(label);
+  } catch (error) {
+    if (!(error instanceof ContextProviderError)) {
+      failures.push(`${label}: wrong error ${error.message || String(error)}`);
+    }
+  }
+}
+
+function runGeminiAsync(args, options = {}) {
+  return new Promise((resolve) => {
+    const invocation = normalizePosixScriptInvocation(geminiCommand(), args);
+    const child = spawn(invocation.command, invocation.args, {
+      cwd: options.cwd ?? process.cwd(),
+      env: process.env,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timeoutMs = options.timeout ?? 15 * 60 * 1000;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        child.kill("SIGTERM");
+      }
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+      if (stdout.length > 20 * 1024 * 1024) {
+        child.kill("SIGTERM");
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      if (stderr.length > 20 * 1024 * 1024) {
+        child.kill("SIGTERM");
+      }
+    });
+    child.stdin.end(options.input ?? "");
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status: 1, stdout, stderr, error: String(error.message ?? error), errorCode: error.code ? String(error.code) : "" });
+    });
+    child.on("close", (status, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        status: status ?? 1,
+        stdout,
+        stderr: signal ? `${stderr}${stderr ? "\n" : ""}terminated by ${signal}` : stderr,
+        error: "",
+        errorCode: ""
+      });
+    });
+  });
+}
+
+async function geminiPrintAsync(prompt, options = {}) {
+  return await withResourceLeaseAsync("model-call", {
+    command: "gemini",
+    ttlMs: (options.timeout || 15 * 60 * 1000) + 60_000
+  }, async () => geminiPrintAsyncUnguarded(prompt, options));
+}
+
+async function geminiPrintAsyncUnguarded(prompt, options = {}) {
+  const result = await runGeminiAsync(geminiPrintArgs(prompt, options), { timeout: options.timeout, cwd: options.cwd });
+  if (result.status !== 0) {
+    return result;
+  }
+  const parsed = parseGeminiJson(result.stdout);
+  return {
+    ...result,
+    status: parsed.ok ? 0 : 1,
+    stdout: parsed.response,
+    stderr: parsed.ok ? result.stderr : parsed.error
+  };
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+  return results;
+}
+
+function parseGeminiJson(stdout) {
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout || "{}");
+  } catch (error) {
+    return { ok: false, response: "", error: `Invalid Gemini JSON output: ${error.message}` };
+  }
+  if (parsed.error) {
+    return { ok: false, response: "", error: JSON.stringify(parsed.error) };
+  }
+  if (typeof parsed.response !== "string") {
+    return { ok: false, response: "", error: "Gemini JSON output did not include a string response." };
+  }
+  return { ok: true, response: parsed.response, error: "" };
+}
+
+function stripBackgroundArgs(rawArgs) {
+  return normalizeArgv(rawArgs).filter((arg) => arg !== "--background" && arg !== "--wait");
+}
+
+function parseJobIdArg(rawArgs) {
+  const tokens = normalizeArgv(rawArgs);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--job-id") {
+      const value = tokens[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("Missing --job-id value.");
+      }
+      return value;
+    }
+  }
+  const positional = tokens.find((token) => token !== "--json" && token !== "--json-output");
+  if (!positional) {
+    throw new Error("Missing --job-id value.");
+  }
+  return positional;
+}
+
+function terminalJobStatus(status) {
+  return ["succeeded", "failed", "cancelled", "cancel_failed"].includes(status);
+}
+
+function startBackgroundJob(command, rawArgs) {
+  if (!BACKGROUND_CAPABLE_COMMANDS.has(command)) {
+    console.error(`${command} does not support --background.`);
+    process.exit(2);
+  }
+  const cwd = process.cwd();
+  const foregroundArgs = stripBackgroundArgs(rawArgs);
+  const session = readJson(currentSessionFileForCwd(cwd), {});
+  const resourceLease = acquireResourceLease("background-job", { command, transferable: true });
+  if (!resourceLease.ok) {
+    console.error(capacityBlockedMessage("gemini-for-claude", resourceLease));
+    process.exit(75);
+  }
+  const job = createJob(cwd, {
+    command,
+    args: foregroundArgs,
+    cwd,
+    sessionId: session?.sessionId || "",
+    resourceLeaseId: resourceLease.lease?.id || ""
+  });
+  try {
+    const child = spawn(process.execPath, [process.argv[1], "__run-job", job.id], {
+      cwd,
+      env: process.env,
+      detached: true,
+      stdio: "ignore"
+    });
+    child.unref();
+    transferResourceLease(resourceLease.lease?.id, child.pid);
+    updateJob(cwd, job.id, {
+      workerPid: child.pid,
+      resourceLeaseId: resourceLease.lease?.id || ""
+    });
+    return readJob(cwd, job.id) ?? job;
+  } catch (error) {
+    const message = `Failed to start background job worker: ${error.message || String(error)}`;
+    finishJob(cwd, job.id, {
+      status: 1,
+      stdout: "",
+      stderr: `${message}\n`,
+      error: message
+    });
+    resourceLease.release();
+    throw error;
+  }
+}
+
+function waitForJob(jobId) {
+  const started = Date.now();
+  const timeoutMs = 30 * 60 * 1000;
+  while (Date.now() - started < timeoutMs) {
+    const job = readJob(process.cwd(), jobId);
+    if (job && terminalJobStatus(job.status)) {
+      return job;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+  return readJob(process.cwd(), jobId) ?? { id: jobId, status: "unknown" };
+}
+
+function maybeStartBackground(command, rawArgs) {
+  let parsed;
+  try {
+    parsed = parseArgs(rawArgs);
+  } catch {
+    return false;
+  }
+  if (!parsed.background) {
+    return false;
+  }
+  const job = startBackgroundJob(command, rawArgs);
+  if (parsed.wait) {
+    const completed = waitForJob(job.id);
+    process.stdout.write(`${JSON.stringify({ status: completed.status, job: completed }, null, 2)}\n`);
+    process.exit(completed.status === "succeeded" ? 0 : 1);
+  }
+  process.stdout.write(`${JSON.stringify({ status: "started", job }, null, 2)}\n`);
+  process.exit(0);
+}
+
+function handleReserveJob(rawArgs) {
+  const tokens = normalizeArgv(rawArgs);
+  const command = tokens[0];
+  if (!command) {
+    throw new Error("Missing command to reserve.");
+  }
+  if (!BACKGROUND_CAPABLE_COMMANDS.has(command)) {
+    throw new Error(`Command "${command}" cannot be reserved as a background job.`);
+  }
+  const commandArgs = stripBackgroundArgs(tokens.slice(1));
+  const session = readJson(currentSessionFileForCwd(process.cwd()), {});
+  const resourceLease = acquireResourceLease("background-job", { command, transferable: true });
+  if (!resourceLease.ok) {
+    throw new Error(capacityBlockedMessage("gemini-for-claude", resourceLease));
+  }
+  const workerCommand = [
+    process.argv0 || process.execPath,
+    process.argv[1],
+    "run-reserved-job"
+  ];
+  let job;
+  let updated;
+  try {
+    job = reserveJob(process.cwd(), {
+      command,
+      args: commandArgs,
+      cwd: process.cwd(),
+      sessionId: session?.sessionId || "",
+      focus: commandArgs.join(" ")
+    }, workerCommand);
+    workerCommand.push("--job-id", job.id);
+    updated = updateJob(process.cwd(), job.id, {
+      workerCommand,
+      resourceLeaseId: resourceLease.lease?.id || ""
+    }) ?? job;
+  } catch (error) {
+    resourceLease.release();
+    throw error;
+  }
+
+  return {
+    status: "reserved",
+    job: {
+      id: updated.id,
+      status: updated.status,
+      command: updated.command,
+      args: updated.args ?? []
+    },
+    workerCommand,
+    forwardingInstructions: "Dispatch exactly one forwarding subagent. The child must run workerCommand once, must not inspect or reinterpret the repository, and must return only the command result."
+  };
+}
+
+function hasReviewableGitChanges(cwd = process.cwd()) {
+  if (run("git", ["rev-parse", "--is-inside-work-tree"], { cwd }).status !== 0) {
+    return { reviewable: false, reason: "not a git repository" };
+  }
+  const status = run("git", ["status", "--short", "--untracked-files=all"], { cwd });
+  if (status.status !== 0) {
+    return { reviewable: false, reason: "git status failed" };
+  }
+  return {
+    reviewable: Boolean(status.stdout.trim()),
+    reason: status.stdout.trim() ? "git working tree has changes" : "no git changes"
+  };
+}
+
+function workingTreeFingerprint(cwd = process.cwd()) {
+  const parts = [
+    run("git", ["status", "--short", "--untracked-files=all"], { cwd }).stdout,
+    run("git", ["diff", "--cached"], { cwd }).stdout,
+    run("git", ["diff"], { cwd }).stdout
+  ];
+  return createHash("sha256").update(parts.join("\n--- gemini-for-claude ---\n")).digest("hex");
+}
+
+function adversarialLensSection(lenses) {
+  return [
+    "<adversarial_lenses>",
+    ...lenses.map((lens) => [
+      `<lens name="${lens.name}" label="${lens.label}">`,
+      lens.directive,
+      "</lens>"
+    ].join("\n")),
+    "</adversarial_lenses>"
+  ].join("\n");
+}
+
+function adversarialVerdictContract() {
+  return [
+    "<output_contract>",
+    "## Intent",
+    "State what the author is trying to achieve. Challenge whether the work achieves that intent well, not whether the intent itself is desirable.",
+    "",
+    "## Verdict: PASS | CONTESTED | REJECT",
+    "Use PASS when there are no high-severity findings.",
+    "Use CONTESTED when high-severity findings exist but the evidence or lens agreement is mixed.",
+    "Use REJECT when high-severity findings have strong evidence or consensus across lenses.",
+    "",
+    "## Findings",
+    "Number findings by severity from high to low. For each finding include:",
+    "- **[severity]** file:line - description, evidence, and impact",
+    "- Lens: skeptic | architect | minimalist",
+    "- Principle: mapped principle name",
+    "- Recommendation: concrete action",
+    "",
+    "## What Went Well",
+    "List one to three things that appear sound, or say none observed.",
+    "",
+    "## Lead Judgment",
+    "For each finding, state accept or reject with a one-line rationale. Reject false positives, overreach, and style-only objections.",
+    "</output_contract>"
+  ].join("\n");
+}
+
+function adversarialJsonContract() {
+  return [
+    "<output_contract>",
+    "Return exactly one JSON object and no Markdown.",
+    "Schema:",
+    "{",
+    '  "verdict": "PASS | CONTESTED | REJECT",',
+    '  "summary": "short intent-aware judgment",',
+    '  "findings": [',
+    '    {"severity": "high|medium|low", "file": "path", "line": 1, "description": "issue", "evidence": "changed-file evidence", "recommendation": "action"}',
+    "  ],",
+    '  "next_steps": ["concrete next step"]',
+    "}",
+    "Use an empty findings array when there are no findings.",
+    "</output_contract>"
+  ].join("\n");
+}
+
+function reviewOutputContract(args) {
+  if (args.scorecard) {
+    return "";
+  }
+  if (args.structuredReview || args.jsonOutput) {
+    return [
+      "<output_contract>",
+      "Return exactly one JSON object and no Markdown.",
+      "Schema:",
+      "{",
+      '  "verdict": "approve | needs-attention",',
+      '  "summary": "short review summary",',
+      '  "findings": [',
+      '    {"severity": "critical|high|medium|low", "title": "short title", "body": "issue, evidence, and impact", "file": "path", "line_start": 1, "line_end": 1, "confidence": 0.0, "recommendation": "concrete action"}',
+      "  ],",
+      '  "next_steps": ["concrete next step"]',
+      "}",
+      "Use verdict approve and an empty findings array when there are no findings.",
+      "</output_contract>"
+    ].join("\n");
+  }
+  return [
+    "<output_contract>",
+    "## Findings",
+    "- [Severity] file:line - issue, evidence, impact, suggested direction",
+    "## Open Questions",
+    "## Residual Risk",
+    "</output_contract>"
+  ].join("\n");
+}
+
+function minifiedJsonFile(relativePath) {
+  const fullPath = path.join(pluginRoot(), relativePath);
+  return JSON.stringify(JSON.parse(fs.readFileSync(fullPath, "utf8")));
+}
+
+function promptPartial(name, variables = {}) {
+  return renderPromptTemplate(loadPromptTemplate(ROOT_DIR, name), variables);
+}
+
+function scorecardPromptBlock(args) {
+  if (!args.scorecard) {
+    return "";
+  }
+  return promptPartial("scorecard", {
+    SCORECARD_OUTPUT_SCHEMA_JSON: minifiedJsonFile(path.join("schemas", "scorecard-output.schema.json"))
+  });
+}
+
+function tasksetPromptBlock(args) {
+  if (!args.taskset) {
+    return "";
+  }
+  return promptPartial("taskset", {
+    TASKSET_SCHEMA_JSON: minifiedJsonFile(path.join("schemas", "taskset.schema.json"))
+  });
+}
+
+function validationEvidencePromptBlock(args) {
+  if (args.validationEvidenceBlock !== undefined) {
+    return args.validationEvidenceBlock;
+  }
+  const evidence = loadValidationEvidence({
+    cwd: process.cwd(),
+    files: args.validationEvidence ?? []
+  });
+  args.validationEvidenceSummary = {
+    items: evidence.items.length,
+    skipped: evidence.skipped.length,
+    kinds: [...new Set(evidence.items.map((item) => item.kind))]
+  };
+  args.validationEvidenceBlock = renderValidationEvidenceBlock(evidence);
+  return args.validationEvidenceBlock;
+}
+
+function projectInstructionsPromptBlock(args) {
+  if (args.projectInstructionsBlock !== undefined) {
+    return args.projectInstructionsBlock;
+  }
+  const files = [...DEFAULT_PROJECT_INSTRUCTION_FILES, ...(args.rules ?? [])];
+  return renderProjectInstructionsBlock(process.cwd(), { files });
+}
+
+function tasksetOutputContract(args) {
+  return [
+    tasksetPromptBlock(args),
+    "<output_contract>",
+    "Return exactly one taskset JSON object and no Markdown.",
+    "</output_contract>"
+  ].filter(Boolean).join("\n");
+}
+
+function standardPlanOutputContract() {
+  return [
+    "<output_contract>",
+    "## Observed Facts",
+    "## Inferences",
+    "## Independent Implementation Plan",
+    "## Tests",
+    "## Risks And Blind Spots",
+    "## Reconciliation Checklist",
+    "</output_contract>"
+  ].join("\n");
+}
+
+function escapeXmlText(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function escapeXmlAttribute(value) {
+  return escapeXmlText(value)
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function escapeCdata(value) {
+  return String(value ?? "").replaceAll("]]>", "]]]]><![CDATA[>");
+}
+
+function parseScorecardResult(stdout) {
+  return normalizeScorecardOutput(extractJsonObject(stdout));
+}
+
+function scorecardRoundSummary(command, scorecard, failureCategory = "") {
+  const blockingFindings = Array.isArray(scorecard?.findings)
+    ? scorecard.findings.filter((finding) => finding.blocking).length
+    : 0;
+  return {
+    command,
+    verdict: scorecard?.verdict ?? "",
+    scoreTotal: Number.isFinite(scorecard?.score?.total) ? scorecard.score.total : null,
+    threshold: Number.isFinite(scorecard?.score?.threshold) ? scorecard.score.threshold : 85,
+    blockingFindings,
+    failureCategory,
+    acceptedFindingIds: []
+  };
+}
+
+function blockingFindingIds(scorecard) {
+  return new Set((scorecard?.findings ?? [])
+    .filter((finding) => finding.blocking)
+    .map((finding) => [
+      finding.severity,
+      finding.file,
+      finding.line,
+      finding.description
+    ].join("|")));
+}
+
+function hasRepeatedBlockingFinding(rounds) {
+  if (rounds.length < 2) {
+    return false;
+  }
+  const previous = rounds.at(-2).blockingFindingIds ?? [];
+  const current = new Set(rounds.at(-1).blockingFindingIds ?? []);
+  return previous.some((id) => current.has(id));
+}
+
+function scorecardMultiReviewPayload(results, args) {
+  const roleResults = results.map(({ role, result }) => {
+    if (result.status !== 0) {
+      return {
+        role: role.name,
+        status: "error",
+        error: (result.stderr || result.error || "Gemini role review failed").trim()
+      };
+    }
+    try {
+      return {
+        role: role.name,
+        status: "ok",
+        scorecard: parseScorecardResult(result.stdout)
+      };
+    } catch (error) {
+      return {
+        role: role.name,
+        status: "error",
+        error: `Invalid scorecard output: ${error.message || String(error)}`
+      };
+    }
+  });
+  const okScorecards = roleResults.filter((entry) => entry.status === "ok").map((entry) => entry.scorecard);
+  const blockingFindings = okScorecards.reduce((sum, scorecard) => sum + scorecard.findings.filter((finding) => finding.blocking).length, 0);
+  const scoreTotal = okScorecards.length
+    ? Math.round(okScorecards.reduce((sum, scorecard) => sum + scorecard.score.total, 0) / okScorecards.length)
+    : null;
+  const errors = roleResults.filter((entry) => entry.status !== "ok");
+  return {
+    mode: "plugin-managed",
+    roles: args.reviewRoles.map((role) => role.name),
+    verdict: errors.length || blockingFindings || okScorecards.some((scorecard) => scorecard.verdict !== "approve") ? "needs-attention" : "approve",
+    scoreTotal,
+    threshold: 85,
+    blockingFindings,
+    role_results: roleResults
+  };
+}
+
+function reviewPrompt(kind, args, contextBlock = "") {
+  const focus = args._.join(" ").trim();
+  const gitContext = collectGitContext(args);
+  const adversarial = kind === "adversarial-review";
+  const reviewRoles = args.reviewRoles?.length
+    ? args.reviewRoles.map((role) => role.name).join(", ")
+    : "";
+
+  if (adversarial) {
+    const adversarialLenses = args.resolvedAdversarialLenses ?? resolveAdversarialLenses(args);
+    return renderPromptTemplate(loadPromptTemplate(ROOT_DIR, "adversarial-review"), {
+      GIT_CONTEXT: gitContext,
+      GEMINI_CONTEXT: contextBlock,
+      PROJECT_INSTRUCTIONS_BLOCK: projectInstructionsPromptBlock(args),
+      VALIDATION_EVIDENCE_BLOCK: validationEvidencePromptBlock(args),
+      ADVERSARIAL_LENSES: adversarialLensSection(adversarialLenses),
+      FOCUS: focus ? `<focus>${focus}</focus>` : "",
+      SCORECARD_BLOCK: scorecardPromptBlock(args),
+      OUTPUT_CONTRACT: args.scorecard ? "" : args.jsonOutput ? adversarialJsonContract() : adversarialVerdictContract()
+    });
+  }
+
+  return renderPromptTemplate(loadPromptTemplate(ROOT_DIR, "review"), {
+    GIT_CONTEXT: gitContext,
+    GEMINI_CONTEXT: contextBlock,
+    PROJECT_INSTRUCTIONS_BLOCK: projectInstructionsPromptBlock(args),
+    VALIDATION_EVIDENCE_BLOCK: validationEvidencePromptBlock(args),
+    REVIEW_ROLES: reviewRoles ? `<review_roles>${reviewRoles}</review_roles>` : "",
+    FOCUS: focus ? `<focus>${focus}</focus>` : "",
+    SCORECARD_BLOCK: scorecardPromptBlock(args),
+    OUTPUT_CONTRACT: reviewOutputContract(args)
+  });
+}
+
+function multiReviewRolePrompt(role, args, gitContext, contextBlock = "") {
+  const focus = args._.join(" ").trim();
+
+  return renderPromptTemplate(loadPromptTemplate(ROOT_DIR, "multi-review-role"), {
+    ROLE_NAME: role.name,
+    ROLE_DIRECTIVE: role.directive,
+    GIT_CONTEXT: gitContext,
+    GEMINI_CONTEXT: contextBlock,
+    PROJECT_INSTRUCTIONS_BLOCK: projectInstructionsPromptBlock(args),
+    VALIDATION_EVIDENCE_BLOCK: validationEvidencePromptBlock(args),
+    FOCUS: focus ? `<focus>${focus}</focus>` : "",
+    SCORECARD_BLOCK: scorecardPromptBlock(args),
+    OUTPUT_CONTRACT: reviewOutputContract(args)
+  });
+}
+
+function nativeAgentName(roleName) {
+  return `gfc_${roleName.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+}
+
+function nativeAgentMarkdown(role) {
+  return [
+    "---",
+    `name: ${nativeAgentName(role.name)}`,
+    `description: Gemini for Claude ${role.name} read-only review subagent.`,
+    "---",
+    "",
+    `You are the ${role.name} reviewer for Gemini for Claude.`,
+    "",
+    "Review only in a read-only capacity. Do not edit files, do not apply fixes, and do not suggest that you are about to apply fixes.",
+    "Ground every finding in concrete changed-file evidence or explicit git context.",
+    "Include exact file paths and line numbers when available.",
+    "If there are no findings for your role, say so and list residual risks briefly.",
+    "",
+    "Role directive:",
+    role.directive,
+    "",
+    "Return:",
+    "## Findings",
+    "- [Severity] file:line - issue, evidence, impact, suggested direction",
+    "## Open Questions",
+    "## Residual Risk"
+  ].join("\n");
+}
+
+function writeNativeAgentWorkspace(roles) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gemini-for-claude-agents-"));
+  const agentsDir = path.join(tempDir, ".gemini", "agents");
+  fs.mkdirSync(agentsDir, { recursive: true });
+  for (const role of roles) {
+    fs.writeFileSync(path.join(agentsDir, `${nativeAgentName(role.name)}.md`), nativeAgentMarkdown(role), "utf8");
+  }
+  return tempDir;
+}
+
+function nativeMarkdownContract() {
+  return [
+    "<output_contract>",
+    "# Gemini Native Subagent Review",
+    "## Role: <role name>",
+    "## Orchestration Summary",
+    "</output_contract>"
+  ].join("\n");
+}
+
+function nativeStructuredContract() {
+  return [
+    "<output_contract>",
+    "Return exactly one JSON object and no Markdown.",
+    "Schema:",
+    "{",
+    '  "role_results": [{"agent":"gfc_role","role":"role name","status":"ok|error","text":"summary","error":""}],',
+    '  "summary": "short aggregate summary",',
+    '  "residual_risk": ["remaining risk"]',
+    "}",
+    "Include exactly one role_results entry for each requested role.",
+    "</output_contract>"
+  ].join("\n");
+}
+
+function nativeMultiAgentPrompt(args, gitContext, contextBlock = "") {
+  const focus = args._.join(" ").trim();
+  const agentCalls = args.reviewRoles.map((role) => `@${nativeAgentName(role.name)}`).join(", ");
+  return renderPromptTemplate(loadPromptTemplate(ROOT_DIR, "native-multi-agent"), {
+    SUBAGENTS: args.reviewRoles.map((role) => `${nativeAgentName(role.name)}: ${role.directive}`).join("\n"),
+    AGENT_CALLS: agentCalls,
+    GIT_CONTEXT: gitContext,
+    GEMINI_CONTEXT: contextBlock,
+    OUTPUT_CONTRACT: args.nativeStructured ? nativeStructuredContract() : nativeMarkdownContract(),
+    FOCUS: focus ? `<focus>${focus}</focus>` : ""
+  });
+}
+
+function validateNativeStructuredAggregate(value, expectedRoles) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("aggregate must be an object");
+  }
+  if (!Array.isArray(value.role_results)) {
+    throw new Error("role_results must be an array");
+  }
+  const expectedNames = expectedRoles.map((role) => role.name);
+  const expected = new Set(expectedNames);
+  const byRole = new Map();
+  for (const item of value.role_results) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("role result must be an object");
+    }
+    if (typeof item.agent !== "string" || !item.agent.startsWith("gfc_")) {
+      throw new Error("role result agent is invalid");
+    }
+    if (typeof item.role !== "string" || !expected.has(item.role)) {
+      throw new Error(`unexpected role ${item.role}`);
+    }
+    if (byRole.has(item.role)) {
+      throw new Error(`duplicate role ${item.role}`);
+    }
+    if (!["ok", "error"].includes(item.status)) {
+      throw new Error("role result status must be ok or error");
+    }
+    if (typeof item.text !== "string") {
+      throw new Error("role result text must be a string");
+    }
+    if (typeof item.error !== "string") {
+      throw new Error("role result error must be a string");
+    }
+    byRole.set(item.role, {
+      agent: item.agent,
+      role: item.role,
+      status: item.status,
+      text: item.text,
+      error: item.error
+    });
+  }
+  for (const name of expectedNames) {
+    if (!byRole.has(name)) {
+      throw new Error(`missing role ${name}`);
+    }
+  }
+  if (typeof value.summary !== "string") {
+    throw new Error("summary must be a string");
+  }
+  if (!Array.isArray(value.residual_risk)) {
+    throw new Error("residual_risk must be an array");
+  }
+  const residualRisk = value.residual_risk.map((item) => {
+    if (typeof item !== "string") {
+      throw new Error("residual_risk entries must be strings");
+    }
+    return item;
+  });
+  return {
+    mode: "native-agents",
+    role_results: expectedNames.map((name) => byRole.get(name)),
+    summary: value.summary,
+    residual_risk: residualRisk
+  };
+}
+
+function extractNativeStructuredObject(rawOutput) {
+  const text = String(rawOutput ?? "").trim();
+  if (!text) {
+    throw new Error("Gemini returned empty native structured output.");
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Continue with embedded JSON extraction.
+  }
+  const fences = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
+  for (const match of fences.reverse()) {
+    try {
+      return JSON.parse(match[1].trim());
+    } catch {
+      // Try earlier fenced blocks.
+    }
+  }
+  const starts = [];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "{") {
+      starts.push(index);
+    }
+  }
+  const ends = [];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "}") {
+      ends.push(index);
+    }
+  }
+  for (const start of starts.reverse()) {
+    for (const end of ends.filter((candidate) => candidate > start).reverse()) {
+      try {
+        return JSON.parse(text.slice(start, end + 1));
+      } catch {
+        // Try a smaller candidate.
+      }
+    }
+  }
+  throw new Error("Gemini output did not contain a native structured JSON object.");
+}
+
+function reviewGateRolePrompt(role, args, gitContext, contextBlock = "") {
+  return renderPromptTemplate(loadPromptTemplate(ROOT_DIR, "stop-review-gate"), {
+    ROLE_NAME: role.name,
+    ROLE_DIRECTIVE: role.directive,
+    GIT_CONTEXT: gitContext,
+    GEMINI_CONTEXT: contextBlock
+  });
+}
+
+function planPrompt(args) {
+  const focus = args._.join(" ").trim();
+  const gitContext = collectGitContext(args);
+
+  return [
+    "<task>Create an independent implementation plan for Claude Code to compare against its own plan.</task>",
+    gitContext,
+    projectInstructionsPromptBlock(args),
+    validationEvidencePromptBlock(args),
+    "<rules>",
+    "- Do not edit files.",
+    "- Separate observed facts from inferences.",
+    "- Prefer small verifiable implementation steps.",
+    "- Include tests for each meaningful behavior or risk area.",
+    "- Identify risks, blind spots, rollback concerns, and unresolved assumptions.",
+    "- End with a reconciliation checklist Claude Code can use against its own plan.",
+    "</rules>",
+    focus ? `<planning_request>${focus}</planning_request>` : "",
+    args.taskset ? tasksetOutputContract(args) : standardPlanOutputContract()
+  ].filter(Boolean).join("\n");
+}
+
+function planReviewRolePrompt(role, args) {
+  const focus = args._.join(" ").trim();
+  const planFile = args.planFile;
+  const reviewedFile = planFile?.relative ?? args.reviewedFile ?? "";
+
+  return renderPromptTemplate(loadPromptTemplate(ROOT_DIR, "plan-review-role"), {
+    ROLE_NAME: escapeXmlText(role.name),
+    ROLE_DIRECTIVE: escapeXmlText(role.directive),
+    PROJECT_INSTRUCTIONS_BLOCK: projectInstructionsPromptBlock(args),
+    VALIDATION_EVIDENCE_BLOCK: validationEvidencePromptBlock(args),
+    FOCUS_BLOCK: focus ? `<focus>${escapeXmlText(focus)}</focus>` : "",
+    SCORECARD_BLOCK: scorecardPromptBlock(args),
+    OUTPUT_CONTRACT: reviewOutputContract(args),
+    REVIEWED_FILE_PATH_ATTR: escapeXmlAttribute(reviewedFile),
+    REVIEWED_FILE_JSON_PATH: escapeXmlText(JSON.stringify(reviewedFile)),
+    PLAN_TEXT_CDATA: escapeCdata(planFile?.text ?? "")
+  });
+}
+
+function assistedReviewPrompt(args, round) {
+  const taskset = args.tasksetLoaded?.ok ? args.tasksetLoaded.taskset : null;
+  const tasksetBlock = taskset
+    ? `<assisted_review_taskset trust="untrusted">\n${escapeXmlText(JSON.stringify(taskset, null, 2))}\n</assisted_review_taskset>`
+    : "";
+  return [
+    promptPartial("assisted-review"),
+    `<assisted_review_round>${round}</assisted_review_round>`,
+    tasksetBlock,
+    reviewPrompt("review", args, args.assistedContextBlock || "")
+  ].filter(Boolean).join("\n\n");
+}
+
+function rescuePrompt(args) {
+  const focus = args._.join(" ").trim();
+  const gitContext = collectGitContext(args);
+
+  return [
+    "<task>Diagnose a stuck or failed Claude Code implementation from Gemini's independent read-only perspective.</task>",
+    gitContext,
+    "<rules>",
+    "- Do not edit files.",
+    "- Do not suggest that you are currently applying fixes.",
+    "- Identify the likely failure mode, missing context, or incorrect assumption.",
+    "- Prefer a short recovery checklist Claude Code can execute.",
+    "- Ground claims in current git state, changed files, and visible evidence.",
+    "- If evidence is insufficient, say exactly what Claude Code should inspect next.",
+    "</rules>",
+    focus ? `<rescue_request>${focus}</rescue_request>` : "",
+    "<output_contract>",
+    "## Diagnosis",
+    "## Evidence",
+    "## Recovery Steps",
+    "## Risks",
+    "</output_contract>"
+  ].filter(Boolean).join("\n");
+}
+
+function setupOptions(rawArgs) {
+  const tokens = normalizeArgv(rawArgs);
+  const options = { enable: false, disable: false, mode: undefined };
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--enable-review-gate") {
+      options.enable = true;
+    } else if (token === "--disable-review-gate") {
+      options.disable = true;
+    } else if (token === "--review-gate-mode") {
+      options.mode = readOptionValue(tokens, index, token);
+      index += 1;
+    } else {
+      throw new Error(`Unknown setup option "${token}".`);
+    }
+  }
+  if (options.enable && options.disable) {
+    throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
+  }
+  if (options.mode !== undefined && !VALID_REVIEW_GATE_MODES.has(options.mode)) {
+    throw new Error(`Invalid --review-gate-mode "${options.mode}". Valid modes: multi-role.`);
+  }
+  return options;
+}
+
+function pluginRoot() {
+  return path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+}
+
+function hookEventsFromManifest(manifest) {
+  const hooks = manifest && typeof manifest === "object" && manifest.hooks && typeof manifest.hooks === "object"
+    ? manifest.hooks
+    : manifest;
+  if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) {
+    return [];
+  }
+  return Object.keys(hooks);
+}
+
+function hookTrustedInClaudeCodeConfig(configText) {
+  if (!configText) {
+    return false;
+  }
+  let currentTrustedHookTable = false;
+  return configText.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      return false;
+    }
+    const tableMatch = trimmed.match(/^\[(.+)\]$/);
+    if (tableMatch) {
+      currentTrustedHookTable = hookTrustKeyMatches(tableMatch[1]);
+      return false;
+    }
+    if (!trimmed.includes("=")) {
+      return false;
+    }
+    const [rawKey, ...valueParts] = trimmed.split("=");
+    const key = rawKey.trim().replace(/^["']|["']$/g, "");
+    const value = valueParts.join("=").trim().replace(/^["']|["']$/g, "");
+    if (currentTrustedHookTable && key === "trusted_hash" && value.startsWith("sha256:")) {
+      return true;
+    }
+    return hookTrustKeyMatches(key) && value === "trusted";
+  });
+}
+
+function hookTrustKeyMatches(key) {
+  return key.includes("gemini-for-claude")
+    && key.includes("hooks/hooks.json")
+    && key.includes(":stop:");
+}
+
+function hookDiagnostics() {
+  const root = pluginRoot();
+  const manifestPath = path.join(root, "hooks", "hooks.json");
+  const manifestExists = fs.existsSync(manifestPath);
+  let events = [];
+  let manifestError = "";
+  if (manifestExists) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      events = hookEventsFromManifest(manifest);
+    } catch (error) {
+      manifestError = error?.message ? String(error.message) : String(error);
+    }
+  }
+
+  const configPath = path.join(os.homedir(), ".claude", "config.toml");
+  const claudeConfigChecked = fs.existsSync(configPath);
+  let configText = "";
+  let claudeConfigError = "";
+  if (claudeConfigChecked) {
+    try {
+      configText = fs.readFileSync(configPath, "utf8");
+    } catch (error) {
+      claudeConfigError = error?.message ? String(error.message) : String(error);
+    }
+  }
+
+  return {
+    manifest: "hooks/hooks.json",
+    manifestPath,
+    manifestExists,
+    manifestError,
+    events,
+    claudeConfigPath: configPath,
+    claudeConfigChecked,
+    claudeConfigError,
+    trustedInClaudeCodeConfig: hookTrustedInClaudeCodeConfig(configText)
+  };
+}
+
+function buildSetupReport(actionsTaken = []) {
+  const cwd = process.cwd();
+  const stateReport = readStateReport(cwd);
+  const config = stateReport.state.config;
+  const preflight = geminiHelpReport();
+  const mailbox = listMailboxThreads(cwd);
+  const leases = listLeases(cwd);
+  return {
+    node: process.version,
+    geminiAvailable: hasGemini(),
+    geminiCommand: geminiCommand(),
+    geminiPreflight: preflight,
+    gitAvailable: hasBinary("git"),
+    cwd,
+    reviewGate: {
+      enabled: Boolean(config.reviewGateEnabled),
+      mode: config.reviewGateMode,
+      stateFile: stateFileForCwd(cwd),
+      stateReadable: stateReport.readable,
+      stateError: stateReport.error,
+      bypassEnv: REVIEW_GATE_ENV
+    },
+    jobCommands: ["jobs", "result", "cancel", "rescue"],
+    sessionCommands: ["sessions"],
+    recommendationCommands: ["recommend-execution-mode"],
+    geminiCapabilities: preflight.capabilities,
+    capabilities: {
+      gemini: preflight.capabilities,
+      requiredFlags: {
+        ok: preflight.ok,
+        missing: preflight.missing,
+        required: preflight.requiredFlags
+      },
+      commands: {
+        capabilities: true,
+        report: true,
+        releaseCheck: true,
+        contextProvider: true,
+        rolePacks: true
+      },
+      defaults: {
+        extensionExecution: "disabled",
+        mcpExecution: "disabled",
+        hooksExecution: "claude-hook-only",
+        reviewOutputFormat: "json",
+        rawOutputAllowed: false,
+        nativeAgentsDefault: false
+      }
+    },
+    rolePacks: {
+      available: true,
+      builtIn: listRolePacks().map((pack) => pack.name)
+    },
+    mailbox: {
+      directory: mailboxDirForCwd(cwd),
+      threadCount: mailbox.threads.length
+    },
+    leases: {
+      directory: leasesDirForCwd(cwd),
+      activeCount: leases.active.length,
+      degraded: leases.degraded,
+      primitive: leases.primitive
+    },
+    hooks: hookDiagnostics(),
+    actionsTaken
+  };
+}
+
+function printSetup(rawArgs) {
+  let options;
+  try {
+    options = setupOptions(rawArgs);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  const actionsTaken = [];
+  const cwd = process.cwd();
+  if (options.mode) {
+    setConfig(cwd, "reviewGateMode", options.mode);
+    actionsTaken.push(`Set review gate mode to ${options.mode}.`);
+  }
+  if (options.enable) {
+    setConfig(cwd, "reviewGateEnabled", true);
+    actionsTaken.push(`Enabled Gemini review gate for ${canonicalWorkspaceRoot(cwd)}.`);
+  } else if (options.disable) {
+    setConfig(cwd, "reviewGateEnabled", false);
+    actionsTaken.push(`Disabled Gemini review gate for ${canonicalWorkspaceRoot(cwd)}.`);
+  }
+  const report = {
+    ...buildSetupReport(actionsTaken)
+  };
+
+  console.log(JSON.stringify(report, null, 2));
+  process.exit(report.geminiAvailable && report.geminiPreflight.ok && report.gitAvailable && report.reviewGate.stateReadable ? 0 : 1);
+}
+
+function printStatus() {
+  process.stdout.write(`${JSON.stringify({
+    jobs: listJobs(process.cwd()),
+    reviewGate: buildSetupReport().reviewGate
+  }, null, 2)}\n`);
+}
+
+function parseGithubActionsOptions(rawArgs) {
+  const tokens = normalizeArgv(rawArgs);
+  const subcommand = tokens.shift();
+  const options = {
+    subcommand,
+    write: false,
+    force: false,
+    annotations: false,
+    contextProvider: "off",
+    timeoutMinutes: undefined,
+    releaseRef: undefined,
+    model: "",
+    input: ""
+  };
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--write") {
+      options.write = true;
+    } else if (token === "--force") {
+      options.force = true;
+    } else if (token === "--annotations") {
+      options.annotations = true;
+    } else if (token === "--context-provider") {
+      options.contextProvider = readOptionValue(tokens, index, token);
+      index += 1;
+    } else if (token === "--timeout-minutes") {
+      options.timeoutMinutes = readOptionValue(tokens, index, token);
+      index += 1;
+    } else if (token === "--ref") {
+      options.releaseRef = readOptionValue(tokens, index, token);
+      index += 1;
+    } else if (token === "--model") {
+      options.model = readOptionValue(tokens, index, token);
+      index += 1;
+    } else if (token === "--input") {
+      options.input = readOptionValue(tokens, index, token);
+      index += 1;
+    } else {
+      throw new Error(`Unknown github-actions option "${token}".`);
+    }
+  }
+  return options;
+}
+
+function runGithubActions(rawArgs) {
+  let options;
+  try {
+    options = parseGithubActionsOptions(rawArgs);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  if (!options.subcommand || !["render", "init", "validate", "render-comment", "render-annotations"].includes(options.subcommand)) {
+    console.error("Usage: gemini-companion.mjs github-actions render|init|validate|render-comment|render-annotations [options]");
+    process.exit(2);
+  }
+  try {
+    if (options.subcommand === "render") {
+      process.stdout.write(renderWorkflow(ROOT_DIR, options));
+      return;
+    }
+    if (options.subcommand === "init") {
+      const rendered = renderWorkflow(ROOT_DIR, options);
+      if (!options.write) {
+        process.stdout.write(`${JSON.stringify({ ok: true, written: false, path: workflowPath(process.cwd()) }, null, 2)}\n`);
+        return;
+      }
+      const target = writeWorkflow(process.cwd(), rendered, { force: options.force });
+      process.stdout.write(`${JSON.stringify({ ok: true, written: true, path: target }, null, 2)}\n`);
+      return;
+    }
+    if (options.subcommand === "validate") {
+      const target = workflowPath(process.cwd());
+      const text = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : renderWorkflow(ROOT_DIR, options);
+      const validation = validateWorkflow(text, options);
+      process.stdout.write(`${JSON.stringify(validation, null, 2)}\n`);
+      process.exit(validation.ok ? 0 : 1);
+    }
+    if (options.subcommand === "render-comment") {
+      if (!options.input) throw new Error("Missing --input for render-comment.");
+      process.stdout.write(`${renderReviewComment(readReviewJson(options.input))}\n`);
+      return;
+    }
+    if (options.subcommand === "render-annotations") {
+      if (!options.input) throw new Error("Missing --input for render-annotations.");
+      process.stdout.write(`${JSON.stringify(reviewToAnnotations(readReviewJson(options.input)), null, 2)}\n`);
+    }
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+}
+
+function stripTerminalControls(text) {
+  return String(text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+}
+
+function runRolesCommand(rawArgs) {
+  const tokens = normalizeArgv(rawArgs);
+  const subcommand = tokens.shift();
+  const jsonOutput = tokens.includes("--json");
+  const filtered = tokens.filter((token) => token !== "--json");
+  try {
+    if (subcommand === "list") {
+      if (filtered.length) {
+        throw new Error("Usage: gemini-companion.mjs roles list [--json]");
+      }
+      const packs = listRolePacks();
+      if (jsonOutput) {
+        process.stdout.write(`${JSON.stringify({ rolePacks: packs }, null, 2)}\n`);
+        return;
+      }
+      process.stdout.write([
+        "Gemini role packs:",
+        ...packs.map((pack) => `- ${pack.name}: ${pack.roles.join(", ")}${pack.gate_compatible ? " (gate-compatible)" : ""}`)
+      ].join("\n") + "\n");
+      return;
+    }
+    if (subcommand === "inspect") {
+      const packName = filtered[0];
+      if (!packName || filtered.length !== 1) {
+        throw new Error("Usage: gemini-companion.mjs roles inspect <pack> [--json]");
+      }
+      const summary = rolePackSummary(resolveRolePack(packName));
+      if (jsonOutput) {
+        process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+        return;
+      }
+      process.stdout.write([
+        `Role pack: ${summary.name}`,
+        `source: ${summary.source}`,
+        `schema: ${summary.schema_version}`,
+        `roles: ${summary.roles.join(", ")}`,
+        `gate-compatible: ${summary.gate_compatible ? "yes" : "no"}`,
+        `native-agents-compatible: ${summary.native_agents_compatible ? "yes" : "no"}`,
+        `hash: ${summary.hash}`,
+        `description: ${summary.description}`
+      ].join("\n") + "\n");
+      return;
+    }
+    if (subcommand === "validate") {
+      const file = filtered[0];
+      if (!file || filtered.length !== 1) {
+        throw new Error("Usage: gemini-companion.mjs roles validate <file> [--json]");
+      }
+      const pack = validateRolePackFile(file, { cwd: process.cwd(), mode: "validate" });
+      const summary = rolePackSummary(pack);
+      const payload = { ok: true, executable: false, reason: "User role packs are validate/inspect-only and are not executable by review commands.", rolePack: summary };
+      if (jsonOutput) {
+        process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+        return;
+      }
+      process.stdout.write(`ok: ${summary.name} validates; execution is not enabled for user-authored role packs\n`);
+      return;
+    }
+    throw new Error("Usage: gemini-companion.mjs roles list|inspect|validate [options]");
+  } catch (error) {
+    console.error(stripTerminalControls(error.message || String(error)));
+    process.exit(2);
+  }
+}
+
+function runMailboxCommand(rawArgs) {
+  const [subcommand, ...rest] = normalizeArgv(rawArgs);
+  const jsonOutput = rest.includes("--json");
+  try {
+    if (subcommand === "list") {
+      if (rest.some((token) => token !== "--json")) {
+        throw new Error("Usage: gemini-companion.mjs mailbox list [--json]");
+      }
+      const payload = listMailboxThreads(process.cwd());
+      process.stdout.write(jsonOutput ? `${JSON.stringify(payload, null, 2)}\n` : `${payload.threads.map((thread) => `${thread.threadId}: ${thread.messageCount}`).join("\n")}\n`);
+      return;
+    }
+    if (subcommand === "show") {
+      const id = rest.find((token) => token !== "--json");
+      if (!id || rest.filter((token) => token !== "--json").length !== 1) {
+        throw new Error("Usage: gemini-companion.mjs mailbox show <thread-or-job-id> [--json]");
+      }
+      const payload = showMailboxThread(process.cwd(), id);
+      process.stdout.write(jsonOutput ? `${JSON.stringify(payload, null, 2)}\n` : `${payload.messages.map((message) => `${message.createdAt} ${message.role} ${message.status}: ${message.summary}`).join("\n")}\n`);
+      return;
+    }
+    if (subcommand === "post") {
+      const options = { role: "manual", summary: "", jobId: "" };
+      for (let index = 0; index < rest.length; index += 1) {
+        const token = rest[index];
+        if (token === "--json") {
+          continue;
+        }
+        if (token === "--job-id") {
+          options.jobId = readOptionValue(rest, index, token);
+          index += 1;
+        } else if (token === "--summary") {
+          options.summary = readOptionValue(rest, index, token);
+          index += 1;
+        } else if (token === "--role") {
+          options.role = readOptionValue(rest, index, token);
+          index += 1;
+        } else {
+          throw new Error(`Unknown mailbox option "${token}".`);
+        }
+      }
+      if (!options.jobId || !options.summary) {
+        throw new Error("Usage: gemini-companion.mjs mailbox post --job-id <id> --summary <text> [--role <role>] [--json]");
+      }
+      const payload = postMailboxMessage(process.cwd(), {
+        threadId: options.jobId,
+        jobId: options.jobId,
+        role: options.role,
+        command: "manual",
+        mode: "manual",
+        status: "note",
+        source: "manual",
+        summary: options.summary
+      });
+      process.stdout.write(jsonOutput ? `${JSON.stringify(payload, null, 2)}\n` : `posted: ${payload.id}\n`);
+      return;
+    }
+    throw new Error("Usage: gemini-companion.mjs mailbox list|show|post [options]");
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+}
+
+function runLeasesCommand(rawArgs) {
+  const [subcommand, ...rest] = normalizeArgv(rawArgs);
+  const jsonOutput = rest.includes("--json");
+  try {
+    if (subcommand === "list") {
+      if (rest.some((token) => token !== "--json")) {
+        throw new Error("Usage: gemini-companion.mjs leases list [--json]");
+      }
+      const payload = listLeases(process.cwd());
+      process.stdout.write(jsonOutput ? `${JSON.stringify(payload, null, 2)}\n` : `${payload.active.map((lease) => `${lease.id}: ${lease.path} ${lease.role}`).join("\n")}\n`);
+      return;
+    }
+    if (subcommand === "claim") {
+      const options = { role: "manual", ttl: "600s", path: "", jobId: "" };
+      for (let index = 0; index < rest.length; index += 1) {
+        const token = rest[index];
+        if (token === "--json") {
+          continue;
+        }
+        if (token === "--path") {
+          options.path = readOptionValue(rest, index, token);
+          index += 1;
+        } else if (token === "--role") {
+          options.role = readOptionValue(rest, index, token);
+          index += 1;
+        } else if (token === "--ttl") {
+          options.ttl = readOptionValue(rest, index, token);
+          index += 1;
+        } else if (token === "--job-id") {
+          options.jobId = readOptionValue(rest, index, token);
+          index += 1;
+        } else {
+          throw new Error(`Unknown leases option "${token}".`);
+        }
+      }
+      if (!options.path) {
+        throw new Error("Usage: gemini-companion.mjs leases claim --path <path> --role <role> --ttl <duration> [--job-id <id>] [--json]");
+      }
+      const payload = claimLease(process.cwd(), { ...options, mode: "manual" });
+      process.stdout.write(jsonOutput ? `${JSON.stringify(payload, null, 2)}\n` : `${payload.status}${payload.lease ? `: ${payload.lease.id}` : ""}\n`);
+      return;
+    }
+    if (subcommand === "release") {
+      const id = rest.find((token) => token !== "--json");
+      if (!id || rest.filter((token) => token !== "--json").length !== 1) {
+        throw new Error("Usage: gemini-companion.mjs leases release <lease-id> [--json]");
+      }
+      const payload = releaseLease(process.cwd(), id);
+      process.stdout.write(jsonOutput ? `${JSON.stringify(payload, null, 2)}\n` : `${payload.status}: ${id}\n`);
+      return;
+    }
+    throw new Error("Usage: gemini-companion.mjs leases list|claim|release [options]");
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+}
+
+function parseGateVerdict(rawOutput) {
+  const text = String(rawOutput ?? "").trim();
+  if (!text) {
+    return { kind: "invalid", reason: "empty Gemini gate output" };
+  }
+  const firstLine = text.split(/\r?\n/, 1)[0].trim();
+  if (firstLine.startsWith("ALLOW:")) {
+    return { kind: "allow", reason: firstLine.slice("ALLOW:".length).trim() || "allowed" };
+  }
+  if (firstLine.startsWith("BLOCK:")) {
+    return { kind: "block", reason: firstLine.slice("BLOCK:".length).trim() || "blocked", output: text };
+  }
+  return { kind: "invalid", reason: `unexpected first line: ${firstLine}` };
+}
+
+function validateGeminiSessionOptions(args) {
+  if (args.resume && args.fresh) {
+    throw new Error("Choose either --resume or --fresh, not both.");
+  }
+  if (args.resume) {
+    requireGeminiCapability("resume", "--resume");
+  }
+  if (args.sessionId) {
+    requireGeminiCapability("sessionId", "--session-id");
+  }
+  if (args.worktree) {
+    requireGeminiCapability("worktree", "--worktree");
+  }
+}
+
+function warnGate(message) {
+  process.stderr.write(`[gemini-for-claude review-gate] ${message}\n`);
+}
+
+function readStdinJsonForGate() {
+  if (process.stdin.isTTY) {
+    return {};
+  }
+  const rawInput = fs.readFileSync(0, "utf8").trim();
+  if (!rawInput) {
+    return {};
+  }
+  return JSON.parse(rawInput);
+}
+
+async function runReviewGate(rawArgs) {
+  if (String(process.env[REVIEW_GATE_ENV] ?? "").toLowerCase() === "off") {
+    return;
+  }
+
+  let args;
+  try {
+    args = parseArgs(rawArgs);
+  } catch (error) {
+    warnGate(`argument parse failed; allowing stop: ${error.message || String(error)}`);
+    return;
+  }
+
+  let input = {};
+  try {
+    input = readStdinJsonForGate();
+  } catch (error) {
+    warnGate(`invalid hook input; allowing stop: ${error.message || String(error)}`);
+    return;
+  }
+
+  if (input.stop_hook_active) {
+    return;
+  }
+
+  const cwd = input.cwd || process.cwd();
+  try {
+    process.chdir(cwd);
+  } catch (error) {
+    warnGate(`unable to enter hook cwd "${cwd}"; allowing stop: ${error.message || String(error)}`);
+    return;
+  }
+  let config;
+  try {
+    config = getConfig(cwd);
+  } catch (error) {
+    if (error instanceof StateReadError) {
+      warnGate(`state unreadable; allowing stop: ${error.message}`);
+      return;
+    }
+    throw error;
+  }
+  if (!config.reviewGateEnabled) {
+    return;
+  }
+  if (config.reviewGateMode !== "multi-role") {
+    warnGate(`unknown gate mode "${config.reviewGateMode}"; allowing stop`);
+    return;
+  }
+
+  const reviewable = hasReviewableGitChanges(cwd);
+  if (!reviewable.reviewable) {
+    return;
+  }
+  const diffHash = workingTreeFingerprint(cwd);
+  const baseline = readJson(turnBaselineFileForCwd(cwd), null);
+  if (baseline?.workingTreeFingerprint === diffHash) {
+    return;
+  }
+  if (config.lastAllowedReviewGateDiffHash === diffHash) {
+    return;
+  }
+
+  let roles;
+  try {
+    if (args.rolePack !== undefined) {
+      const pack = resolveRolePack(args.rolePack);
+      if (!rolePackGateCompatible(pack)) {
+        process.stdout.write(`${JSON.stringify({
+          decision: "block",
+          reason: `Gemini review gate role pack "${pack.name}" is not gate-compatible.`
+        })}\n`);
+        return;
+      }
+      args.rolePackSummary = rolePackSummary(pack);
+      args.rolePack = pack;
+      roles = rolesForPack(pack);
+    } else {
+      roles = defaultRoleObjects();
+    }
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify({
+      decision: "block",
+      reason: `Gemini review gate role pack configuration error: ${error.message || String(error)}`
+    })}\n`);
+    return;
+  }
+  args.scope = "working-tree";
+  args.timeout = REVIEW_GATE_ROLE_TIMEOUT_MS;
+
+  const gitContext = collectGitContext(args);
+  let context = { block: "", metadata: defaultContextMetadata() };
+  if (args.contextProvider !== undefined || args.contextBudget !== undefined || args.contextTimeoutMs !== undefined || args.contextStrict) {
+    try {
+      context = await resolveCommandContext(args, { allowProviderErrors: true });
+      if (context.warning) {
+        warnGate(`context provider unavailable; running gate without context: ${context.warning}`);
+      }
+    } catch (error) {
+      warnGate(`context provider failed before execution; running gate without context: ${error.message || String(error)}`);
+      context = {
+        block: "",
+        metadata: { ...defaultContextMetadata(), contextStatus: "unavailable", contextFailureReason: error.reason || "unsafe-config", contextDegraded: true }
+      };
+    }
+    if (args.contextStrict && context.metadata.contextStatus !== "available" && context.metadata.contextStatus !== "disabled") {
+      warnGate(`context provider unavailable in strict mode; allowing stop without Gemini: ${context.metadata.contextFailureReason}`);
+      writeOperationReport({ command: "review-gate", cwd, status: 2, geminiAvailable: hasGemini(), contextMetadata: context.metadata, rolePack: args.rolePackSummary });
+      return;
+    }
+    if (context.metadata.contextDegraded) {
+      warnGate(`context degraded (${context.metadata.contextFailureReason}); gate decision will fail open unless Gemini returns BLOCK`);
+    }
+  }
+  const blocks = [];
+  for (const role of roles) {
+    const prompt = reviewGateRolePrompt(role, args, gitContext, context.block);
+    const result = geminiPrint(prompt, args);
+    if (result.errorCode === "ETIMEDOUT" || result.error.includes("ETIMEDOUT")) {
+      warnGate(`role ${role.name} timed out; allowing stop`);
+      continue;
+    }
+    if (result.status !== 0) {
+      const detail = (result.stderr || result.error || result.stdout || "gemini review failed").trim();
+      warnGate(`role ${role.name} failed; allowing stop: ${detail}`);
+      continue;
+    }
+    const verdict = parseGateVerdict(result.stdout);
+    if (verdict.kind === "block") {
+      blocks.push({ role: role.name, reason: verdict.reason, output: verdict.output });
+    } else if (verdict.kind === "invalid") {
+      warnGate(`role ${role.name} returned invalid gate output; allowing stop: ${verdict.reason}`);
+    }
+  }
+
+  if (blocks.length) {
+    const reason = blocks
+      .map((block) => `${block.role}: ${block.reason}`)
+      .join("; ");
+    process.stdout.write(`${JSON.stringify({
+      decision: "block",
+      reason: `Gemini review gate found blocking issues: ${reason}`
+    })}\n`);
+    return;
+  }
+  setConfig(cwd, "lastAllowedReviewGateDiffHash", diffHash);
+  writeOperationReport({ command: "review-gate", cwd, status: 0, geminiAvailable: hasGemini(), contextMetadata: context.metadata, rolePack: args.rolePackSummary });
+}
+
+async function runGeminiTask(kind, rawArgs) {
+  if (maybeStartBackground(kind, rawArgs)) {
+    return;
+  }
+  let args;
+  try {
+    args = parseArgs(rawArgs);
+    normalizeAgentTeam(args, kind);
+    validateQualityLoopArgs(kind, args);
+    if (kind !== "multi-review" && args.roles !== undefined) {
+      throw new Error("--roles is only valid for multi-review; use --adversarial-lenses for adversarial-review.");
+    }
+    if (kind !== "multi-review" && args.rolePack !== undefined) {
+      throw new Error("--role-pack is only valid for multi-review and manual review-gate.");
+    }
+    if (args.structuredReview && kind !== "review") {
+      throw new Error("--structured is only valid for review.");
+    }
+    if (args.jsonOutput && kind !== "review" && kind !== "adversarial-review") {
+      throw new Error("--json is only valid for review and adversarial-review.");
+    }
+    if (kind === "review" && args.jsonOutput && args.structuredReview) {
+      throw new Error("--json and --structured cannot be combined for review.");
+    }
+    if (args.scorecard && args.structuredReview) {
+      throw new Error("--scorecard and --structured cannot be combined.");
+    }
+    if (kind === "adversarial-review") {
+      args.resolvedAdversarialLenses = resolveAdversarialLenses(args);
+    }
+    if (kind === "multi-review") {
+      args.reviewRoles = resolveReviewRoles(args);
+    }
+    if (args.write) {
+      throw new Error("Gemini for Claude is read-only; --write is not supported.");
+    }
+    if (args.effort) {
+      throw new Error("--effort is not supported by Gemini for Claude.");
+    }
+    if ((kind === "plan" || kind === "rescue") && (args.contextProvider !== undefined || args.contextBudget !== undefined || args.contextTimeoutMs !== undefined || args.contextStrict)) {
+      throw new Error("Context provider flags are only supported for review, adversarial-review, multi-review, and manual review-gate.");
+    }
+    validateGeminiSessionOptions(args);
+    if (kind === "review" || kind === "adversarial-review") {
+      parseContextOptions(args);
+    }
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  const scope = args.scope ?? "auto";
+  if (!VALID_SCOPES.has(scope)) {
+    console.error(`Invalid --scope "${scope}". Valid scopes: auto, working-tree, branch.`);
+    process.exit(2);
+  }
+  if (scope === "branch" && !args.base) {
+    console.error("--scope branch requires --base <ref>.");
+    process.exit(2);
+  }
+  args.scope = scope;
+  let context = { block: "", metadata: defaultContextMetadata() };
+  if (kind === "review" || kind === "adversarial-review") {
+    try {
+      context = await resolveCommandContext(args);
+    } catch (error) {
+      console.error(error.message || String(error));
+      process.exit(2);
+    }
+    if (args.contextStrict && context.metadata.contextStatus !== "available" && context.metadata.contextStatus !== "disabled") {
+      console.error(`Context provider unavailable in strict mode: ${context.metadata.contextFailureReason}`);
+      writeOperationReport({ command: kind, cwd: process.cwd(), status: 2, geminiAvailable: hasGemini(), contextMetadata: context.metadata });
+      process.exit(2);
+    }
+  }
+  const prompt = kind === "plan" ? planPrompt(args) : kind === "rescue" ? rescuePrompt(args) : reviewPrompt(kind, args, context.block);
+  const result = geminiPrint(prompt, args);
+  writeOperationReport({ command: kind, cwd: process.cwd(), status: result.status, geminiAvailable: hasGemini(), contextMetadata: context.metadata });
+
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr || result.error || "gemini review failed\n");
+    process.exit(result.status);
+  }
+  if (kind === "plan" && args.taskset) {
+    try {
+      const taskset = saveTaskset(process.cwd(), extractJsonObject(result.stdout), process.env);
+      const payload = {
+        ok: true,
+        tasksetId: taskset.id,
+        statePath: taskset.path,
+        taskset
+      };
+      process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    } catch (error) {
+      process.stderr.write(`Invalid taskset output: ${error.message || String(error)}\n`);
+      process.stdout.write(result.stdout);
+      process.exit(1);
+    }
+    return;
+  }
+  if (args.scorecard) {
+    try {
+      const parsed = parseScorecardResult(result.stdout);
+      process.stdout.write(`${JSON.stringify(parsed, null, 2)}\n`);
+    } catch (error) {
+      process.stderr.write(`Invalid scorecard output: ${error.message || String(error)}\n`);
+      process.stdout.write(result.stdout);
+      process.exit(1);
+    }
+    return;
+  }
+  if (kind === "adversarial-review" && args.jsonOutput) {
+    try {
+      const parsed = validateAdversarialJson(extractJsonObject(result.stdout));
+      process.stdout.write(`${JSON.stringify(parsed, null, 2)}\n`);
+    } catch (error) {
+      process.stderr.write(`Invalid structured adversarial output: ${error.message || String(error)}\n`);
+      process.stdout.write(result.stdout);
+      process.exit(1);
+    }
+    return;
+  }
+  if (kind === "review" && args.jsonOutput) {
+    try {
+      const parsed = validateStructuredReview(extractJsonObject(result.stdout));
+      process.stdout.write(`${JSON.stringify(parsed, null, 2)}\n`);
+    } catch (error) {
+      process.stderr.write(`Invalid structured review output: ${error.message || String(error)}\n`);
+      process.stdout.write(result.stdout);
+      process.exit(1);
+    }
+    return;
+  }
+  if (kind === "review" && args.structuredReview) {
+    try {
+      const parsed = validateStructuredReview(extractJsonObject(result.stdout));
+      process.stdout.write(`${renderStructuredReview(parsed)}\n`);
+    } catch (error) {
+      process.stderr.write(`Invalid structured review output: ${error.message || String(error)}\n`);
+      process.stdout.write(result.stdout);
+      process.exit(1);
+    }
+    return;
+  }
+  process.stdout.write(result.stdout);
+}
+
+async function runGeminiMultiReview(rawArgs) {
+  if (maybeStartBackground("multi-review", rawArgs)) {
+    return;
+  }
+  let args;
+  try {
+    args = parseArgs(rawArgs);
+    normalizeAgentTeam(args, "multi-review");
+    validateQualityLoopArgs("multi-review", args);
+    if (args.write) {
+      throw new Error("Gemini for Claude is read-only; --write is not supported.");
+    }
+    if (args.effort) {
+      throw new Error("--effort is not supported by Gemini for Claude.");
+    }
+    parseContextOptions(args);
+    if (args.structuredReview) {
+      throw new Error("--structured is only valid for review.");
+    }
+    if (args.scorecard && args.nativeAgents) {
+      throw new Error("--scorecard is currently supported for plugin-managed multi-review only.");
+    }
+    validateGeminiSessionOptions(args);
+    args.reviewRoles = (args.roles === undefined && args.rolePack === undefined)
+      ? defaultRoleObjects()
+      : resolveReviewRoles(args);
+    if (args.nativeAgents && args.rolePackSummary) {
+      if (!rolePackNativeAgentsCompatible(args.rolePack)) {
+        throw new Error(`Role pack "${args.rolePack.name}" is not compatible with Gemini native agents.`);
+      }
+      const maxNativeAgents = args.rolePack.limits?.max_native_agents;
+      if (Number.isInteger(maxNativeAgents) && args.reviewRoles.length > maxNativeAgents) {
+        throw new Error(`Role pack "${args.rolePack.name}" has ${args.reviewRoles.length} roles, exceeding max_native_agents ${maxNativeAgents}.`);
+      }
+      if (!currentGeminiCapabilities().includeDirectories) {
+        throw new Error("Gemini native role-pack review requires Gemini CLI --include-directories support.");
+      }
+    }
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  const scope = args.scope ?? "auto";
+  if (!VALID_SCOPES.has(scope)) {
+    console.error(`Invalid --scope "${scope}". Valid scopes: auto, working-tree, branch.`);
+    process.exit(2);
+  }
+  if (scope === "branch" && !args.base) {
+    console.error("--scope branch requires --base <ref>.");
+    process.exit(2);
+  }
+  args.scope = scope;
+
+  const gitContext = collectGitContext(args);
+  let context = { block: "", metadata: defaultContextMetadata() };
+  try {
+    context = await resolveCommandContext(args);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  if (args.contextStrict && context.metadata.contextStatus !== "available" && context.metadata.contextStatus !== "disabled") {
+    console.error(`Context provider unavailable in strict mode: ${context.metadata.contextFailureReason}`);
+    writeOperationReport({ command: "multi-review", cwd: process.cwd(), status: 2, geminiAvailable: hasGemini(), contextMetadata: context.metadata, rolePack: args.rolePackSummary });
+    process.exit(2);
+  }
+  let results;
+  let nativeWorkspace = "";
+  let nativeStructuredExit = null;
+  const mailboxThreadId = args.useMailbox ? `thread-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}` : "";
+  const leaseResults = [];
+  let mailboxWriteFailures = 0;
+  if (args.advisoryLeases) {
+    if (!args.paths.length) {
+      process.stderr.write("[gemini-for-claude leases] --advisory-leases supplied without --path; skipping leases.\n");
+    } else {
+      for (const leasePath of args.paths) {
+        try {
+          leaseResults.push(claimLease(process.cwd(), {
+            path: leasePath,
+            role: args.nativeAgents ? "native-gemini-subagents" : args.reviewRoles[0]?.name || "multi-review",
+            ttl: "600s",
+            mode: args.nativeAgents ? "native-agents" : "plugin-managed"
+          }));
+        } catch (error) {
+          leaseResults.push({ status: "degraded", degraded: true, reason: error.message || String(error) });
+        }
+      }
+    }
+  }
+  function writeMailbox(message) {
+    if (!mailboxThreadId) {
+      return;
+    }
+    try {
+      postMailboxMessage(process.cwd(), {
+        threadId: mailboxThreadId,
+        command: "multi-review",
+        source: "runtime",
+        ...message
+      });
+    } catch (error) {
+      mailboxWriteFailures += 1;
+      process.stderr.write(`[gemini-for-claude mailbox] ${error.message || String(error)}\n`);
+    }
+  }
+  function releaseClaimedLeases() {
+    for (const leaseResult of leaseResults) {
+      if (leaseResult.status === "claimed" && leaseResult.lease?.id) {
+        try {
+          const released = releaseLease(process.cwd(), leaseResult.lease.id);
+          if (released.status !== "released") {
+            process.stderr.write(`[gemini-for-claude leases] failed to release ${leaseResult.lease.id}: ${released.reason || released.status}\n`);
+          }
+        } catch (error) {
+          process.stderr.write(`[gemini-for-claude leases] failed to release ${leaseResult.lease.id}: ${error.message || String(error)}\n`);
+        }
+      }
+    }
+  }
+  emitProgress(args, "multi-review started");
+  try {
+    if (args.nativeAgents) {
+      try {
+        writeMailbox({
+          role: "native-gemini-subagents",
+          mode: "native-agents",
+          status: "started",
+          summary: `Gemini native-agent review started for roles: ${args.reviewRoles.map((role) => role.name).join(", ")}.`
+        });
+        nativeWorkspace = writeNativeAgentWorkspace(args.reviewRoles);
+        emitProgress(args, "native-agents started");
+        const result = geminiPrint(nativeMultiAgentPrompt(args, gitContext, context.block), {
+          ...args,
+          cwd: nativeWorkspace,
+          includeDirectories: currentGeminiCapabilities().includeDirectories ? [process.cwd()] : []
+        });
+        emitProgress(args, "native-agents finished", { status: result.status });
+        results = [{ role: { name: "native-gemini-subagents" }, result }];
+        writeMailbox({
+          role: "native-gemini-subagents",
+          mode: "native-agents",
+          status: result.status === 0 ? "succeeded" : "failed",
+          summary: `Gemini native-agent review ${result.status === 0 ? "succeeded" : "failed"} with exit status ${result.status}.`
+        });
+        if (args.nativeStructured) {
+          const leaseMetadata = leaseSummary(leaseResults);
+          if (result.status !== 0) {
+            emitProgress(args, "multi-review finished", { status: result.status });
+            nativeStructuredExit = {
+              status: result.status || 1,
+              stdout: "",
+              stderr: result.stderr || result.error || "Gemini native structured review failed\n",
+              report: {
+                command: "multi-review",
+                cwd: process.cwd(),
+                status: result.status || 1,
+                geminiAvailable: hasGemini(),
+                contextMetadata: context.metadata,
+                rolePack: args.rolePackSummary,
+                mailbox: args.useMailbox ? mailboxSummary(process.cwd(), mailboxThreadId, process.env, { writeFailures: mailboxWriteFailures }) : undefined,
+                leases: args.advisoryLeases ? leaseMetadata : undefined
+              }
+            };
+          }
+          let aggregate;
+          if (!nativeStructuredExit) {
+            try {
+              aggregate = validateNativeStructuredAggregate(extractNativeStructuredObject(result.stdout), args.reviewRoles);
+            } catch (error) {
+              emitProgress(args, "multi-review finished", { status: 1 });
+              nativeStructuredExit = {
+                status: 1,
+                stdout: "",
+                stderr: `Invalid Gemini native structured output: ${error.message || String(error)}\n`,
+                report: {
+                  command: "multi-review",
+                  cwd: process.cwd(),
+                  status: 1,
+                  geminiAvailable: hasGemini(),
+                  contextMetadata: context.metadata,
+                  rolePack: args.rolePackSummary,
+                  mailbox: args.useMailbox ? mailboxSummary(process.cwd(), mailboxThreadId, process.env, { writeFailures: mailboxWriteFailures }) : undefined,
+                  leases: args.advisoryLeases ? leaseMetadata : undefined
+                }
+              };
+            }
+          }
+          if (!nativeStructuredExit) {
+            const failedNativeRoles = aggregate.role_results.filter((entry) => entry.status === "error");
+            const exitStatus = failedNativeRoles.length ? 1 : 0;
+            emitProgress(args, "multi-review finished", { status: exitStatus });
+            nativeStructuredExit = {
+              status: exitStatus,
+              stdout: `${JSON.stringify(aggregate, null, 2)}\n`,
+              stderr: "",
+              report: {
+                command: "multi-review",
+                cwd: process.cwd(),
+                status: exitStatus,
+                geminiAvailable: hasGemini(),
+                contextMetadata: context.metadata,
+                rolePack: args.rolePackSummary,
+                mailbox: args.useMailbox ? mailboxSummary(process.cwd(), mailboxThreadId, process.env, { writeFailures: mailboxWriteFailures }) : undefined,
+                leases: args.advisoryLeases ? leaseMetadata : undefined
+              }
+            };
+          }
+        }
+      } finally {
+        if (nativeWorkspace) {
+          fs.rmSync(nativeWorkspace, { recursive: true, force: true });
+        }
+      }
+    } else {
+      const concurrency = multiReviewConcurrency();
+      results = await mapWithConcurrency(args.reviewRoles, concurrency, async (role) => {
+        emitProgress(args, "role started", { role: role.name });
+        writeMailbox({
+          role: role.name,
+          mode: "plugin-managed",
+          status: "started",
+          summary: `Role ${role.name} started.`
+        });
+        const prompt = multiReviewRolePrompt(role, args, gitContext, context.block);
+        const result = await geminiPrintAsync(prompt, args);
+        emitProgress(args, "role finished", { role: role.name, status: result.status });
+        writeMailbox({
+          role: role.name,
+          mode: "plugin-managed",
+          status: result.status === 0 ? "succeeded" : "failed",
+          summary: `Role ${role.name} ${result.status === 0 ? "succeeded" : "failed"} with exit status ${result.status}.`
+        });
+        return { role, result };
+      });
+      args.orchestrationMode = concurrency <= 1 ? "sequential Gemini CLI role review" : `parallel Gemini CLI role fan-out (bounded ${concurrency} max)`;
+    }
+  } finally {
+    releaseClaimedLeases();
+  }
+
+  if (nativeStructuredExit) {
+    writeOperationReport(nativeStructuredExit.report);
+    if (nativeStructuredExit.stdout) {
+      process.stdout.write(nativeStructuredExit.stdout);
+    }
+    if (nativeStructuredExit.stderr) {
+      process.stderr.write(nativeStructuredExit.stderr);
+    }
+    process.exit(nativeStructuredExit.status);
+  }
+
+  if (args.scorecard) {
+    const payload = scorecardMultiReviewPayload(results, args);
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    writeOperationReport({
+      command: "multi-review",
+      cwd: process.cwd(),
+      status: payload.verdict === "approve" ? 0 : 1,
+      geminiAvailable: hasGemini(),
+      contextMetadata: context.metadata,
+      rolePack: args.rolePackSummary
+    });
+    process.exit(payload.verdict === "approve" ? 0 : 1);
+  }
+
+  const succeeded = results.filter(({ result }) => result.status === 0).map(({ role }) => role.name);
+  const failed = results.filter(({ result }) => result.status !== 0).map(({ role }) => role.name);
+  const leaseMetadata = leaseSummary(leaseResults);
+  const sections = [
+    args.nativeAgents ? "# Gemini Native Subagent Review" : "# Gemini Multi-Agent Review",
+    ...results.map(({ role, result }) => [
+      `## Role: ${role.name}`,
+      result.stdout.trim() || "(no stdout)",
+      result.status === 0 ? "" : [
+        "",
+        `Role failed with exit status ${result.status}.`,
+        result.stderr || result.error ? `stderr: ${(result.stderr || result.error).trim()}` : ""
+      ].filter(Boolean).join("\n")
+    ].filter(Boolean).join("\n")),
+    "## Orchestration Summary",
+    `roles requested: ${args.reviewRoles.map((role) => role.name).join(", ")}`,
+    `orchestration: ${args.nativeAgents ? "Gemini native subagents" : (args.orchestrationMode || "bounded Gemini CLI role fan-out")}`,
+    `roles succeeded: ${succeeded.length ? succeeded.join(", ") : "(none)"}`,
+    `roles failed: ${failed.length ? failed.join(", ") : "(none)"}`,
+    args.advisoryLeases ? `advisory leases: ${leaseMetadata.claimed} claimed, ${leaseMetadata.conflicts} conflicts${leaseMetadata.degraded ? ", degraded" : ""}` : "",
+    "exit policy: exits non-zero if any role fails; completed role output remains visible."
+  ].filter(Boolean);
+  if (!args.nativeAgents) {
+    writeMailbox({
+      role: "summary",
+      mode: "plugin-managed",
+      status: failed.length ? "failed" : "succeeded",
+      summary: `Multi-review completed. Succeeded: ${succeeded.length}; failed: ${failed.length}.`
+    });
+  }
+  emitProgress(args, "multi-review finished", { status: failed.length ? 1 : 0 });
+  process.stdout.write(`${sections.join("\n\n")}\n`);
+  writeOperationReport({
+    command: "multi-review",
+    cwd: process.cwd(),
+    status: failed.length ? 1 : 0,
+    geminiAvailable: hasGemini(),
+    contextMetadata: context.metadata,
+    rolePack: args.rolePackSummary,
+    mailbox: args.useMailbox ? mailboxSummary(process.cwd(), mailboxThreadId, process.env, { writeFailures: mailboxWriteFailures }) : undefined,
+    leases: args.advisoryLeases ? leaseMetadata : undefined
+  });
+  process.exit(failed.length ? 1 : 0);
+}
+
+async function runGeminiPlanReview(rawArgs) {
+  let args;
+  try {
+    args = parseArgs(rawArgs);
+    normalizeAgentTeam(args, "plan-review");
+    validateQualityLoopArgs("plan-review", args);
+    if (args.background || args.wait) {
+      throw new Error("plan-review does not support --background.");
+    }
+    if (args.write) {
+      throw new Error("plan-review does not support --write.");
+    }
+    if (args.nativeAgents) {
+      throw new Error("plan-review currently supports plugin-managed roles only.");
+    }
+    if (!args.plan) {
+      throw new Error("--plan is required for plan-review.");
+    }
+    args.reviewRoles = (args.roles === undefined && args.rolePack === undefined)
+      ? defaultRoleObjects()
+      : resolveReviewRoles(args);
+    args.planFile = readWorkspaceBoundPlanFile(args.plan, process.cwd());
+    args.reviewedFile = args.planFile.relative;
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+
+  const concurrency = multiReviewConcurrency();
+  const results = await mapWithConcurrency(args.reviewRoles, concurrency, async (role) => {
+    const prompt = planReviewRolePrompt(role, args);
+    const result = await geminiPrintAsync(prompt, args);
+    return { role, result };
+  });
+
+  if (args.scorecard) {
+    const payload = scorecardMultiReviewPayload(results, args);
+    payload.mode = "plan-review";
+    payload.reviewedFile = args.reviewedFile;
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    writeOperationReport({
+      command: "plan-review",
+      cwd: process.cwd(),
+      status: payload.verdict === "approve" ? 0 : 1,
+      geminiAvailable: hasGemini(),
+      rolePack: args.rolePackSummary
+    });
+    process.exit(payload.verdict === "approve" ? 0 : 1);
+  }
+
+  const failed = results.filter(({ result }) => result.status !== 0).map(({ role }) => role.name);
+  const sections = [
+    "# Gemini Plan Review",
+    `reviewed plan: ${args.reviewedFile}`,
+    ...results.map(({ role, result }) => [
+      `## Role: ${role.name}`,
+      result.stdout.trim() || "(no stdout)",
+      result.status === 0 ? "" : [
+        "",
+        `Role failed with exit status ${result.status}.`,
+        result.stderr || result.error ? `stderr: ${(result.stderr || result.error).trim()}` : ""
+      ].filter(Boolean).join("\n")
+    ].filter(Boolean).join("\n")),
+    "## Orchestration Summary",
+    `roles requested: ${args.reviewRoles.map((role) => role.name).join(", ")}`,
+    `orchestration: ${concurrency <= 1 ? "sequential Gemini CLI plan review" : `parallel Gemini CLI plan review (bounded ${concurrency} max)`}`,
+    "exit policy: exits non-zero if any role fails; completed role output remains visible."
+  ];
+  process.stdout.write(`${sections.join("\n\n")}\n`);
+  writeOperationReport({
+    command: "plan-review",
+    cwd: process.cwd(),
+    status: failed.length ? 1 : 0,
+    geminiAvailable: hasGemini(),
+    rolePack: args.rolePackSummary
+  });
+  process.exit(failed.length ? 1 : 0);
+}
+
+async function runGeminiAssistedReview(rawArgs) {
+  if (maybeStartBackground("assisted-review", rawArgs)) {
+    return;
+  }
+  let args;
+  try {
+    args = parseArgs(rawArgs);
+    validateQualityLoopArgs("assisted-review", args);
+    if (args.write) {
+      throw new Error("Gemini for Claude is read-only; --write is not supported.");
+    }
+    if (args.effort) {
+      throw new Error("--effort is not supported by Gemini for Claude.");
+    }
+    if (args.structuredReview) {
+      throw new Error("--structured is not supported for assisted-review.");
+    }
+    args.scorecard = true;
+    args.jsonOutput = true;
+    args.maxReviewRounds = args.maxReviewRounds ?? 2;
+    if (args.tasksetId) {
+      args.tasksetLoaded = readTaskset(process.cwd(), args.tasksetId, process.env);
+      if (!args.tasksetLoaded.ok) {
+        throw new Error(`Unable to read taskset ${args.tasksetId}: ${args.tasksetLoaded.error}`);
+      }
+    }
+    parseContextOptions(args);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+
+  let context = { block: "", metadata: defaultContextMetadata() };
+  try {
+    context = await resolveCommandContext(args);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  if (args.contextStrict && context.metadata.contextStatus !== "available" && context.metadata.contextStatus !== "disabled") {
+    console.error(`Context provider unavailable in strict mode: ${context.metadata.contextFailureReason}`);
+    writeOperationReport({ command: "assisted-review", cwd: process.cwd(), status: 2, geminiAvailable: hasGemini(), contextMetadata: context.metadata });
+    process.exit(2);
+  }
+  args.assistedContextBlock = context.block;
+
+  const loopId = `loop-${randomUUID()}`;
+  const rounds = [];
+  let finalAction = { action: "review" };
+  for (let round = 1; round <= args.maxReviewRounds; round += 1) {
+    const prompt = assistedReviewPrompt(args, round);
+    const result = await geminiPrintAsync(prompt, args);
+    let scorecard = null;
+    let roundFailureCategory = "";
+    if (result.status === 0) {
+      try {
+        scorecard = parseScorecardResult(result.stdout);
+      } catch (error) {
+        process.stderr.write(`Invalid assisted-review scorecard output: ${error.message || String(error)}\n`);
+        process.stdout.write(result.stdout);
+        process.exit(1);
+      }
+    } else {
+      roundFailureCategory = classifyProviderFailure(result);
+    }
+    const summary = {
+      ...scorecardRoundSummary("assisted-review", scorecard, roundFailureCategory),
+      blockingFindingIds: scorecard ? [...blockingFindingIds(scorecard)] : []
+    };
+    rounds.push(summary);
+    writeRoundSummary(process.cwd(), loopId, round, summary, process.env);
+    finalAction = nextAssistedReviewAction({
+      maxRounds: args.maxReviewRounds,
+      rounds,
+      repeatedBlockingFinding: hasRepeatedBlockingFinding(rounds)
+    });
+    if (finalAction.action === "stop") {
+      break;
+    }
+  }
+  const latest = rounds.at(-1) ?? {};
+  const payload = {
+    status: finalAction.reason === "threshold_met" ? "approved" : "needs_attention",
+    loopId,
+    rounds: rounds.length,
+    stopReason: finalAction.reason ?? "max_rounds",
+    scoreTotal: latest.scoreTotal ?? null,
+    threshold: latest.threshold ?? 85,
+    blockingFindings: latest.blockingFindings ?? 0,
+    nextSuggestedCommand: "gemini-review --scorecard --json"
+  };
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  writeOperationReport({
+    command: "assisted-review",
+    cwd: process.cwd(),
+    status: payload.status === "approved" ? 0 : 1,
+    geminiAvailable: hasGemini(),
+    contextMetadata: context.metadata
+  });
+  process.exit(payload.status === "approved" ? 0 : 1);
+}
+
+function printJobs() {
+  process.stdout.write(`${JSON.stringify(listJobs(process.cwd()), null, 2)}\n`);
+}
+
+function printExecutionRecommendation(rawArgs) {
+  process.stdout.write(`${JSON.stringify(recommendExecutionMode(rawArgs), null, 2)}\n`);
+}
+
+function printSessions() {
+  const capabilities = currentGeminiCapabilities();
+  if (!capabilities.listSessions) {
+    process.stdout.write(`${JSON.stringify({
+      available: false,
+      reason: "Gemini CLI does not report --list-sessions support."
+    }, null, 2)}\n`);
+    process.exit(1);
+  }
+  const result = runGemini(["--list-sessions"]);
+  process.stdout.write(`${JSON.stringify({
+    available: result.status === 0,
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr || result.error
+  }, null, 2)}\n`);
+  process.exit(result.status === 0 ? 0 : 1);
+}
+
+function printResult(rawArgs) {
+  const jobId = rawArgs[0];
+  if (!jobId) {
+    console.error("Usage: gemini-companion.mjs result <job-id>");
+    process.exit(2);
+  }
+  let payload;
+  try {
+    payload = resultForJob(process.cwd(), jobId);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  process.exit(payload.status === "ok" ? 0 : 1);
+}
+
+function runCancel(rawArgs) {
+  const jobId = rawArgs[0];
+  if (!jobId) {
+    console.error("Usage: gemini-companion.mjs cancel <job-id>");
+    process.exit(2);
+  }
+  let payload;
+  try {
+    payload = cancelJob(process.cwd(), jobId);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  process.exit(payload.status === "cancelled" ? 0 : 1);
+}
+
+function runJobWorker(rawArgs) {
+  const jobId = rawArgs[0];
+  if (!jobId) {
+    process.exit(2);
+  }
+  const job = readJob(process.cwd(), jobId);
+  if (!job) {
+    process.exit(1);
+  }
+  if (job.status === "cancelled") {
+    process.exit(0);
+  }
+  if (!BACKGROUND_CAPABLE_COMMANDS.has(job.command)) {
+    finishJob(process.cwd(), jobId, {
+      status: 2,
+      stdout: "",
+      stderr: `Unsupported background job command "${job.command}".`,
+      error: ""
+    });
+    process.exit(2);
+  }
+  const resourceLease = ensureResourceLease(job.resourceLeaseId, "background-job", { command: job.command, transferable: false });
+  if (!resourceLease.ok) {
+    const message = capacityBlockedMessage("gemini-for-claude", resourceLease);
+    finishJob(process.cwd(), jobId, {
+      status: 75,
+      stdout: "",
+      stderr: `${message}\n`,
+      error: message
+    });
+    process.exit(75);
+  }
+  markJobRunning(process.cwd(), jobId, process.pid);
+  let exitStatus = 1;
+  try {
+    const result = spawnSync(process.execPath, [process.argv[1], job.command, ...(job.args ?? [])], {
+      cwd: job.cwd || process.cwd(),
+      env: {
+        ...process.env,
+        GEMINI_FOR_CLAUDE_JOB_WORKER: "1"
+      },
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 30 * 60 * 1000
+    });
+    const current = readJob(process.cwd(), jobId);
+    if (current?.status === "cancelled") {
+      exitStatus = 0;
+    } else {
+      finishJob(process.cwd(), jobId, {
+        status: result.status ?? 1,
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+        error: result.error ? String(result.error.message ?? result.error) : ""
+      });
+      exitStatus = result.status ?? 1;
+    }
+  } finally {
+    resourceLease.release();
+  }
+  process.exit(exitStatus);
+}
+
+function runStoredJobCommand(job) {
+  if (!BACKGROUND_CAPABLE_COMMANDS.has(job.command)) {
+    return Promise.resolve({
+      status: 2,
+      stdout: "",
+      stderr: `Unsupported reserved job command "${job.command}".`,
+      error: ""
+    });
+  }
+  const foregroundArgs = stripBackgroundArgs(job.args ?? []);
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [process.argv[1], job.command, ...foregroundArgs], {
+      cwd: job.cwd || process.cwd(),
+      env: {
+        ...process.env,
+        GEMINI_FOR_CLAUDE_JOB_WORKER: "1"
+      },
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    const started = Date.now();
+    const timeout = setTimeout(() => {
+      stopChildGroup("SIGTERM");
+    }, 30 * 60 * 1000);
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let settled = false;
+    let stopRequested = false;
+
+    function stopChildGroup(signal) {
+      stopRequested = true;
+      try {
+        process.kill(-child.pid, signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          // Child may already have exited.
+        }
+      }
+    }
+
+    function handleWrapperSignal(signal) {
+      stopChildGroup(signal);
+    }
+
+    process.once("SIGTERM", handleWrapperSignal);
+    process.once("SIGINT", handleWrapperSignal);
+
+    child.stdout?.on("data", (chunk) => stdoutChunks.push(Buffer.from(chunk)));
+    child.stderr?.on("data", (chunk) => stderrChunks.push(Buffer.from(chunk)));
+    child.once("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      process.removeListener("SIGTERM", handleWrapperSignal);
+      process.removeListener("SIGINT", handleWrapperSignal);
+      resolve({
+        status: 1,
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        error: error.message || String(error)
+      });
+    });
+    child.once("close", (status, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      process.removeListener("SIGTERM", handleWrapperSignal);
+      process.removeListener("SIGINT", handleWrapperSignal);
+      resolve({
+        status: status ?? (signal ? 1 : 0),
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        error: stopRequested || Date.now() - started >= 30 * 60 * 1000 ? `Child terminated by ${signal ?? "timeout"}.` : ""
+      });
+    });
+  });
+}
+
+async function runReservedJob(rawArgs) {
+  let jobId;
+  try {
+    jobId = parseJobIdArg(rawArgs);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+
+  let claim;
+  try {
+    claim = claimReservedJob(process.cwd(), jobId, process.pid);
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(2);
+  }
+  if (claim.status !== "claimed") {
+    process.stdout.write(`${JSON.stringify({
+      status: claim.status,
+      jobId,
+      message: "Reserved job was not queued and was not executed."
+    }, null, 2)}\n`);
+    process.exit(1);
+  }
+
+  let resourceLease = ensureResourceLease(claim.job.resourceLeaseId, "background-job", { command: claim.job.command, transferable: false });
+  if (!resourceLease.ok) {
+    const message = capacityBlockedMessage("gemini-for-claude", resourceLease);
+    const finished = finishJob(process.cwd(), claim.job.id, {
+      status: 75,
+      stdout: "",
+      stderr: `${message}\n`,
+      error: message
+    });
+    process.stdout.write(`${JSON.stringify({
+      status: finished.status,
+      jobId: finished.id,
+      exitStatus: finished.exitStatus,
+      reason: "capacity_blocked"
+    }, null, 2)}\n`);
+    process.exit(75);
+  }
+  if (claim.job.resourceLeaseId) {
+    transferResourceLease(claim.job.resourceLeaseId, process.pid);
+  }
+  let result;
+  try {
+    result = await runStoredJobCommand(claim.job);
+  } finally {
+    resourceLease.release();
+  }
+  const finished = finishJob(process.cwd(), claim.job.id, result);
+  process.stdout.write(`${JSON.stringify({
+    status: finished.status,
+    jobId: finished.id,
+    exitStatus: finished.exitStatus
+  }, null, 2)}\n`);
+  process.exit(result.status ?? 1);
+}
+
+const [command, ...rawArgs] = process.argv.slice(2);
+
+if (command === undefined || isHelpArg(command)) {
+  printUsage();
+  process.exit(command === undefined ? 2 : 0);
+}
+
+if (!VALID_COMMANDS.has(command)) {
+  console.error(`Usage: gemini-companion.mjs ${Array.from(VALID_COMMANDS).join("|")} [args]`);
+  process.exit(2);
+}
+
+if (rawArgs.length === 1 && isHelpArg(rawArgs[0])) {
+  printUsage(command);
+  process.exit(0);
+}
+
+switch (command) {
+  case "setup":
+    printSetup(rawArgs);
+    break;
+  case "capabilities":
+    printCapabilities();
+    break;
+  case "report":
+    printReport(rawArgs);
+    break;
+  case "real-smoke":
+    await runRealSmoke(rawArgs);
+    break;
+  case "release-check":
+    runReleaseCheck(rawArgs);
+    break;
+  case "github-actions":
+    runGithubActions(rawArgs);
+    break;
+  case "roles":
+    runRolesCommand(rawArgs);
+    break;
+  case "mailbox":
+    runMailboxCommand(rawArgs);
+    break;
+  case "leases":
+    runLeasesCommand(rawArgs);
+    break;
+  case "review":
+    await runGeminiTask("review", rawArgs);
+    break;
+  case "adversarial-review":
+    await runGeminiTask("adversarial-review", rawArgs);
+    break;
+  case "multi-review":
+    await runGeminiMultiReview(rawArgs);
+    break;
+  case "plan-review":
+    await runGeminiPlanReview(rawArgs);
+    break;
+  case "plan":
+    await runGeminiTask("plan", rawArgs);
+    break;
+  case "assisted-review":
+    await runGeminiAssistedReview(rawArgs);
+    break;
+  case "rescue":
+    await runGeminiTask("rescue", rawArgs);
+    break;
+  case "status":
+    printStatus();
+    break;
+  case "review-gate":
+    await runReviewGate(rawArgs);
+    break;
+  case "jobs":
+    printJobs();
+    break;
+  case "recommend-execution-mode":
+    printExecutionRecommendation(rawArgs);
+    break;
+  case "sessions":
+    printSessions();
+    break;
+  case "result":
+    printResult(rawArgs);
+    break;
+  case "cancel":
+    runCancel(rawArgs);
+    break;
+  case "__run-job":
+    runJobWorker(rawArgs);
+    break;
+  case "reserve-job":
+    try {
+      process.stdout.write(`${JSON.stringify(handleReserveJob(rawArgs), null, 2)}\n`);
+    } catch (error) {
+      console.error(error.message || String(error));
+      process.exit(String(error.message || error).includes("capacity_blocked") ? 75 : 2);
+    }
+    break;
+  case "run-reserved-job":
+    await runReservedJob(rawArgs);
+    break;
+}

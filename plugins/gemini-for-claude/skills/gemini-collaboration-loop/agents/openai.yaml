@@ -1,0 +1,5 @@
+interface:
+  display_name: "Gemini Collaboration Loop"
+  short_description: "Run a Claude Code-Gemini plan, review, and reconciliation loop"
+  brand_color: "#4F46E5"
+  default_prompt: "Use Gemini for Claude to run a full Claude Code-Gemini collaboration loop and reconcile Gemini findings before final reporting."

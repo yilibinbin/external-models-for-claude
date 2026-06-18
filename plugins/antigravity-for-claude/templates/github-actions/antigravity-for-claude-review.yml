@@ -1,0 +1,93 @@
+name: Antigravity for Claude Review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: {{TIMEOUT_MINUTES}}
+    env:
+      ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER: "{{MODEL_PROVIDER}}"
+      ANTIGRAVITY_FOR_CLAUDE_MODEL: "{{MODEL}}"
+      ANTIGRAVITY_FOR_CLAUDE_RELEASE_REF: "{{RELEASE_REF}}"
+    steps:
+      # This workflow intentionally uses pull_request with read-only contents
+      # permissions. Provide an authenticated agy installation in CI before
+      # enabling blocking automation.
+      - name: Checkout pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Claude Code and Antigravity for Claude
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g @anthropic-ai/claude-code
+          marketplace_dir="$RUNNER_TEMP/external-models-for-claude"
+          rm -rf "$marketplace_dir"
+          git init "$marketplace_dir"
+          git -C "$marketplace_dir" remote add origin https://github.com/yilibinbin/external-models-for-claude
+          git -C "$marketplace_dir" config core.sparseCheckout true
+          {
+            echo ".claude-plugin"
+            echo "plugins/gemini-for-claude"
+            echo "plugins/antigravity-for-claude"
+          } > "$marketplace_dir/.git/info/sparse-checkout"
+          git -C "$marketplace_dir" fetch --depth 1 origin "$ANTIGRAVITY_FOR_CLAUDE_RELEASE_REF"
+          git -C "$marketplace_dir" checkout --detach FETCH_HEAD
+          claude plugin marketplace add "$marketplace_dir" --scope user
+          claude plugin install antigravity-for-claude@external-models-for-claude --scope user
+
+      - name: Prepare pull request diff
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Pull request diff base: $PR_BASE_SHA"
+            echo "Pull request diff head: $PR_HEAD_SHA"
+            echo
+            git diff --stat "$PR_BASE_SHA" "$PR_HEAD_SHA"
+            echo
+            git diff "$PR_BASE_SHA" "$PR_HEAD_SHA" -- .
+          } > /tmp/antigravity-pr-diff.txt
+
+      - name: Resolve Antigravity for Claude plugin root
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLAUDE_PLUGIN_ROOT="$(
+            claude plugin list --json | node -e '
+              const fs = require("fs");
+              const id = process.argv[1];
+              const plugins = JSON.parse(fs.readFileSync(0, "utf8"));
+              const plugin = plugins.find((item) => item.id === id);
+              if (!plugin?.installPath) process.exit(1);
+              process.stdout.write(plugin.installPath);
+            ' "antigravity-for-claude@external-models-for-claude"
+          )"
+          if [[ -z "$CLAUDE_PLUGIN_ROOT" || ! -f "$CLAUDE_PLUGIN_ROOT/scripts/antigravity-companion.mjs" ]]; then
+            echo "Antigravity for Claude runtime was not found from Claude plugin metadata." >&2
+            exit 1
+          fi
+          echo "CLAUDE_PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT" >> "$GITHUB_ENV"
+
+      - name: Run Antigravity review
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(review --model-provider "$ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER")
+          if [[ -n "$ANTIGRAVITY_FOR_CLAUDE_MODEL" ]]; then
+            args+=(--model "$ANTIGRAVITY_FOR_CLAUDE_MODEL")
+          fi
+          args+=("Review this pull request using the prepared PR diff below.
+
+$(cat /tmp/antigravity-pr-diff.txt)")
+          node "$CLAUDE_PLUGIN_ROOT/scripts/antigravity-companion.mjs" "${args[@]}"

@@ -1,0 +1,21 @@
+{
+  "name": "antigravity-for-claude",
+  "version": "0.1.0",
+  "description": "Use Antigravity CLI from Claude Code for read-only review, planning, scorecard quality loops, tracked jobs, GitHub Actions workflow rendering, release checks, and explicit Gemini or Claude model-provider selection.",
+  "author": {
+    "name": "fanghao",
+    "url": "https://github.com/yilibinbin"
+  },
+  "homepage": "https://github.com/yilibinbin/external-models-for-claude",
+  "repository": "https://github.com/yilibinbin/external-models-for-claude",
+  "license": "MIT",
+  "keywords": [
+    "antigravity",
+    "agy",
+    "gemini",
+    "claude-code",
+    "review",
+    "planning",
+    "multi-model"
+  ]
+}
