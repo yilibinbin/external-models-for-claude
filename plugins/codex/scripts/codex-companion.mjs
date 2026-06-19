@@ -24,6 +24,7 @@ import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { runReleaseCheck } from "./lib/release-check.mjs";
 import {
   generateJobId,
   getConfig,
@@ -80,6 +81,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs release-check [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
   );
@@ -978,6 +980,40 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
 }
 
+function renderReleaseCheckDetail(detail) {
+  if (detail == null) {
+    return "";
+  }
+  if (typeof detail === "string") {
+    return detail;
+  }
+  return JSON.stringify(detail);
+}
+
+function handleReleaseCheck(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    booleanOptions: ["json"]
+  });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected release-check argument: ${positionals.join(" ")}`);
+  }
+
+  const report = runReleaseCheck(process.cwd());
+
+  if (options.json) {
+    outputResult(report, true);
+  } else {
+    for (const item of report.checks) {
+      const detail = renderReleaseCheckDetail(item.detail);
+      console.log(`${item.ok ? "PASS" : "FAIL"} ${item.name}${detail ? ` ${detail}` : ""}`);
+    }
+  }
+
+  if (!report.ok) {
+    process.exitCode = 1;
+  }
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
@@ -1008,6 +1044,9 @@ async function main() {
       break;
     case "result":
       handleResult(argv);
+      break;
+    case "release-check":
+      handleReleaseCheck(argv);
       break;
     case "task-resume-candidate":
       handleTaskResumeCandidate(argv);
