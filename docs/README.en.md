@@ -19,6 +19,10 @@ claude plugin install antigravity-for-claude@external-models-for-claude --scope 
 
 Reload Claude Code plugins after installing.
 
+## Codex for Claude
+
+The `codex` plugin in this marketplace is a local Apache-2.0 extension of the OpenAI-authored Codex Claude Code plugin files bundled under `plugins/codex`. OpenAI attribution, `LICENSE`, and `NOTICE` are preserved; local extensions are documented in `plugins/codex/FORK_NOTICE.md` without asserting unverified upstream lineage.
+
 ## Provider Setup
 
 Run the setup command for the plugin you install:

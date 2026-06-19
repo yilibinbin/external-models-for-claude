@@ -28,6 +28,10 @@ claude plugin install antigravity-for-claude@external-models-for-claude --scope 
 
 Reload Claude Code plugins after installation.
 
+## Codex for Claude
+
+The `codex` plugin in this marketplace is a local Apache-2.0 extension of the OpenAI-authored Codex Claude Code plugin files bundled under `plugins/codex`. OpenAI attribution, `LICENSE`, and `NOTICE` are preserved; local extensions are documented in `plugins/codex/FORK_NOTICE.md` without asserting unverified upstream lineage.
+
 ## Requirements
 
 - Claude Code with plugin support.
@@ -76,7 +80,11 @@ claude plugin install gemini-for-claude@external-models-for-claude --scope user
 claude plugin install antigravity-for-claude@external-models-for-claude --scope user
 ```
 
-安装后重载 Claude Code 插件。`codex` 是 OpenAI 官方 Claude Code 插件的收录版本；`gemini-for-claude` 和 `antigravity-for-claude` 是本仓库维护的 Claude 原生外部模型审阅、规划和协作流程。
+安装后重载 Claude Code 插件。`codex` 是 OpenAI 官方 Claude Code 插件的本地扩展版本；`gemini-for-claude` 和 `antigravity-for-claude` 是本仓库维护的 Claude 原生外部模型审阅、规划和协作流程。
+
+### Codex for Claude
+
+The `codex` plugin in this marketplace is a local Apache-2.0 extension of the OpenAI-authored Codex Claude Code plugin files bundled under `plugins/codex`. OpenAI attribution, `LICENSE`, and `NOTICE` are preserved; local extensions are documented in `plugins/codex/FORK_NOTICE.md` without asserting unverified upstream lineage.
 
 More documentation:
 

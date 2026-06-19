@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 
+from plugin_versions import GEMINI_FOR_CLAUDE_VERSION, MARKETPLACE_VERSION
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "gemini-for-claude"
@@ -97,10 +99,10 @@ def test_claude_marketplace_lists_gemini_for_claude():
 
     assert marketplace["name"] == "external-models-for-claude"
     assert marketplace["metadata"]["description"]
-    assert marketplace["metadata"]["version"] == "0.1.0"
+    assert marketplace["metadata"]["version"] == MARKETPLACE_VERSION
     plugins = {item["name"]: item for item in marketplace["plugins"]}
     assert plugins["gemini-for-claude"]["source"] == "./plugins/gemini-for-claude"
-    assert plugins["gemini-for-claude"]["version"] == "0.1.0"
+    assert plugins["gemini-for-claude"]["version"] == GEMINI_FOR_CLAUDE_VERSION
     assert plugins["gemini-for-claude"]["category"] == "Productivity"
     assert len(plugins) == len(marketplace["plugins"])
 
@@ -109,7 +111,7 @@ def test_gemini_for_claude_manifest_is_claude_native():
     manifest = read_json(PLUGIN / ".claude-plugin" / "plugin.json")
 
     assert manifest["name"] == "gemini-for-claude"
-    assert manifest["version"] == "0.1.0"
+    assert manifest["version"] == GEMINI_FOR_CLAUDE_VERSION
     assert "Gemini CLI" in manifest["description"]
     assert "codex" not in manifest["name"].lower()
     assert manifest["homepage"] == "https://github.com/yilibinbin/external-models-for-claude"
