@@ -2265,6 +2265,7 @@ def test_codex_job_lifecycle_uses_updated_at_for_legacy_jobs():
 def test_codex_heartbeat_does_not_rewrite_global_job_state_or_terminal_jobs(tmp_path):
     payload = run_node_script(
         """
+        import fs from 'node:fs';
         import { writeHeartbeatIfRunning } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
         import { listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
         const cwd = process.argv[1];
@@ -2274,12 +2275,18 @@ def test_codex_heartbeat_does_not_rewrite_global_job_state_or_terminal_jobs(tmp_
         writeJobFile(cwd, running.id, running);
         upsertJob(cwd, terminal);
         writeJobFile(cwd, terminal.id, terminal);
-        writeHeartbeatIfRunning(running, 123456, () => true);
-        writeHeartbeatIfRunning(terminal, 123456, () => true);
+        const terminalFile = resolveJobFile(cwd, terminal.id);
+        const terminalMtimeBefore = fs.statSync(terminalFile).mtimeMs;
+        const runningResult = writeHeartbeatIfRunning(running, 123456, () => true);
+        const terminalResult = writeHeartbeatIfRunning({ ...running, id: terminal.id }, 123456, () => true);
+        const terminalMtimeAfter = fs.statSync(terminalFile).mtimeMs;
         console.log(JSON.stringify({
           sharedRunning: listJobs(cwd).find((job) => job.id === running.id),
           storedRunning: readJobFile(resolveJobFile(cwd, running.id)),
-          storedTerminal: readJobFile(resolveJobFile(cwd, terminal.id))
+          storedTerminal: readJobFile(terminalFile),
+          runningResult,
+          terminalResult,
+          terminalMtimeUnchanged: terminalMtimeAfter === terminalMtimeBefore
         }));
         """,
         args=[str(tmp_path)],
@@ -2290,6 +2297,9 @@ def test_codex_heartbeat_does_not_rewrite_global_job_state_or_terminal_jobs(tmp_
     assert payload["sharedRunning"]["sharedOnly"] is True
     assert payload["storedRunning"]["heartbeatAtMs"] == 123456
     assert payload["storedRunning"]["heartbeat"] == "1970-01-01T00:02:03.456Z"
+    assert payload["runningResult"]["heartbeatAtMs"] == 123456
+    assert payload["terminalResult"] is None
+    assert payload["terminalMtimeUnchanged"] is True
     assert "heartbeatAtMs" not in payload["storedTerminal"]
 
 

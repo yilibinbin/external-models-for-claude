@@ -175,7 +175,7 @@ function writeHeartbeatIfRunning(job, nowMs = null, isRunning = null) {
   const heartbeatAtMs = Number.isFinite(nowMs) ? nowMs : Date.now();
   return mutateJobFile(job.workspaceRoot, job.id, (storedJob) => {
     if (storedJob.status !== "queued" && storedJob.status !== "running") {
-      return storedJob;
+      return null;
     }
     return {
       ...storedJob,
