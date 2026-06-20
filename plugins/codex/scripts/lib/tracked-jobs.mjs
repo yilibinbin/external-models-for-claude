@@ -112,7 +112,7 @@ function removeOrphanProgressPatch(workspaceRoot, jobId) {
     if (!hasLifecycleFields) {
       state.jobs = state.jobs.filter((job) => job.id !== jobId);
     }
-  });
+  }, { pruneJobFiles: false });
 }
 
 function removeTrackedJobAfterSessionEnd(job) {
@@ -172,6 +172,9 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     }
     const updated = mutateJobFile(workspaceRoot, jobId, (storedJob) => {
       if (!storedJob?.id) {
+        return null;
+      }
+      if (["completed", "failed", "cancelled"].includes(storedJob.status)) {
         return null;
       }
       return {

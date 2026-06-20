@@ -293,7 +293,7 @@ export function saveState(cwd, state) {
   return nextState;
 }
 
-export function updateState(cwd, mutator) {
+export function updateState(cwd, mutator, options = {}) {
   let nextState;
   let prunedPreviousJobs = [];
   nextState = withStateLock(cwd, () => {
@@ -304,7 +304,9 @@ export function updateState(cwd, mutator) {
     nextState = saveStateUnlocked(cwd, current, previousJobs);
     return nextState;
   });
-  removePrunedJobFiles(cwd, prunedPreviousJobs, nextState.jobs);
+  if (options.pruneJobFiles !== false) {
+    removePrunedJobFiles(cwd, prunedPreviousJobs, nextState.jobs);
+  }
 
   return nextState;
 }
@@ -362,7 +364,15 @@ export function getConfig(cwd) {
 }
 
 export function writeJobFile(cwd, jobId, payload) {
-  return withJobFileLock(cwd, jobId, () => writeAtomicJson(resolveJobFile(cwd, jobId), payload));
+  return withJobFileLock(cwd, jobId, () => {
+    const jobFile = resolveJobFile(cwd, jobId);
+    if (hasEndedSession(cwd, payload?.sessionId)) {
+      removeJobFile(jobFile);
+      removeFileIfExists(payload?.logFile);
+      return null;
+    }
+    return writeAtomicJson(jobFile, payload);
+  });
 }
 
 export function readJobFile(jobFile) {

@@ -2661,6 +2661,50 @@ def test_codex_state_upsert_rejects_ended_session_jobs(tmp_path):
     assert payload["jobs"] == []
 
 
+def test_codex_state_write_job_file_rejects_ended_session_sidecars(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'write-ended-session',
+          status: 'running',
+          sessionId: 'session-write-ended',
+          workspaceRoot: cwd,
+          request: { secret: 'write secret' },
+          logFile: resolveJobLogFile(cwd, 'write-ended-session')
+        };
+        fs.writeFileSync(job.logFile, 'write log\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-write-ended');
+        });
+        const writeResult = writeJobFile(cwd, job.id, job);
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          writeResult,
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload == {
+        "writeResult": None,
+        "jobFileExists": False,
+        "logFileExists": False,
+    }
+
+
 def test_codex_state_uses_required_slice_contracts():
     source = read_text(PLUGIN / "scripts" / "lib" / "state.mjs")
     save_state = js_function_body(source, "saveState")
@@ -2702,9 +2746,11 @@ def test_codex_state_pruned_job_files_are_removed_under_job_file_lock():
     assert re.search(
         r"return nextState;\s*"
         r"\}\);\s*"
+        r"if \(options\.pruneJobFiles !== false\) \{\s*"
         r"removePrunedJobFiles\(cwd, prunedPreviousJobs, nextState\.jobs\);",
         update_state,
     )
+    assert "pruneJobFiles: false" in read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
     assert "withJobFileLock" not in save_unlocked
     assert "removePrunedJobFiles" not in save_unlocked
     assert "removeJobFile" not in save_unlocked
@@ -3266,6 +3312,7 @@ def test_codex_progress_upsert_prune_completes_before_job_file_mutation():
     source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
     body = js_function_body(source, "createJobProgressUpdater")
     assert "function sharedProgressJobPatch(job)" in source
+    assert "pruneJobFiles: false" in js_function_body(source, "removeOrphanProgressPatch")
     assert "request," in js_function_body(source, "sharedProgressJobPatch")
     assert "result," in js_function_body(source, "sharedProgressJobPatch")
     assert body.index("upsertJob(workspaceRoot, patch)") < body.index("mutateJobFile(workspaceRoot, jobId")
@@ -3420,6 +3467,47 @@ def test_codex_progress_update_after_session_end_removes_sidecar_without_republi
     assert payload["jobFileExists"] is False
     assert "progress secret" not in payload["jobFileText"]
     assert payload["logFileExists"] is False
+
+
+def test_codex_progress_update_ignores_terminal_sidecar_without_republish(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          createJobProgressUpdater
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          readJobFile,
+          resolveJobFile,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'progress-terminal-sidecar',
+          status: 'completed',
+          phase: 'done',
+          workspaceRoot: cwd,
+          completedAt: new Date().toISOString()
+        };
+        writeJobFile(cwd, job.id, job);
+        const update = createJobProgressUpdater(cwd, job.id);
+        update({ phase: 'running', threadId: 'thread-late-progress' });
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd),
+          stored: readJobFile(jobFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["jobs"] == []
+    assert payload["stored"]["status"] == "completed"
+    assert payload["stored"]["phase"] == "done"
+    assert "threadId" not in payload["stored"]
 
 
 def test_codex_run_tracked_job_completion_after_session_end_does_not_republish_result(tmp_path):
