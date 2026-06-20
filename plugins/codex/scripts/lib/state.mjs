@@ -233,10 +233,20 @@ export function removePrunedJobFiles(cwd, previousJobs, nextJobs) {
     }
     withJobFileLock(cwd, job.id, () => {
       const currentState = loadState(cwd);
-      if (!(currentState.jobs ?? []).some((currentJob) => currentJob.id === job.id)) {
-        removeJobFile(resolveJobFile(cwd, job.id));
-        removeFileIfExists(job.logFile);
+      if ((currentState.jobs ?? []).some((currentJob) => currentJob.id === job.id)) {
+        return;
       }
+      const jobFile = resolveJobFile(cwd, job.id);
+      try {
+        const storedJob = readJobFile(jobFile);
+        if (storedJob?.status === "queued" || storedJob?.status === "running") {
+          return;
+        }
+      } catch {
+        // Missing or corrupt job files can still be removed from the sidecar set.
+      }
+      removeJobFile(jobFile);
+      removeFileIfExists(job.logFile);
     });
   }
 }

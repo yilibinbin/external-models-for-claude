@@ -2372,7 +2372,9 @@ def test_codex_state_pruned_job_files_are_removed_under_job_file_lock():
     assert "saveState(" not in prune_body
     assert "updateState(" not in prune_body
     assert "loadState(cwd)" in prune_body
-    assert "removeJobFile(resolveJobFile(cwd, job.id))" in prune_body
+    assert "const jobFile = resolveJobFile(cwd, job.id)" in prune_body
+    assert "removeJobFile(jobFile)" in prune_body
+    assert 'storedJob?.status === "queued" || storedJob?.status === "running"' in prune_body
     assert "removeFileIfExists(job.logFile)" in prune_body
     assert save_state.index("withStateLock(cwd") < save_state.index("removePrunedJobFiles(cwd")
     assert update_state.index("withStateLock(cwd") < update_state.index("removePrunedJobFiles(cwd")
@@ -2437,6 +2439,44 @@ def test_codex_state_skips_pruned_file_delete_when_job_reappears(tmp_path):
     }
 
 
+def test_codex_state_skips_pruned_active_job_file(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          removePrunedJobFiles,
+          resolveJobFile,
+          resolveJobLogFile,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'active-pruned-job',
+          status: 'running',
+          workspaceRoot: cwd,
+          updatedAt: new Date().toISOString()
+        };
+        const logFile = resolveJobLogFile(cwd, job.id);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(logFile, 'active log\\n', 'utf8');
+
+        removePrunedJobFiles(cwd, [{ ...job, logFile }], []);
+
+        console.log(JSON.stringify({
+          jobFileExists: fs.existsSync(resolveJobFile(cwd, job.id)),
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload == {
+        "jobFileExists": True,
+        "logFileExists": True,
+    }
+
+
 def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
     payload = run_node_script(
         """
@@ -2454,7 +2494,7 @@ def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
         const cwd = process.argv[1];
         const job = {
           id: 'child-reappeared-job',
-          status: 'running',
+          status: 'completed',
           workspaceRoot: cwd,
           updatedAt: new Date().toISOString()
         };
