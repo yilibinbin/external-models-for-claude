@@ -64,11 +64,21 @@ import {
   renderStatusReport,
   renderTaskResult
 } from "./lib/render.mjs";
+import {
+  withResourceLease,
+  acquireResourceLease,
+  claimResourceLease,
+  transferResourceLease,
+  reapStaleResourceLeases,
+  capacityBlockedMessage
+} from "./lib/resource-governor.mjs";
+import { releaseTerminalJobLeasesForWorkspace } from "./lib/terminal-lease-cleanup.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const STALE_BACKGROUND_HANDOFF_MS = 30000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -100,6 +110,13 @@ function outputResult(value, asJson) {
 
 function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
+}
+
+function capacityBlockedError(lease) {
+  const error = new Error(capacityBlockedMessage(lease));
+  error.status = 75;
+  error.code = "ECAPACITY";
+  return error;
 }
 
 function normalizeRequestedModel(model) {
@@ -334,15 +351,15 @@ function findLatestResumableTaskJob(jobs) {
   );
 }
 
-async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
+async function waitForSingleJobSnapshot(workspaceRoot, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
-  let snapshot = buildSingleJobSnapshot(cwd, reference);
+  let snapshot = buildSingleJobSnapshot(workspaceRoot, reference);
 
   while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
-    snapshot = buildSingleJobSnapshot(cwd, reference);
+    snapshot = buildSingleJobSnapshot(workspaceRoot, reference);
   }
 
   return {
@@ -628,7 +645,8 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    backgroundLeaseId: null
   };
 }
 
@@ -673,21 +691,90 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+function sharedBackgroundJobPatch(job, patch) {
+  const { request, backgroundLease, backgroundLeaseId, lease, ...metadata } = job;
+  return {
+    ...metadata,
+    ...patch
+  };
+}
+
+function recordBackgroundLaunchFailure(job, queuedRecord, logFile, error) {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const completedAt = nowIso();
+  const failedRecord = {
+    ...queuedRecord,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage,
+    completedAt
+  };
+  appendLogLine(logFile, `Failed to start background task worker: ${errorMessage}`);
+  writeJobFile(job.workspaceRoot, job.id, failedRecord);
+  upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    logFile,
+    ...(queuedRecord.governorVersion ? { governorVersion: queuedRecord.governorVersion } : {}),
+    errorMessage,
+    completedAt
+  }));
+}
+
+function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies = {}) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
-
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  const governorEnabledLease = !backgroundLease.disabled;
+  const spawnTaskWorker = dependencies.spawnTaskWorker ?? spawnDetachedTaskWorker;
+  const transferLease = dependencies.transferResourceLease ?? transferResourceLease;
+  let transferred = false;
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
-    request
+    ...(governorEnabledLease ? { governorVersion: 1 } : {}),
+    request: {
+      ...request,
+      backgroundLeaseId: backgroundLease.lease?.id ?? null
+    }
   };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+
+  try {
+    writeJobFile(job.workspaceRoot, job.id, queuedRecord);
+
+    const child = spawnTaskWorker(cwd, job.id);
+    if (!Number.isInteger(child.pid) || child.pid <= 0) {
+      throw new Error("Failed to start background task worker: missing worker pid.");
+    }
+
+    if (governorEnabledLease && !transferLease(backgroundLease.lease?.id, child.pid, process.env, { keepTransferable: true })) {
+      throw new Error("Failed to transfer background resource lease to task worker.");
+    }
+    transferred = governorEnabledLease;
+
+    const spawnedRecord = {
+      ...queuedRecord,
+      pid: child.pid
+    };
+    writeJobFile(job.workspaceRoot, job.id, spawnedRecord);
+    upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
+      status: "queued",
+      phase: "queued",
+      pid: child.pid,
+      logFile,
+      ...(governorEnabledLease ? { governorVersion: 1 } : {})
+    }));
+  } catch (error) {
+    if (!transferred) {
+      backgroundLease.release();
+    }
+    recordBackgroundLaunchFailure(job, queuedRecord, logFile, error);
+    throw error;
+  }
 
   return {
     payload: {
@@ -701,6 +788,50 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
 }
 
+function processAlive(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function jobTimestampMs(job) {
+  const values = [job?.updatedAt, job?.createdAt].map((value) => Date.parse(String(value ?? "")));
+  const parsed = values.find((value) => Number.isFinite(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function shouldReclaimBackgroundLease(storedJob, claim) {
+  if (storedJob?.status !== "queued" || storedJob?.startedAt) {
+    return false;
+  }
+  if (processAlive(storedJob.pid)) {
+    return false;
+  }
+  if (Number(claim?.active ?? 0) > 0) {
+    return false;
+  }
+  const leaseState = claim?.leaseState;
+  if (!leaseState?.exists || leaseState.kind !== "background-job" || !leaseState.stale) {
+    return false;
+  }
+  if (!leaseState.transferable || leaseState.claimed) {
+    return false;
+  }
+  const timestampMs = jobTimestampMs(storedJob);
+  if (!Number.isFinite(timestampMs)) {
+    return false;
+  }
+  const ageMs = Date.now() - timestampMs;
+  return ageMs >= STALE_BACKGROUND_HANDOFF_MS;
+}
+
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "cwd"],
@@ -712,36 +843,48 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const focusText = positionals.join(" ").trim();
-  const target = resolveReviewTarget(cwd, {
-    base: options.base,
-    scope: options.scope
+  const resourceLease = acquireResourceLease("model-call", {
+    env: process.env,
+    command: config.reviewName === "Adversarial Review" ? "adversarial-review" : "review"
   });
+  if (!resourceLease.ok) {
+    throw capacityBlockedError(resourceLease);
+  }
 
-  config.validateRequest?.(target, focusText);
-  const metadata = buildReviewJobMetadata(config.reviewName, target);
-  const job = createCompanionJob({
-    prefix: "review",
-    kind: metadata.kind,
-    title: metadata.title,
-    workspaceRoot,
-    jobClass: "review",
-    summary: metadata.summary
-  });
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  try {
+    const focusText = positionals.join(" ").trim();
+    const target = resolveReviewTarget(cwd, {
+      base: options.base,
+      scope: options.scope
+    });
+
+    config.validateRequest?.(target, focusText);
+    const metadata = buildReviewJobMetadata(config.reviewName, target);
+    const job = createCompanionJob({
+      prefix: "review",
+      kind: metadata.kind,
+      title: metadata.title,
+      workspaceRoot,
+      jobClass: "review",
+      summary: metadata.summary
+    });
+    await runForegroundCommand(
+      job,
+      (progress) =>
+        executeReviewRun({
+          cwd,
+          base: options.base,
+          scope: options.scope,
+          model: options.model,
+          focusText,
+          reviewName: config.reviewName,
+          onProgress: progress
+        }),
+      { json: options.json }
+    );
+  } finally {
+    resourceLease.release();
+  }
 }
 
 async function handleReview(argv) {
@@ -778,10 +921,24 @@ async function handleTask(argv) {
   });
 
   if (options.background) {
-    ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
-
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const backgroundLease = acquireResourceLease("background-job", {
+      env: process.env,
+      transferable: true,
+      pid: 0,
+      command: "task-worker",
+      jobId: job.id
+    });
+    if (!backgroundLease.ok) {
+      throw capacityBlockedError(backgroundLease);
+    }
+    try {
+      ensureCodexAvailable(cwd);
+      requireTaskRequest(prompt, resumeLast);
+    } catch (error) {
+      backgroundLease.release();
+      throw error;
+    }
     const request = buildTaskRequest({
       cwd,
       model,
@@ -791,26 +948,31 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = enqueueBackgroundTask(cwd, job, request, backgroundLease);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
+  const foregroundJob = buildTaskJob(workspaceRoot, taskMetadata, write);
+  await withResourceLease(
+    "model-call",
+    { env: process.env, command: "task" },
+    async () =>
+      runForegroundCommand(
+        foregroundJob,
+        (progress) =>
+          executeTaskRun({
+            cwd,
+            model,
+            effort,
+            prompt,
+            write,
+            resumeLast,
+            jobId: foregroundJob.id,
+            onProgress: progress
+          }),
+        { json: options.json }
+      )
   );
 }
 
@@ -835,28 +997,62 @@ async function handleTaskWorker(argv) {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
   }
 
-  const { logFile, progress } = createTrackedProgress(
-    {
-      ...storedJob,
-      workspaceRoot
-    },
-    {
-      logFile: storedJob.logFile ?? null
+  let workerLease = { release() {} };
+  if (storedJob.governorVersion === 1) {
+    let claim = request.backgroundLeaseId
+      ? claimResourceLease(request.backgroundLeaseId, "background-job", process.env)
+      : claimResourceLease(null, "background-job", process.env);
+    if (!request.backgroundLeaseId && !claim.ok) {
+      throw new Error(`Stored job ${options["job-id"]} is missing its background resource lease.`);
     }
-  );
-  await runTrackedJob(
-    {
-      ...storedJob,
-      workspaceRoot,
-      logFile
-    },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
-    { logFile }
-  );
+    if (!claim.ok && String(claim.reason || "").includes("lease is not claimable") && shouldReclaimBackgroundLease(storedJob, claim)) {
+      claim = acquireResourceLease("background-job", {
+        env: process.env,
+        command: "task-worker-reclaim",
+        jobId: storedJob.id
+      });
+      if (!claim.ok) {
+        const error = new Error(capacityBlockedMessage(claim));
+        error.status = 75;
+        error.code = "ECAPACITY";
+        throw error;
+      }
+    }
+    if (!claim.ok) {
+      throw new Error(claim.reason || "Failed to claim background resource lease.");
+    }
+    workerLease = claim;
+  }
+
+  try {
+    const trackedJob = sharedBackgroundJobPatch(
+      {
+        ...storedJob,
+        workspaceRoot
+      },
+      {}
+    );
+    const { logFile, progress } = createTrackedProgress(
+      trackedJob,
+      {
+        logFile: storedJob.logFile ?? null
+      }
+    );
+    await runTrackedJob(
+      {
+        ...trackedJob,
+        logFile
+      },
+      () =>
+        executeTaskRun({
+          ...request,
+          onProgress: progress
+        }),
+      { logFile }
+    );
+  } finally {
+    workerLease.release();
+  }
 }
 
 async function handleStatus(argv) {
@@ -866,14 +1062,21 @@ async function handleStatus(argv) {
   });
 
   const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  try {
+    releaseTerminalJobLeasesForWorkspace(workspaceRoot, process.env);
+    reapStaleResourceLeases(process.env);
+  } catch {
+    // Status cleanup is advisory; rendering current job state is more important.
+  }
   const reference = positionals[0] ?? "";
   if (reference) {
     const snapshot = options.wait
-      ? await waitForSingleJobSnapshot(cwd, reference, {
+      ? await waitForSingleJobSnapshot(workspaceRoot, reference, {
           timeoutMs: options["timeout-ms"],
           pollIntervalMs: options["poll-interval-ms"]
         })
-      : buildSingleJobSnapshot(cwd, reference);
+      : buildSingleJobSnapshot(workspaceRoot, reference);
     outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
     return;
   }
@@ -882,7 +1085,7 @@ async function handleStatus(argv) {
     throw new Error("`status --wait` requires a job id.");
   }
 
-  const report = buildStatusSnapshot(cwd, { all: options.all });
+  const report = buildStatusSnapshot(workspaceRoot, { all: options.all });
   outputResult(renderStatusPayload(report, options.json), options.json);
 }
 
@@ -1082,8 +1285,30 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+function isDirectEntrypoint() {
+  if (!process.argv[1]) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectEntrypoint()) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    if (error?.code === "ECAPACITY" || error?.status === 75) {
+      process.exitCode = 75;
+      return;
+    }
+    process.exitCode = 1;
+  });
+}
+
+export const __testHooks = {
+  enqueueBackgroundTask,
+  shouldReclaimBackgroundLease
+};

@@ -234,6 +234,23 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf8")
 
 
+def run_node_script(script, cwd=ROOT, env=None, args=None):
+    command_env = os.environ.copy()
+    if env:
+        command_env.update(env)
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", script, *(args or [])],
+        cwd=cwd,
+        env=command_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout or "{}")
+
+
 def test_codex_plugin_is_local_fork_with_openai_attribution():
     marketplace = read_json(ROOT / ".claude-plugin" / "marketplace.json")
     manifest = read_json(PLUGIN / ".claude-plugin" / "plugin.json")
@@ -307,6 +324,17 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "Local extended version: 1.1.0-fh.1" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
+
+
+def test_codex_readme_documents_default_model_call_saturation_caveat():
+    text = read_text(PLUGIN / "README.md")
+    assert "default global `model-call` limit is 2" in text
+    assert "two concurrent model-call commands" in text
+    assert "one `multi-review` plus one long task" in text
+    assert "saturate the pool" in text
+    assert "next foreground review or task return `capacity_blocked`" in text
+    assert "Stop-gate review uses the independent `stop-gate` pool" in text
+    assert "always-available spare slot" not in text.lower()
 
 
 def test_codex_commands_do_not_disable_model_invocation():
@@ -1101,3 +1129,1072 @@ def test_codex_machine_path_pattern_source_is_single_contract():
         assert "/Users/" not in release_check
         assert "/private/var/folders" not in release_check
         assert "/Volumes/" not in release_check
+
+
+def governor_env(tmp_path, **overrides):
+    env = {
+        "CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR": str(tmp_path / "locks"),
+        "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data"),
+    }
+    env.update(overrides)
+    return env
+
+
+def background_launch_failure_payload(tmp_path, mode):
+    return run_node_script(
+        """
+        import fs from 'node:fs';
+        import { __testHooks } from './plugins/codex/scripts/codex-companion.mjs';
+        import { listJobs, resolveJobFile } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const mode = process.argv[2];
+        const job = {
+          id: `task-${mode}`,
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task',
+          summary: mode,
+          write: true,
+          sessionId: 'session-failure',
+          workspaceRoot: cwd
+        };
+        const request = {
+          cwd,
+          model: null,
+          effort: null,
+          prompt: `launch failure ${mode}`,
+          write: false,
+          resumeLast: false,
+          jobId: job.id
+        };
+        const lease = {
+          disabled: false,
+          lease: { id: `background-job-${mode}` },
+          released: false,
+          release() {
+            this.released = true;
+          }
+        };
+        const dependencies = {
+          spawnTaskWorker() {
+            if (mode === 'spawn') {
+              throw new Error('spawn failed');
+            }
+            return mode === 'pid' ? { pid: null } : { pid: 12345 };
+          },
+          transferResourceLease() {
+            return false;
+          }
+        };
+
+        let errorMessage = null;
+        try {
+          __testHooks.enqueueBackgroundTask(cwd, job, request, lease, dependencies);
+        } catch (error) {
+          errorMessage = error.message;
+        }
+        const jobs = listJobs(cwd);
+        const sharedJob = jobs.find((item) => item.id === job.id);
+        const activeJobs = jobs.filter((item) => item.status === 'queued' || item.status === 'running');
+        const stored = JSON.parse(fs.readFileSync(resolveJobFile(cwd, job.id), 'utf8'));
+        console.log(JSON.stringify({
+          errorMessage,
+          released: lease.released,
+          activeCount: activeJobs.length,
+          sharedJob,
+          status: sharedJob?.status,
+          storedStatus: stored.status,
+          storedPhase: stored.phase
+        }));
+        """,
+        env=governor_env(tmp_path),
+        args=[str(tmp_path), mode],
+    )
+
+
+def test_codex_resource_governor_blocks_without_leaking_lock_root(tmp_path):
+    payload = run_node_script(
+        """
+        import { acquireResourceLease, capacityBlockedMessage } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const lease = acquireResourceLease('model-call', { env: process.env, limit: 0, command: 'test' });
+        console.log(JSON.stringify({ ok: lease.ok, message: capacityBlockedMessage(lease), lockDir: process.env.CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload["ok"] is False
+    assert payload["message"].startswith("capacity_blocked: codex model-call capacity is full (0/0)")
+    assert payload["lockDir"] not in payload["message"]
+
+
+def test_codex_resource_governor_wrapper_is_thin_shared_core_adapter():
+    text = read_text(PLUGIN / "scripts" / "lib" / "resource-governor.mjs")
+    assert "createResourceGovernor({" in text
+    assert text.count("createResourceGovernor") == 2
+    assert "CODEX_FOR_CLAUDE" in text
+    assert "function acquireResourceLease" not in text
+
+
+def test_codex_resource_governor_wrapper_imports_shared_core():
+    text = read_text(PLUGIN / "scripts" / "lib" / "resource-governor.mjs")
+    assert 'from "./resource-governor-core.mjs"' in text
+
+
+def test_codex_resource_governor_factory_exposes_codex_capacity_contract(tmp_path):
+    payload = run_node_script(
+        """
+        import { createResourceGovernor } from './plugins/codex/scripts/lib/resource-governor-core.mjs';
+        const governor = createResourceGovernor({
+          envPrefix: 'TEST_CODEX',
+          capacityLabel: 'codex',
+          defaultModelLimit: 2,
+          defaultBackgroundLimit: 4,
+          defaultStopGateLimit: 1,
+          homeStateDir: '.test-codex-locks'
+        });
+        const lease = governor.acquireResourceLease('model-call', { env: process.env, limit: 0 });
+        console.log(JSON.stringify({ lease, result: governor.capacityBlockedResult(lease) }));
+        """,
+        env={"TEST_CODEX_RESOURCE_LOCK_DIR": str(tmp_path / "locks")},
+    )
+    assert payload["result"]["status"] == 75
+    assert payload["result"]["errorCode"] == "ECAPACITY"
+    assert payload["result"]["stderr"].startswith("capacity_blocked: codex model-call capacity is full")
+
+
+def test_codex_resource_governor_core_is_vendored_without_provider_runtime_leakage():
+    text = read_text(PLUGIN / "scripts" / "lib" / "resource-governor-core.mjs")
+    stripped = re.sub(r"/\\*.*?\\*/|//.*?$", "", text, flags=re.DOTALL | re.MULTILINE)
+    for forbidden in [
+        "CODEX_FOR_CLAUDE",
+        "GEMINI",
+        "ANTIGRAVITY",
+        "claude-for-codex",
+        "gemini-for-claude",
+        "antigravity-for-claude",
+    ]:
+        assert forbidden not in stripped
+
+
+def test_codex_resource_governor_provenance_is_shipped_in_notices():
+    phrase = "ported from fanghao's Gemini/Antigravity governor work covered by this repository's root MIT license"
+    for path in [
+        PLUGIN / "scripts" / "lib" / "resource-governor-core.mjs",
+        PLUGIN / "FORK_NOTICE.md",
+        ROOT / "THIRD_PARTY_NOTICES.md",
+    ]:
+        text = read_text(path)
+        assert phrase in text
+        assert "Codex-specific additions" in text
+
+
+def test_codex_resource_governor_enforces_limit_concurrently(tmp_path):
+    payload = run_node_script(
+        """
+        import { acquireResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const first = acquireResourceLease('model-call', { env: process.env, limit: 1 });
+        const second = acquireResourceLease('model-call', { env: process.env, limit: 1 });
+        first.release();
+        console.log(JSON.stringify({ firstOk: first.ok, secondOk: second.ok, active: second.active, limit: second.limit }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"firstOk": True, "secondOk": False, "active": 1, "limit": 1}
+
+
+def test_codex_stop_gate_pool_is_independent_from_model_call_capacity(tmp_path):
+    payload = run_node_script(
+        """
+        import { acquireResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const model = acquireResourceLease('model-call', { env: process.env, limit: 0 });
+        const stopGate = acquireResourceLease('stop-gate', { env: process.env });
+        stopGate.release();
+        console.log(JSON.stringify({ modelOk: model.ok, stopGateOk: stopGate.ok, stopGateKind: stopGate.lease.kind }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"modelOk": False, "stopGateOk": True, "stopGateKind": "stop-gate"}
+
+
+def test_codex_resource_governor_verify_expected_command_rejects_mismatch(tmp_path):
+    payload = run_node_script(
+        """
+        import { acquireResourceLease, verifyResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const lease = acquireResourceLease('stop-gate', { env: process.env, command: 'stop-review-gate' });
+        const matching = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedCommand: 'stop-review-gate' });
+        const mismatched = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedCommand: 'task' });
+        lease.release();
+        console.log(JSON.stringify({ matchingOk: matching.ok, mismatchedOk: mismatched.ok, reason: mismatched.reason }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {
+        "matchingOk": True,
+        "mismatchedOk": False,
+        "reason": "resource lease command mismatch",
+    }
+
+
+def test_codex_resource_governor_verify_expected_parent_pid_uses_owner_or_holder(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { acquireResourceLease, resourceLockRoot, verifyResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const lease = acquireResourceLease('stop-gate', { env: process.env, command: 'stop-review-gate' });
+        const file = path.join(resourceLockRoot(process.env), `${lease.lease.id}.json`);
+        const ownerMatch = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedParentPid: process.pid });
+        const mismatch = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedParentPid: process.pid + 100000 });
+        const withoutOwner = JSON.parse(fs.readFileSync(file, 'utf8'));
+        delete withoutOwner.ownerPid;
+        fs.writeFileSync(file, `${JSON.stringify(withoutOwner, null, 2)}\\n`);
+        const holderFallback = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedParentPid: process.pid });
+        const deadOwner = JSON.parse(fs.readFileSync(file, 'utf8'));
+        deadOwner.ownerPid = 99999999;
+        fs.writeFileSync(file, `${JSON.stringify(deadOwner, null, 2)}\\n`);
+        const deadParent = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedParentPid: 99999999 });
+        lease.release();
+        console.log(JSON.stringify({
+          ownerMatchOk: ownerMatch.ok,
+          mismatchOk: mismatch.ok,
+          mismatchReason: mismatch.reason,
+          holderFallbackOk: holderFallback.ok,
+          deadParentOk: deadParent.ok,
+          deadParentReason: deadParent.reason
+        }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload["ownerMatchOk"] is True
+    assert payload["mismatchOk"] is False
+    assert payload["mismatchReason"] == "resource lease parent pid mismatch"
+    assert payload["holderFallbackOk"] is True
+    assert payload["deadParentOk"] is False
+    assert payload["deadParentReason"] == "resource lease parent is not alive"
+
+
+def test_codex_default_model_limit_two_can_saturate_foreground_pool(tmp_path):
+    payload = run_node_script(
+        """
+        import { acquireResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const first = acquireResourceLease('model-call', { env: process.env });
+        const second = acquireResourceLease('model-call', { env: process.env });
+        const third = acquireResourceLease('model-call', { env: process.env });
+        first.release();
+        second.release();
+        console.log(JSON.stringify({ first: first.ok, second: second.ok, third: third.ok, active: third.active, limit: third.limit }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"first": True, "second": True, "third": False, "active": 2, "limit": 2}
+
+
+def test_codex_review_job_metadata_and_creation_are_pure_before_foreground_run():
+    body = js_function_body(read_text(PLUGIN / "scripts" / "codex-companion.mjs"), "handleReviewCommand")
+    assert body.index('acquireResourceLease("model-call"') < body.index("const focusText")
+    assert body.index('acquireResourceLease("model-call"') < body.index("resolveReviewTarget")
+    assert body.index('acquireResourceLease("model-call"') < body.index("buildReviewJobMetadata")
+    assert body.index('acquireResourceLease("model-call"') < body.index("createCompanionJob")
+
+
+def test_codex_review_capacity_zero_returns_capacity_blocked(tmp_path):
+    result = run_companion(
+        ["review", "--json"],
+        cwd=tmp_path,
+        env=governor_env(tmp_path, CODEX_FOR_CLAUDE_GLOBAL_MAX_MODEL_CALLS="0"),
+    )
+    assert result.returncode == 75
+    assert "capacity_blocked: codex model-call capacity is full (0/0)" in result.stderr
+    assert "This command must run inside a Git repository" not in result.stderr
+
+
+def test_codex_task_capacity_zero_returns_capacity_blocked(tmp_path):
+    result = run_companion(
+        ["task", "--json", "do work"],
+        cwd=tmp_path,
+        env=governor_env(tmp_path, CODEX_FOR_CLAUDE_GLOBAL_MAX_MODEL_CALLS="0"),
+    )
+    assert result.returncode == 75
+    assert "capacity_blocked: codex model-call capacity is full (0/0)" in result.stderr
+
+
+def test_codex_background_task_capacity_zero_returns_capacity_blocked_before_codex_probe(tmp_path):
+    result = run_companion(
+        ["task", "--background", "--json", "do work"],
+        cwd=tmp_path,
+        env=governor_env(tmp_path, CODEX_FOR_CLAUDE_GLOBAL_MAX_BACKGROUND_JOBS="0", PATH=""),
+    )
+    assert result.returncode == 75
+    assert "capacity_blocked: codex background-job capacity is full (0/0)" in result.stderr
+    assert "Install Codex" not in result.stderr
+
+
+def test_codex_workspace_root_resolves_non_git_for_capacity_precedence(tmp_path):
+    result = run_companion(
+        ["review", "--json"],
+        cwd=tmp_path,
+        env=governor_env(tmp_path, CODEX_FOR_CLAUDE_GLOBAL_MAX_MODEL_CALLS="0"),
+    )
+    assert result.returncode == 75
+    assert "capacity_blocked" in result.stderr
+
+
+def test_codex_command_workspace_resolution_uses_workspace_fallback_contract(tmp_path):
+    payload = json.loads(run_companion(["status", "--json"], cwd=tmp_path, env=governor_env(tmp_path)).stdout)
+    assert payload["workspaceRoot"] == str(tmp_path)
+
+
+def test_codex_status_cleanup_failure_is_advisory_and_sanitized(tmp_path):
+    lock_file = tmp_path / "lock-root-file"
+    lock_file.write_text("not a directory\n", encoding="utf8")
+
+    result = run_companion(
+        ["status", "--json"],
+        cwd=tmp_path,
+        env=governor_env(tmp_path, CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR=str(lock_file)),
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["workspaceRoot"] == str(tmp_path)
+    assert str(lock_file) not in result.stderr
+    assert str(lock_file) not in result.stdout
+
+
+def test_codex_background_lease_released_when_worker_spawn_fails():
+    body = js_function_body(read_text(PLUGIN / "scripts" / "codex-companion.mjs"), "enqueueBackgroundTask")
+    assert "try" in body
+    assert "spawnDetachedTaskWorker" in body
+    assert "backgroundLease.release()" in body
+
+
+def test_codex_background_missing_worker_pid_releases_lease_once():
+    body = js_function_body(read_text(PLUGIN / "scripts" / "codex-companion.mjs"), "enqueueBackgroundTask")
+    assert "child.pid" in body
+    assert "backgroundLease.release()" in body
+    assert body.index("!Number.isInteger(child.pid)") < body.index("transferLease(backgroundLease")
+    assert body.count("backgroundLease.release()") == 1
+
+
+def test_codex_background_launch_failures_do_not_leave_active_jobs(tmp_path):
+    for mode in ["spawn", "pid", "transfer"]:
+        payload = background_launch_failure_payload(tmp_path, mode)
+        assert payload["released"] is True
+        assert payload["activeCount"] == 0
+        assert payload["status"] == "failed"
+        assert payload["sharedJob"]["jobClass"] == "task"
+        assert payload["sharedJob"]["title"] == "Codex Task"
+        assert payload["sharedJob"]["summary"] == mode
+        assert payload["sharedJob"]["write"] is True
+        assert payload["sharedJob"]["sessionId"] == "session-failure"
+        assert "request" not in payload["sharedJob"]
+        assert "backgroundLeaseId" not in payload["sharedJob"]
+        assert payload["storedStatus"] == "failed"
+        assert payload["storedPhase"] == "failed"
+        assert payload["errorMessage"]
+
+
+def test_codex_background_enqueue_success_preserves_sanitized_shared_metadata(tmp_path):
+    payload = run_node_script(
+        """
+        import { __testHooks } from './plugins/codex/scripts/codex-companion.mjs';
+        import { listJobs, resolveJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        import fs from 'node:fs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'task-success',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task: success',
+          summary: 'successful background metadata',
+          write: true,
+          sessionId: 'session-success',
+          workspaceRoot: cwd
+        };
+        const request = {
+          cwd,
+          model: null,
+          effort: null,
+          prompt: 'successful background metadata',
+          write: true,
+          resumeLast: false,
+          jobId: job.id
+        };
+        const lease = {
+          disabled: false,
+          lease: { id: 'background-job-success' },
+          released: false,
+          release() {
+            this.released = true;
+          }
+        };
+        const result = __testHooks.enqueueBackgroundTask(cwd, job, request, lease, {
+          spawnTaskWorker() {
+            return { pid: 12345 };
+          },
+          transferResourceLease() {
+            return true;
+          }
+        });
+        const sharedJob = listJobs(cwd).find((item) => item.id === job.id);
+        const stored = JSON.parse(fs.readFileSync(resolveJobFile(cwd, job.id), 'utf8'));
+        console.log(JSON.stringify({
+          payload: result.payload,
+          released: lease.released,
+          sharedJob,
+          storedRequestBackgroundLeaseId: stored.request.backgroundLeaseId
+        }));
+        """,
+        env=governor_env(tmp_path),
+        args=[str(tmp_path)],
+    )
+    shared_job = payload["sharedJob"]
+    assert payload["released"] is False
+    assert shared_job["jobClass"] == "task"
+    assert shared_job["kind"] == "task"
+    assert shared_job["kindLabel"] == "rescue"
+    assert shared_job["title"] == "Codex Task: success"
+    assert shared_job["summary"] == "successful background metadata"
+    assert shared_job["write"] is True
+    assert shared_job["sessionId"] == "session-success"
+    assert shared_job["status"] == "queued"
+    assert shared_job["phase"] == "queued"
+    assert shared_job["pid"] == 12345
+    assert shared_job["governorVersion"] == 1
+    assert "request" not in shared_job
+    assert "backgroundLeaseId" not in shared_job
+    assert payload["storedRequestBackgroundLeaseId"] == "background-job-success"
+
+
+def test_codex_task_worker_preserves_stored_job_bindings_before_claim():
+    body = js_function_body(read_text(PLUGIN / "scripts" / "codex-companion.mjs"), "handleTaskWorker")
+    assert body.index("const storedJob") < body.index("const request")
+    assert body.index("const request") < body.index("claimResourceLease")
+    assert body.index("const workspaceRoot") < body.index("claimResourceLease")
+
+
+def test_codex_foreground_task_does_not_acquire_background_job_lease():
+    body = js_function_body(read_text(PLUGIN / "scripts" / "codex-companion.mjs"), "handleTask")
+    foreground = body.split("if (options.background)", 1)[1].split("const foregroundJob", 1)[1]
+    assert 'acquireResourceLease("background-job"' not in foreground
+    assert "withResourceLease" in foreground
+    assert '"model-call"' in foreground
+
+
+def test_codex_resource_governor_off_makes_claim_and_transfer_noops(tmp_path):
+    payload = run_node_script(
+        """
+        import { claimResourceLease, transferResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const claimed = claimResourceLease('missing-id', 'background-job', process.env);
+        const transferred = transferResourceLease('', 0, process.env);
+        console.log(JSON.stringify({ claimedOk: claimed.ok, disabled: claimed.disabled, transferred }));
+        """,
+        env=governor_env(tmp_path, CODEX_FOR_CLAUDE_RESOURCE_GOVERNOR="off"),
+    )
+    assert payload == {"claimedOk": True, "disabled": True, "transferred": True}
+
+
+def test_codex_task_worker_governor_off_allows_v1_job_with_null_background_lease(tmp_path):
+    bin_dir = fake_cli_dir(tmp_path, {"plugins": []})
+    env = companion_env(tmp_path, bin_dir)
+    env.update(
+        governor_env(
+            tmp_path,
+            CODEX_FOR_CLAUDE_RESOURCE_GOVERNOR="off",
+        )
+    )
+    run_node_script(
+        """
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const job = {
+          id: 'task-offmode',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task',
+          summary: 'off mode',
+          status: 'queued',
+          phase: 'queued',
+          pid: null,
+          logFile: null,
+          workspaceRoot: cwd,
+          governorVersion: 1,
+          request: {
+            cwd,
+            model: null,
+            effort: null,
+            prompt: 'off mode worker regression',
+            write: false,
+            resumeLast: false,
+            jobId: 'task-offmode',
+            backgroundLeaseId: null
+          }
+        };
+        upsertJob(cwd, {
+          id: job.id,
+          status: job.status,
+          phase: job.phase,
+          pid: job.pid,
+          logFile: job.logFile
+        });
+        writeJobFile(cwd, job.id, job);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["task-worker", "--cwd", str(tmp_path), "--job-id", "task-offmode"], cwd=tmp_path, env=env)
+
+    assert "missing its background resource lease" not in result.stderr
+
+
+def test_codex_task_worker_shared_state_stays_request_free_after_update(tmp_path):
+    bin_dir = fake_cli_dir(tmp_path, {"plugins": []})
+    env = companion_env(tmp_path, bin_dir)
+    env.update(governor_env(tmp_path, CODEX_FOR_CLAUDE_RESOURCE_GOVERNOR="off"))
+    run_node_script(
+        """
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const now = new Date().toISOString();
+        const job = {
+          id: 'task-worker-sanitize',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task',
+          summary: 'worker sanitize',
+          status: 'queued',
+          phase: 'queued',
+          pid: null,
+          logFile: null,
+          workspaceRoot: cwd,
+          createdAt: now,
+          updatedAt: now,
+          governorVersion: 1,
+          write: true,
+          sessionId: 'session-worker-sanitize',
+          backgroundLeaseId: 'top-level-background-lease',
+          backgroundLease: { lease: { id: 'nested-background-lease' } },
+          lease: { id: 'raw-lease-detail' },
+          request: {
+            cwd,
+            model: null,
+            effort: null,
+            prompt: 'worker sanitize',
+            write: true,
+            resumeLast: false,
+            jobId: 'task-worker-sanitize',
+            backgroundLeaseId: 'request-background-lease'
+          }
+        };
+        upsertJob(cwd, {
+          id: job.id,
+          kind: job.kind,
+          kindLabel: job.kindLabel,
+          jobClass: job.jobClass,
+          title: job.title,
+          summary: job.summary,
+          status: job.status,
+          phase: job.phase,
+          pid: job.pid,
+          logFile: job.logFile,
+          workspaceRoot: job.workspaceRoot,
+          governorVersion: job.governorVersion,
+          write: job.write,
+          sessionId: job.sessionId,
+          createdAt: now,
+          updatedAt: now
+        });
+        writeJobFile(cwd, job.id, job);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["task-worker", "--cwd", str(tmp_path), "--job-id", "task-worker-sanitize"], cwd=tmp_path, env=env)
+    payload = run_node_script(
+        """
+        import { listJobs } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const sharedJob = listJobs(cwd).find((item) => item.id === 'task-worker-sanitize');
+        console.log(JSON.stringify({ sharedJob }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    assert "missing its background resource lease" not in result.stderr
+    shared_job = payload["sharedJob"]
+    assert shared_job["jobClass"] == "task"
+    assert shared_job["kind"] == "task"
+    assert shared_job["kindLabel"] == "rescue"
+    assert shared_job["title"] == "Codex Task"
+    assert shared_job["summary"] == "worker sanitize"
+    assert shared_job["write"] is True
+    assert shared_job["sessionId"] == "session-worker-sanitize"
+    assert shared_job["status"] == "failed"
+    assert "request" not in shared_job
+    assert "backgroundLeaseId" not in shared_job
+    assert "backgroundLease" not in shared_job
+    assert "lease" not in shared_job
+
+
+def test_codex_background_lease_claim_is_unconditional_for_existing_counted_lease(tmp_path):
+    payload = run_node_script(
+        """
+        import { acquireResourceLease, claimResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const lease = acquireResourceLease('background-job', { env: process.env, limit: 1, transferable: true, pid: 0 });
+        const claimed = claimResourceLease(lease.lease.id, 'background-job', process.env);
+        claimed.release();
+        console.log(JSON.stringify({ acquired: lease.ok, claimed: claimed.ok }));
+        """,
+        env=governor_env(tmp_path, CODEX_FOR_CLAUDE_GLOBAL_MAX_BACKGROUND_JOBS="1"),
+    )
+    assert payload == {"acquired": True, "claimed": True}
+
+
+def test_codex_background_lease_claim_allows_active_equal_limit(tmp_path):
+    test_codex_background_lease_claim_is_unconditional_for_existing_counted_lease(tmp_path)
+
+
+def test_codex_task_worker_reacquire_capacity_blocked_is_explicit():
+    body = js_function_body(read_text(PLUGIN / "scripts" / "codex-companion.mjs"), "handleTaskWorker")
+    assert "task-worker-reclaim" in body
+    assert "ECAPACITY" in body
+    assert "capacityBlockedMessage" in body
+
+
+def test_codex_task_worker_rejects_fresh_unclaimable_handoff(tmp_path):
+    env = governor_env(tmp_path)
+    payload = run_node_script(
+        """
+        import { acquireResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const lease = acquireResourceLease('background-job', {
+          env: process.env,
+          transferable: true,
+          pid: 0,
+          command: 'task-worker',
+          jobId: 'task-fresh-handoff'
+        });
+        const leaseId = lease.lease.id;
+        lease.release();
+        const now = new Date().toISOString();
+        const job = {
+          id: 'task-fresh-handoff',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task',
+          summary: 'fresh handoff',
+          status: 'queued',
+          phase: 'queued',
+          pid: null,
+          logFile: null,
+          workspaceRoot: cwd,
+          createdAt: now,
+          updatedAt: now,
+          governorVersion: 1,
+          request: {
+            cwd,
+            model: null,
+            effort: null,
+            prompt: 'fresh handoff',
+            write: false,
+            resumeLast: false,
+            jobId: 'task-fresh-handoff',
+            backgroundLeaseId: leaseId
+          }
+        };
+        upsertJob(cwd, {
+          id: job.id,
+          status: job.status,
+          phase: job.phase,
+          pid: job.pid,
+          logFile: job.logFile,
+          createdAt: now,
+          updatedAt: now
+        });
+        writeJobFile(cwd, job.id, job);
+        console.log(JSON.stringify({ leaseId }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["task-worker", "--cwd", str(tmp_path), "--job-id", "task-fresh-handoff"], cwd=tmp_path, env=env)
+
+    assert payload["leaseId"].startswith("background-job-")
+    assert result.returncode == 1
+    assert "lease is not claimable" in result.stderr
+    assert "task-worker-reclaim" not in result.stderr
+
+
+def test_codex_task_worker_rejects_already_claimed_handoff_even_when_old(tmp_path):
+    env = governor_env(tmp_path)
+    run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import {
+          acquireResourceLease,
+          claimResourceLease,
+          resourceLockRoot
+        } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const old = new Date(Date.now() - 60000).toISOString();
+        const lease = acquireResourceLease('background-job', {
+          env: process.env,
+          transferable: true,
+          pid: 0,
+          command: 'task-worker',
+          jobId: 'task-claimed-handoff'
+        });
+        const claimed = claimResourceLease(lease.lease.id, 'background-job', process.env);
+        const file = path.join(resourceLockRoot(process.env), `${lease.lease.id}.json`);
+        const leasePayload = JSON.parse(fs.readFileSync(file, 'utf8'));
+        fs.writeFileSync(file, `${JSON.stringify({
+          ...leasePayload,
+          pid: 99999999,
+          ownerPid: 99999999,
+          transferable: false
+        }, null, 2)}\\n`);
+        const job = {
+          id: 'task-claimed-handoff',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task',
+          summary: 'claimed handoff',
+          status: 'queued',
+          phase: 'queued',
+          pid: null,
+          logFile: null,
+          workspaceRoot: cwd,
+          createdAt: old,
+          updatedAt: old,
+          governorVersion: 1,
+          request: {
+            cwd,
+            model: null,
+            effort: null,
+            prompt: 'claimed handoff',
+            write: false,
+            resumeLast: false,
+            jobId: 'task-claimed-handoff',
+            backgroundLeaseId: lease.lease.id
+          }
+        };
+        upsertJob(cwd, {
+          id: job.id,
+          status: job.status,
+          phase: job.phase,
+          pid: job.pid,
+          logFile: job.logFile,
+          createdAt: old,
+          updatedAt: old
+        });
+        writeJobFile(cwd, job.id, job);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["task-worker", "--cwd", str(tmp_path), "--job-id", "task-claimed-handoff"], cwd=tmp_path, env=env)
+
+    assert result.returncode == 1
+    assert "lease is not claimable" in result.stderr
+    assert "Codex CLI is not installed" not in result.stderr
+
+
+def test_codex_task_worker_reclaims_only_stale_handoff_without_active_lease(tmp_path):
+    env = governor_env(tmp_path, PATH="")
+    run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { acquireResourceLease, resourceLockRoot } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const old = new Date(Date.now() - 60000).toISOString();
+        const lease = acquireResourceLease('background-job', {
+          env: process.env,
+          transferable: true,
+          pid: 0,
+          command: 'task-worker',
+          jobId: 'task-stale-handoff'
+        });
+        const leaseId = lease.lease.id;
+        const file = path.join(resourceLockRoot(process.env), `${leaseId}.json`);
+        const leasePayload = JSON.parse(fs.readFileSync(file, 'utf8'));
+        fs.writeFileSync(file, `${JSON.stringify({
+          ...leasePayload,
+          pid: 0,
+          ownerPid: 99999999,
+          transferable: true,
+          claimedAt: undefined,
+          claimedAtMs: undefined
+        }, null, 2)}\\n`);
+        const job = {
+          id: 'task-stale-handoff',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task',
+          summary: 'stale handoff',
+          status: 'queued',
+          phase: 'queued',
+          pid: null,
+          logFile: null,
+          workspaceRoot: cwd,
+          createdAt: old,
+          updatedAt: old,
+          governorVersion: 1,
+          request: {
+            cwd,
+            model: null,
+            effort: null,
+            prompt: 'stale handoff',
+            write: false,
+            resumeLast: false,
+            jobId: 'task-stale-handoff',
+            backgroundLeaseId: leaseId
+          }
+        };
+        upsertJob(cwd, {
+          id: job.id,
+          status: job.status,
+          phase: job.phase,
+          pid: job.pid,
+          logFile: job.logFile,
+          createdAt: old,
+          updatedAt: old
+        });
+        writeJobFile(cwd, job.id, job);
+        console.log(JSON.stringify({ leaseId }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["task-worker", "--cwd", str(tmp_path), "--job-id", "task-stale-handoff"], cwd=tmp_path, env=env)
+
+    assert result.returncode == 1
+    assert "lease is not claimable" not in result.stderr
+    assert "Codex CLI is not installed" in result.stderr
+
+
+def test_codex_background_lease_claim_then_release_frees_slot(tmp_path):
+    payload = run_node_script(
+        """
+        import { acquireResourceLease, claimResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const first = acquireResourceLease('background-job', { env: process.env, limit: 1, transferable: true, pid: 0 });
+        const claimed = claimResourceLease(first.lease.id, 'background-job', process.env);
+        claimed.release();
+        const second = acquireResourceLease('background-job', { env: process.env, limit: 1 });
+        second.release();
+        console.log(JSON.stringify({ first: first.ok, claimed: claimed.ok, second: second.ok }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"first": True, "claimed": True, "second": True}
+
+
+def test_codex_background_claimed_lease_cannot_be_reopened_by_transfer(tmp_path):
+    payload = run_node_script(
+        """
+        import { acquireResourceLease, claimResourceLease, transferResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const first = acquireResourceLease('background-job', { env: process.env, limit: 1, transferable: true, pid: 0 });
+        const claimed = claimResourceLease(first.lease.id, 'background-job', process.env);
+        const transferredAfterClaim = transferResourceLease(first.lease.id, process.pid, process.env, { keepTransferable: true });
+        const duplicateClaim = claimResourceLease(first.lease.id, 'background-job', process.env);
+        claimed.release();
+        console.log(JSON.stringify({
+          firstOk: first.ok,
+          claimedOk: claimed.ok,
+          transferredAfterClaim,
+          duplicateClaimOk: duplicateClaim.ok,
+          duplicateClaimReason: duplicateClaim.reason
+        }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {
+        "firstOk": True,
+        "claimedOk": True,
+        "transferredAfterClaim": True,
+        "duplicateClaimOk": False,
+        "duplicateClaimReason": "lease is not claimable",
+    }
+
+
+def test_codex_background_transferred_dead_pid_reaps_on_next_governor_operation(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { acquireResourceLease, transferResourceLease, resourceLockRoot } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const first = acquireResourceLease('background-job', { env: process.env, limit: 1, transferable: true });
+        transferResourceLease(first.lease.id, 99999999, process.env);
+        const file = path.join(resourceLockRoot(process.env), `${first.lease.id}.json`);
+        const lease = JSON.parse(fs.readFileSync(file, 'utf8'));
+        lease.transferredAtMs = Date.now() - 31000;
+        fs.writeFileSync(file, `${JSON.stringify(lease, null, 2)}\\n`);
+        const second = acquireResourceLease('background-job', { env: process.env, limit: 1 });
+        second.release();
+        console.log(JSON.stringify({ second: second.ok }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"second": True}
+
+
+def test_codex_background_transferred_lease_has_claim_grace(tmp_path):
+    payload = run_node_script(
+        """
+        import { acquireResourceLease, transferResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const first = acquireResourceLease('background-job', { env: process.env, limit: 1, transferable: true });
+        transferResourceLease(first.lease.id, 99999999, process.env, { keepTransferable: true });
+        const second = acquireResourceLease('background-job', { env: process.env, limit: 1 });
+        first.release();
+        console.log(JSON.stringify({ second: second.ok, active: second.active }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"second": False, "active": 1}
+
+
+def test_codex_background_transferred_alive_child_dead_owner_is_not_reaped_during_grace(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { acquireResourceLease, transferResourceLease, resourceLockRoot } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const first = acquireResourceLease('background-job', { env: process.env, limit: 1, transferable: true });
+        transferResourceLease(first.lease.id, process.pid, process.env, { keepTransferable: true });
+        const file = path.join(resourceLockRoot(process.env), `${first.lease.id}.json`);
+        const lease = JSON.parse(fs.readFileSync(file, 'utf8'));
+        lease.ownerPid = 99999999;
+        fs.writeFileSync(file, `${JSON.stringify(lease, null, 2)}\\n`);
+        const second = acquireResourceLease('background-job', { env: process.env, limit: 1 });
+        first.release();
+        console.log(JSON.stringify({ second: second.ok, active: second.active }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"second": False, "active": 1}
+
+
+def test_codex_background_unspawned_dead_owner_reaps_without_grace(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { acquireResourceLease, resourceLockRoot } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const first = acquireResourceLease('background-job', { env: process.env, limit: 1, transferable: true, pid: 0 });
+        const file = path.join(resourceLockRoot(process.env), `${first.lease.id}.json`);
+        const lease = JSON.parse(fs.readFileSync(file, 'utf8'));
+        lease.ownerPid = 99999999;
+        fs.writeFileSync(file, `${JSON.stringify(lease, null, 2)}\\n`);
+        const second = acquireResourceLease('background-job', { env: process.env, limit: 1 });
+        second.release();
+        console.log(JSON.stringify({ second: second.ok }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"second": True}
+
+
+def test_codex_background_unspawned_live_owner_is_not_reaped_by_age_only(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { acquireResourceLease, resourceLockRoot } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const first = acquireResourceLease('background-job', { env: process.env, limit: 1, transferable: true, pid: 0 });
+        const file = path.join(resourceLockRoot(process.env), `${first.lease.id}.json`);
+        const lease = JSON.parse(fs.readFileSync(file, 'utf8'));
+        lease.createdAtMs = Date.now() - 10 * 60 * 1000;
+        lease.updatedAtMs = lease.createdAtMs;
+        fs.writeFileSync(file, `${JSON.stringify(lease, null, 2)}\\n`);
+        const second = acquireResourceLease('background-job', { env: process.env, limit: 1 });
+        first.release();
+        console.log(JSON.stringify({ second: second.ok, active: second.active }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"second": False, "active": 1}
+
+
+def test_codex_status_and_doctor_trigger_resource_reap():
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    doctor = read_text(PLUGIN / "scripts" / "lib" / "doctor.mjs")
+    assert "releaseTerminalJobLeasesForWorkspace(workspaceRoot, process.env)" in companion
+    assert "reapStaleResourceLeases(process.env)" in companion
+    assert "releaseTerminalJobLeasesForWorkspace(cwd, env)" in doctor
+    assert "reapStaleResourceLeases(env)" in doctor
+
+
+def test_codex_status_reaps_transferred_terminal_job_lease_even_if_pid_looks_alive(tmp_path):
+    payload = run_node_script(
+        """
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        import { acquireResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        import { releaseTerminalJobLeasesForWorkspace } from './plugins/codex/scripts/lib/terminal-lease-cleanup.mjs';
+        const cwd = process.argv[1];
+        const job = { id: 'task-test', status: 'completed', phase: 'done', pid: process.pid, logFile: null };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        const first = acquireResourceLease('background-job', { env: process.env, limit: 1, jobId: job.id, pid: process.pid });
+        const released = releaseTerminalJobLeasesForWorkspace(cwd, process.env);
+        const second = acquireResourceLease('background-job', { env: process.env, limit: 1 });
+        second.release();
+        console.log(JSON.stringify({ first: first.ok, released, second: second.ok }));
+        """,
+        env=governor_env(tmp_path),
+        args=[str(tmp_path)],
+    )
+    assert payload == {"first": True, "released": 1, "second": True}
+
+
+def test_codex_companion_import_is_side_effect_free():
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", "await import('./plugins/codex/scripts/codex-companion.mjs')"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_codex_companion_guarded_entrypoint_copy_tree_doctor_smoke(tmp_path):
+    repo = copy_repo(tmp_path)
+    bin_dir = fake_cli_dir(tmp_path, {"plugins": []})
+    result = subprocess.run(
+        [NODE, "plugins/codex/scripts/codex-companion.mjs", "doctor", "--json"],
+        cwd=repo,
+        env={**os.environ, **companion_env(tmp_path, bin_dir)},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["ok"] is True

@@ -210,8 +210,7 @@ function matchJobReference(jobs, reference, predicate = () => true) {
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
 }
 
-export function buildStatusSnapshot(cwd, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+export function buildStatusSnapshot(workspaceRoot, options = {}) {
   const config = getConfig(workspaceRoot);
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
@@ -239,8 +238,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
   };
 }
 
-export function buildSingleJobSnapshot(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+export function buildSingleJobSnapshot(workspaceRoot, reference, options = {}) {
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {

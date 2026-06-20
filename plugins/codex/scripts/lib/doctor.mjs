@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { resolveInstalledPluginRoot } from "./install-consistency.mjs";
 import { ensureStateDir, resolveStateDir } from "./state.mjs";
+import { reapStaleResourceLeases } from "./resource-governor.mjs";
+import { releaseTerminalJobLeasesForWorkspace } from "./terminal-lease-cleanup.mjs";
 
 function firstLine(text) {
   return String(text ?? "")
@@ -87,6 +89,13 @@ function installedPluginCheck(env) {
 }
 
 export function doctorReport(cwd = process.cwd(), env = process.env) {
+  try {
+    releaseTerminalJobLeasesForWorkspace(cwd, env);
+    reapStaleResourceLeases(env);
+  } catch {
+    // Doctor cleanup is advisory and must not hide prerequisite diagnostics.
+  }
+
   const checks = {
     node: commandVersion("node", ["--version"], env),
     codexExecutable: commandVersion("codex", ["--version"], env),
