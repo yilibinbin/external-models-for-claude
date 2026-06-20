@@ -711,7 +711,6 @@ function recordBackgroundLaunchFailure(job, queuedRecord, logFile, error) {
     completedAt
   };
   appendLogLine(logFile, `Failed to start background task worker: ${errorMessage}`);
-  writeJobFile(job.workspaceRoot, job.id, failedRecord);
   upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
     status: "failed",
     phase: "failed",
@@ -721,6 +720,7 @@ function recordBackgroundLaunchFailure(job, queuedRecord, logFile, error) {
     errorMessage,
     completedAt
   }));
+  writeJobFile(job.workspaceRoot, job.id, failedRecord);
 }
 
 function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies = {}) {
@@ -744,6 +744,13 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
   };
 
   try {
+    upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
+      status: "queued",
+      phase: "queued",
+      pid: null,
+      logFile,
+      ...(governorEnabledLease ? { governorVersion: 1 } : {})
+    }));
     writeJobFile(job.workspaceRoot, job.id, queuedRecord);
 
     const child = spawnTaskWorker(cwd, job.id);
@@ -760,7 +767,6 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
       ...queuedRecord,
       pid: child.pid
     };
-    writeJobFile(job.workspaceRoot, job.id, spawnedRecord);
     upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
       status: "queued",
       phase: "queued",
@@ -768,6 +774,7 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
       logFile,
       ...(governorEnabledLease ? { governorVersion: 1 } : {})
     }));
+    writeJobFile(job.workspaceRoot, job.id, spawnedRecord);
   } catch (error) {
     if (!transferred) {
       backgroundLease.release();
@@ -1178,11 +1185,6 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
   upsertJob(workspaceRoot, {
     id: job.id,
     status: "cancelled",
@@ -1190,6 +1192,11 @@ async function handleCancel(argv) {
     pid: null,
     errorMessage: "Cancelled by user.",
     completedAt
+  });
+  writeJobFile(workspaceRoot, job.id, {
+    ...existing,
+    ...nextJob,
+    cancelledAt: completedAt
   });
 
   const payload = {

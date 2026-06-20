@@ -2305,9 +2305,12 @@ def test_codex_stop_child_disables_heartbeat_and_progress_updates():
     assert "heartbeat?.unref?.()" in run_tracked
     assert run_tracked.count("writeJobFile(job.workspaceRoot, job.id") == 3
     assert run_tracked.count("heartbeatActive = false") >= 2
+    assert run_tracked.index("upsertJob(job.workspaceRoot, runningRecord)") < run_tracked.index("writeJobFile(job.workspaceRoot, job.id, runningRecord)")
     assert run_tracked.index("heartbeatActive = false") < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
+    assert run_tracked.index("upsertJob(job.workspaceRoot, {", run_tracked.index("const execution = await runner()")) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
     catch_index = run_tracked.index("} catch (error) {")
     assert run_tracked.index("heartbeatActive = false", catch_index) < run_tracked.index("readStoredJobOrNull", catch_index)
+    assert run_tracked.index("upsertJob(job.workspaceRoot, {", catch_index) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", catch_index)
     assert run_tracked.index("readStoredJobOrNull", catch_index) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", catch_index)
 
 
@@ -2414,6 +2417,102 @@ def test_codex_state_skips_pruned_file_delete_when_job_reappears(tmp_path):
     }
 
 
+def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { spawnSync } from 'node:child_process';
+        import {
+          listJobs,
+          removePrunedJobFiles,
+          resolveJobFile,
+          resolveJobLogFile,
+          saveState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'child-reappeared-job',
+          status: 'running',
+          workspaceRoot: cwd,
+          updatedAt: new Date().toISOString()
+        };
+        const jobFile = resolveJobFile(cwd, job.id);
+        const logFile = resolveJobLogFile(cwd, job.id);
+        writeJobFile(cwd, job.id, { ...job, progress: 'old job file' });
+        fs.writeFileSync(logFile, 'old log\\n', 'utf8');
+        saveState(cwd, { jobs: [] });
+
+        let injected = false;
+        let childStatus = null;
+        let childStderr = '';
+        const originalUnlinkSync = fs.unlinkSync;
+        fs.unlinkSync = function patchedUnlinkSync(filePath) {
+          if (!injected && String(filePath) === jobFile) {
+            injected = true;
+            const child = spawnSync(
+              process.execPath,
+              [
+                '--input-type=module',
+                '-e',
+                `
+                  import fs from 'node:fs';
+                  import {
+                    resolveJobLogFile,
+                    upsertJob,
+                    writeJobFile
+                  } from './plugins/codex/scripts/lib/state.mjs';
+                  const cwd = process.argv[1];
+                  const job = ${JSON.stringify(job)};
+                  const logFile = resolveJobLogFile(cwd, job.id);
+                  upsertJob(cwd, { ...job, childPublished: true, logFile });
+                  writeJobFile(cwd, job.id, { ...job, childPublished: true, logFile });
+                  fs.writeFileSync(logFile, 'new log\\\\n', 'utf8');
+                `,
+                cwd
+              ],
+              {
+                cwd: process.cwd(),
+                env: {
+                  ...process.env,
+                  CODEX_FOR_CLAUDE_FILE_LOCK_WAIT_MS: '200'
+                },
+                encoding: 'utf8'
+              }
+            );
+            childStatus = child.status;
+            childStderr = child.stderr;
+          }
+          return originalUnlinkSync.call(fs, filePath);
+        };
+
+        try {
+          removePrunedJobFiles(cwd, [{ ...job, logFile }], []);
+        } finally {
+          fs.unlinkSync = originalUnlinkSync;
+        }
+
+        const stateHasJob = listJobs(cwd).some((item) => item.id === job.id);
+        console.log(JSON.stringify({
+          injected,
+          childStatus,
+          childStderr,
+          stateHasJob,
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["injected"] is True
+    assert not (
+        payload["stateHasJob"]
+        and (not payload["jobFileExists"] or not payload["logFileExists"])
+    ), payload
+
+
 def test_codex_state_file_lock_wait_env_controls_timeout(tmp_path):
     state_source = read_text(PLUGIN / "scripts" / "lib" / "state.mjs")
     assert "CODEX_FOR_CLAUDE_FILE_LOCK_WAIT_MS" in state_source
@@ -2497,6 +2596,18 @@ def test_codex_progress_upsert_prune_completes_before_job_file_mutation():
     source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
     body = js_function_body(source, "createJobProgressUpdater")
     assert body.index("upsertJob(workspaceRoot, patch)") < body.index("mutateJobFile(workspaceRoot, jobId")
+
+
+def test_codex_companion_publishes_background_and_cancel_state_before_job_file_writes():
+    source = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    failure = js_function_body(source, "recordBackgroundLaunchFailure")
+    enqueue = js_function_body(source, "enqueueBackgroundTask")
+    cancel = js_function_body(source, "handleCancel")
+
+    assert failure.index("upsertJob(job.workspaceRoot") < failure.index("writeJobFile(job.workspaceRoot, job.id, failedRecord)")
+    assert enqueue.index("upsertJob(job.workspaceRoot", enqueue.index("const queuedRecord")) < enqueue.index("writeJobFile(job.workspaceRoot, job.id, queuedRecord)")
+    assert enqueue.index("upsertJob(job.workspaceRoot", enqueue.index("const spawnedRecord")) < enqueue.index("writeJobFile(job.workspaceRoot, job.id, spawnedRecord)")
+    assert cancel.index("upsertJob(workspaceRoot") < cancel.index("writeJobFile(workspaceRoot, job.id")
 
 
 def test_codex_status_json_includes_liveness(tmp_path):
