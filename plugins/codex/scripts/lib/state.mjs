@@ -182,6 +182,9 @@ export function withStateLock(cwd, callback) {
 }
 
 export function withJobFileLock(cwd, jobId, callback) {
+  if (LOCK_CONTEXT.stateDepth > 0) {
+    throw new Error("job-file lock cannot be acquired while holding a state lock");
+  }
   if (LOCK_CONTEXT.jobDepth > 0) {
     throw new Error("job-file lock cannot be nested");
   }
@@ -223,28 +226,27 @@ export function removePrunedJobFiles(cwd, previousJobs, nextJobs) {
   if (process.env.CODEX_FOR_CLAUDE_SKIP_STATE_PRUNE === "1") {
     return;
   }
-  return withStateLock(cwd, () => {
-    const currentState = loadState(cwd);
-    const retainedIds = new Set((currentState.jobs ?? nextJobs ?? []).map((job) => job.id));
-    for (const job of previousJobs) {
-      if (retainedIds.has(job.id)) {
-        continue;
-      }
-      withJobFileLock(cwd, job.id, () => {
+  const retainedIds = new Set((nextJobs ?? []).map((job) => job.id));
+  for (const job of previousJobs) {
+    if (retainedIds.has(job.id)) {
+      continue;
+    }
+    withJobFileLock(cwd, job.id, () => {
+      const currentState = loadState(cwd);
+      if (!(currentState.jobs ?? []).some((currentJob) => currentJob.id === job.id)) {
         removeJobFile(resolveJobFile(cwd, job.id));
         removeFileIfExists(job.logFile);
-      });
-    }
-  });
+      }
+    });
+  }
 }
 
 export function saveState(cwd, state) {
   const previousJobs = (state.jobs ?? []).slice();
   const nextState = withStateLock(cwd, () => {
-    const savedState = saveStateUnlocked(cwd, state, previousJobs);
-    removePrunedJobFiles(cwd, previousJobs, savedState.jobs);
-    return savedState;
+    return saveStateUnlocked(cwd, state, previousJobs);
   });
+  removePrunedJobFiles(cwd, previousJobs, nextState.jobs);
 
   return nextState;
 }
@@ -258,9 +260,9 @@ export function updateState(cwd, mutator) {
     prunedPreviousJobs = previousJobs;
     mutator(current);
     nextState = saveStateUnlocked(cwd, current, previousJobs);
-    removePrunedJobFiles(cwd, prunedPreviousJobs, nextState.jobs);
     return nextState;
   });
+  removePrunedJobFiles(cwd, prunedPreviousJobs, nextState.jobs);
 
   return nextState;
 }

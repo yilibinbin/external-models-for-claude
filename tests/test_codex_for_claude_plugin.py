@@ -2365,10 +2365,31 @@ def test_codex_state_uses_required_slice_contracts():
 def test_codex_state_pruned_job_files_are_removed_under_job_file_lock():
     source = read_text(PLUGIN / "scripts" / "lib" / "state.mjs")
     prune_body = js_function_body(source, "removePrunedJobFiles")
+    save_state = js_function_body(source, "saveState")
+    update_state = js_function_body(source, "updateState")
     save_unlocked = js_function_body(source, "saveStateUnlocked")
     assert "withJobFileLock(cwd, job.id" in prune_body
+    assert "withStateLock" not in prune_body
+    assert "saveState(" not in prune_body
+    assert "updateState(" not in prune_body
+    assert "loadState(cwd)" in prune_body
     assert "removeJobFile(resolveJobFile(cwd, job.id))" in prune_body
     assert "removeFileIfExists(job.logFile)" in prune_body
+    assert save_state.index("withStateLock(cwd") < save_state.index("removePrunedJobFiles(cwd")
+    assert update_state.index("withStateLock(cwd") < update_state.index("removePrunedJobFiles(cwd")
+    assert re.search(
+        r"const nextState = withStateLock\(cwd, \(\) => \{\s*"
+        r"return saveStateUnlocked\(cwd, state, previousJobs\);\s*"
+        r"\}\);\s*"
+        r"removePrunedJobFiles\(cwd, previousJobs, nextState\.jobs\);",
+        save_state,
+    )
+    assert re.search(
+        r"return nextState;\s*"
+        r"\}\);\s*"
+        r"removePrunedJobFiles\(cwd, prunedPreviousJobs, nextState\.jobs\);",
+        update_state,
+    )
     assert "withJobFileLock" not in save_unlocked
     assert "removePrunedJobFiles" not in save_unlocked
     assert "removeJobFile" not in save_unlocked
@@ -2421,7 +2442,7 @@ def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
     payload = run_node_script(
         """
         import fs from 'node:fs';
-        import { spawnSync } from 'node:child_process';
+        import { spawn } from 'node:child_process';
         import {
           listJobs,
           removePrunedJobFiles,
@@ -2440,6 +2461,7 @@ def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
         };
         const jobFile = resolveJobFile(cwd, job.id);
         const logFile = resolveJobLogFile(cwd, job.id);
+        const publishedSignal = `${jobFile}.published`;
         writeJobFile(cwd, job.id, { ...job, progress: 'old job file' });
         fs.writeFileSync(logFile, 'old log\\n', 'utf8');
         saveState(cwd, { jobs: [] });
@@ -2447,11 +2469,12 @@ def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
         let injected = false;
         let childStatus = null;
         let childStderr = '';
+        let childDone = Promise.resolve();
         const originalUnlinkSync = fs.unlinkSync;
         fs.unlinkSync = function patchedUnlinkSync(filePath) {
           if (!injected && String(filePath) === jobFile) {
             injected = true;
-            const child = spawnSync(
+            const child = spawn(
               process.execPath,
               [
                 '--input-type=module',
@@ -2467,22 +2490,35 @@ def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
                   const job = ${JSON.stringify(job)};
                   const logFile = resolveJobLogFile(cwd, job.id);
                   upsertJob(cwd, { ...job, childPublished: true, logFile });
+                  fs.writeFileSync(process.argv[2], 'published', 'utf8');
                   writeJobFile(cwd, job.id, { ...job, childPublished: true, logFile });
                   fs.writeFileSync(logFile, 'new log\\\\n', 'utf8');
                 `,
-                cwd
+                cwd,
+                publishedSignal
               ],
               {
                 cwd: process.cwd(),
                 env: {
                   ...process.env,
-                  CODEX_FOR_CLAUDE_FILE_LOCK_WAIT_MS: '200'
+                  CODEX_FOR_CLAUDE_FILE_LOCK_WAIT_MS: '5000'
                 },
-                encoding: 'utf8'
               }
             );
-            childStatus = child.status;
-            childStderr = child.stderr;
+            child.stderr.setEncoding('utf8');
+            child.stderr.on('data', (chunk) => {
+              childStderr += chunk;
+            });
+            childDone = new Promise((resolve) => {
+              child.on('close', (status) => {
+                childStatus = status;
+                resolve();
+              });
+            });
+            const startedAt = Date.now();
+            while (!fs.existsSync(publishedSignal) && Date.now() - startedAt < 1000) {
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+            }
           }
           return originalUnlinkSync.call(fs, filePath);
         };
@@ -2492,6 +2528,7 @@ def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
         } finally {
           fs.unlinkSync = originalUnlinkSync;
         }
+        await childDone;
 
         const stateHasJob = listJobs(cwd).some((item) => item.id === job.id);
         console.log(JSON.stringify({
@@ -2500,17 +2537,19 @@ def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
           childStderr,
           stateHasJob,
           jobFileExists: fs.existsSync(jobFile),
-          logFileExists: fs.existsSync(logFile)
+          logFileExists: fs.existsSync(logFile),
+          publishedSignalExists: fs.existsSync(publishedSignal)
         }));
         """,
         args=[str(tmp_path)],
     )
 
     assert payload["injected"] is True
-    assert not (
-        payload["stateHasJob"]
-        and (not payload["jobFileExists"] or not payload["logFileExists"])
-    ), payload
+    assert payload["publishedSignalExists"] is True
+    assert payload["childStatus"] == 0, payload["childStderr"]
+    assert payload["stateHasJob"] is True
+    assert payload["jobFileExists"] is True
+    assert payload["logFileExists"] is True
 
 
 def test_codex_state_file_lock_wait_env_controls_timeout(tmp_path):
@@ -2558,6 +2597,8 @@ def test_codex_state_lock_order_is_one_way():
     with_job = js_function_body(source, "withJobFileLock")
     assert "LOCK_CONTEXT.jobDepth" in with_state
     assert "state lock cannot be acquired while holding a job-file lock" in with_state
+    assert "LOCK_CONTEXT.stateDepth" in with_job
+    assert "job-file lock cannot be acquired while holding a state lock" in with_job
     assert "LOCK_CONTEXT.jobDepth" in with_job
     assert "job-file lock cannot be nested" in with_job
 
@@ -2565,7 +2606,7 @@ def test_codex_state_lock_order_is_one_way():
 def test_codex_job_file_lock_enforces_runtime_order(tmp_path):
     payload = run_node_script(
         """
-        import { mutateJobFile, updateState, withJobFileLock } from './plugins/codex/scripts/lib/state.mjs';
+        import { mutateJobFile, updateState, withJobFileLock, withStateLock } from './plugins/codex/scripts/lib/state.mjs';
         const cwd = process.argv[1];
         const nestedJob = (() => {
           try {
@@ -2583,13 +2624,22 @@ def test_codex_job_file_lock_enforces_runtime_order(tmp_path):
             return error.message;
           }
         })();
-        console.log(JSON.stringify({ nestedJob, stateInsideJob }));
+        const jobInsideState = (() => {
+          try {
+            withStateLock(cwd, () => withJobFileLock(cwd, 'job-lock-order', () => {}));
+            return null;
+          } catch (error) {
+            return error.message;
+          }
+        })();
+        console.log(JSON.stringify({ nestedJob, stateInsideJob, jobInsideState }));
         """,
         args=[str(tmp_path)],
     )
 
     assert payload["nestedJob"] == "job-file lock cannot be nested"
     assert payload["stateInsideJob"] == "state lock cannot be acquired while holding a job-file lock"
+    assert payload["jobInsideState"] == "job-file lock cannot be acquired while holding a state lock"
 
 
 def test_codex_progress_upsert_prune_completes_before_job_file_mutation():
