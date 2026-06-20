@@ -343,6 +343,21 @@ export function mutateJobFile(cwd, jobId, mutate) {
   });
 }
 
+export function removeJobSidecar(cwd, job) {
+  return withJobFileLock(cwd, job.id, () => {
+    const jobFile = resolveJobFile(cwd, job.id);
+    let logFile = job.logFile ?? null;
+    try {
+      const storedJob = readJobFile(jobFile);
+      logFile = logFile ?? storedJob.logFile ?? null;
+    } catch {
+      // Missing or corrupt sidecars are still safe to delete best-effort.
+    }
+    removeJobFile(jobFile);
+    removeFileIfExists(logFile);
+  });
+}
+
 function removeJobFile(jobFile) {
   if (fs.existsSync(jobFile)) {
     fs.unlinkSync(jobFile);

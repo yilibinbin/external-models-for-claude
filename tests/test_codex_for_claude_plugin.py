@@ -2622,9 +2622,67 @@ def test_codex_session_lifecycle_cleanup_uses_locked_update_state():
     source = read_text(PLUGIN / "scripts" / "session-lifecycle-hook.mjs")
     assert "saveState" not in source
     assert "updateState" in source
+    assert "removeJobSidecar" in source
     cleanup = js_function_body(source, "cleanupSessionJobs")
     assert "updateState(workspaceRoot" in cleanup
     assert "state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId)" in cleanup
+    assert cleanup.index("updateState(workspaceRoot") < cleanup.index("removeJobSidecar(workspaceRoot, job)")
+
+
+def test_codex_session_lifecycle_cleanup_removes_active_sidecars(tmp_path):
+    payload = run_node_script(
+        f"""
+        import fs from 'node:fs';
+        import {{ spawnSync }} from 'node:child_process';
+        import {{
+          listJobs,
+          resolveJobFile,
+          resolveJobLogFile,
+          upsertJob,
+          writeJobFile
+        }} from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const hook = {json.dumps(str(PLUGIN / "scripts" / "session-lifecycle-hook.mjs"))};
+        const job = {{
+          id: 'session-active-cleanup',
+          status: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-cleanup',
+          pid: 99999999,
+          request: {{ secret: true }},
+          logFile: resolveJobLogFile(cwd, 'session-active-cleanup'),
+          updatedAt: new Date().toISOString()
+        }};
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'active log\\\\n', 'utf8');
+
+        const result = spawnSync(
+          process.execPath,
+          [hook, 'SessionEnd'],
+          {{
+            cwd,
+            input: JSON.stringify({{ cwd, session_id: 'session-cleanup' }}),
+            encoding: 'utf8'
+          }}
+        );
+
+        console.log(JSON.stringify({{
+          status: result.status,
+          stderr: result.stderr,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(resolveJobFile(cwd, job.id)),
+          logFileExists: fs.existsSync(job.logFile)
+        }}));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["status"] == 0, payload["stderr"]
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
 
 
 def test_codex_state_lock_order_is_one_way():

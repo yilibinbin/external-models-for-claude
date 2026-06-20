@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, updateState } from "./lib/state.mjs";
+import { loadState, removeJobSidecar, resolveStateFile, updateState } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -70,6 +70,10 @@ function cleanupSessionJobs(cwd, sessionId) {
   updateState(workspaceRoot, (state) => {
     state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
   });
+
+  for (const job of removedJobs) {
+    removeJobSidecar(workspaceRoot, job);
+  }
 }
 
 function handleSessionStart(input) {
