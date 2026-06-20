@@ -742,7 +742,7 @@ function recordBackgroundLaunchFailure(job, queuedRecord, logFile, error) {
     completedAt
   };
   appendLogLine(logFile, `Failed to start background task worker: ${errorMessage}`);
-  upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
+  if (!upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
     status: "failed",
     phase: "failed",
     pid: null,
@@ -750,7 +750,10 @@ function recordBackgroundLaunchFailure(job, queuedRecord, logFile, error) {
     ...(queuedRecord.governorVersion ? { governorVersion: queuedRecord.governorVersion } : {}),
     errorMessage,
     completedAt
-  }));
+  }))) {
+    removeBackgroundJobForEndedSession(queuedRecord);
+    return;
+  }
   writeJobFile(job.workspaceRoot, job.id, failedRecord);
 }
 
@@ -1234,14 +1237,18 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  upsertJob(workspaceRoot, {
+  if (!upsertJob(workspaceRoot, {
     id: job.id,
+    sessionId: job.sessionId,
     status: "cancelled",
     phase: "cancelled",
     pid: null,
     errorMessage: "Cancelled by user.",
     completedAt
-  });
+  })) {
+    removeJobSidecar(workspaceRoot, job);
+    throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
+  }
   writeJobFile(workspaceRoot, job.id, {
     ...existing,
     ...nextJob,

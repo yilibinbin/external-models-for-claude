@@ -1749,6 +1749,82 @@ def test_codex_background_enqueue_failure_after_session_end_does_not_write_faile
     assert payload["logFileExists"] is False
 
 
+def test_codex_cancel_after_session_end_does_not_write_cancelled_sidecar(tmp_path):
+    env = governor_env(tmp_path)
+    run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobLogFile,
+          updateState,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'cancel-ended-session',
+          status: 'running',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Cancel ended session',
+          workspaceRoot: cwd,
+          sessionId: 'session-cancel-ended',
+          pid: 99999999,
+          logFile: resolveJobLogFile(cwd, 'cancel-ended-session'),
+          request: { secret: 'cancel secret' },
+          updatedAt: new Date().toISOString()
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'cancel log\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-cancel-ended');
+        });
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(
+        ["cancel", "cancel-ended-session", "--cwd", str(tmp_path), "--json"],
+        cwd=tmp_path,
+        env=env,
+    )
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          listJobs,
+          resolveJobFile,
+          resolveJobLogFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const jobFile = resolveJobFile(cwd, 'cancel-ended-session');
+        const logFile = resolveJobLogFile(cwd, 'cancel-ended-session');
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    assert result.returncode != 0
+    assert "ended before job cancel-ended-session could be cancelled" in result.stderr
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert "cancel secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
+
+
 def test_codex_task_worker_preserves_stored_job_bindings_before_claim():
     body = js_function_body(read_text(PLUGIN / "scripts" / "codex-companion.mjs"), "handleTaskWorker")
     assert body.index("const storedJob") < body.index("const request")
@@ -2497,6 +2573,7 @@ def test_codex_stop_child_disables_heartbeat_and_progress_updates():
     assert run_tracked.count("writeJobFile(job.workspaceRoot, job.id") == 3
     assert run_tracked.count("heartbeatActive = false") >= 2
     assert run_tracked.index("upsertJob(job.workspaceRoot, runningRecord)") < run_tracked.index("writeJobFile(job.workspaceRoot, job.id, runningRecord)")
+    assert "if (!upsertJob(job.workspaceRoot, runningRecord))" in run_tracked
     assert run_tracked.index("heartbeatActive = false") < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
     assert run_tracked.index("upsertJob(job.workspaceRoot, {", run_tracked.index("const execution = await runner()")) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
     catch_index = run_tracked.index("} catch (error) {")
@@ -3417,9 +3494,13 @@ def test_codex_companion_publishes_background_and_cancel_state_before_job_file_w
     cancel = js_function_body(source, "handleCancel")
 
     assert failure.index("upsertJob(job.workspaceRoot") < failure.index("writeJobFile(job.workspaceRoot, job.id, failedRecord)")
+    assert "if (!upsertJob(job.workspaceRoot" in failure
+    assert failure.index("if (!upsertJob(job.workspaceRoot") < failure.index("writeJobFile(job.workspaceRoot, job.id, failedRecord)")
     assert enqueue.index("upsertJob(job.workspaceRoot", enqueue.index("const queuedRecord")) < enqueue.index("writeJobFile(job.workspaceRoot, job.id, queuedRecord)")
     assert enqueue.index("upsertJob(job.workspaceRoot", enqueue.index("const spawnedRecord")) < enqueue.index("writeJobFile(job.workspaceRoot, job.id, spawnedRecord)")
     assert cancel.index("upsertJob(workspaceRoot") < cancel.index("writeJobFile(workspaceRoot, job.id")
+    assert "if (!upsertJob(workspaceRoot" in cancel
+    assert "sessionId: job.sessionId" in cancel
 
 
 def test_codex_status_json_includes_liveness(tmp_path):

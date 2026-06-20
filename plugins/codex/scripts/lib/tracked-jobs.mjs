@@ -166,7 +166,10 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
+    if (!upsertJob(workspaceRoot, patch)) {
+      removeJobSidecar(workspaceRoot, { id: jobId });
+      return;
+    }
     const updated = mutateJobFile(workspaceRoot, jobId, (storedJob) => {
       if (!storedJob?.id) {
         return null;
@@ -256,7 +259,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     pid: process.pid,
     logFile: options.logFile ?? job.logFile ?? null
   };
-  upsertJob(job.workspaceRoot, runningRecord);
+  if (!upsertJob(job.workspaceRoot, runningRecord)) {
+    removeTrackedJobAfterSessionEnd(runningRecord);
+    throw new Error(`Claude session ${runningRecord.sessionId} ended before job ${runningRecord.id} could run.`);
+  }
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   writeHeartbeatIfRunning(runningRecord);
   let heartbeatActive = true;
