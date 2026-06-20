@@ -2319,7 +2319,6 @@ def test_codex_progress_updates_use_locked_job_file_mutation():
     body = js_function_body(source, "createJobProgressUpdater")
     assert "mutateJobFile(workspaceRoot, jobId" in body
     assert "upsertJob(workspaceRoot, patch)" in body
-    assert body.index("upsertJob(workspaceRoot, patch)") < body.index("mutateJobFile(workspaceRoot, jobId")
     assert "resolveJobFile(workspaceRoot, jobId)" not in body
     assert "readJobFile(jobFile)" not in body
     assert "writeJobFile(workspaceRoot, jobId" not in body
@@ -2645,7 +2644,38 @@ def test_codex_job_file_lock_enforces_runtime_order(tmp_path):
 def test_codex_progress_upsert_prune_completes_before_job_file_mutation():
     source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
     body = js_function_body(source, "createJobProgressUpdater")
-    assert body.index("upsertJob(workspaceRoot, patch)") < body.index("mutateJobFile(workspaceRoot, jobId")
+    assert body.index("mutateJobFile(workspaceRoot, jobId") < body.index("upsertJob(workspaceRoot, patch)")
+    assert "if (updated)" in body
+
+
+def test_codex_progress_update_does_not_publish_orphan_shared_job(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          createJobProgressUpdater
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          resolveJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const update = createJobProgressUpdater(cwd, 'missing-progress-job');
+        update({ phase: 'running', threadId: 'thread-1' });
+
+        console.log(JSON.stringify({
+          sharedJob: listJobs(cwd).find((job) => job.id === 'missing-progress-job') ?? null,
+          jobFileExists: fs.existsSync(resolveJobFile(cwd, 'missing-progress-job'))
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload == {
+        "sharedJob": None,
+        "jobFileExists": False,
+    }
 
 
 def test_codex_companion_publishes_background_and_cancel_state_before_job_file_writes():

@@ -104,11 +104,18 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-    mutateJobFile(workspaceRoot, jobId, (storedJob) => ({
-      ...storedJob,
-      ...patch
-    }));
+    const updated = mutateJobFile(workspaceRoot, jobId, (storedJob) => {
+      if (!storedJob?.id) {
+        return null;
+      }
+      return {
+        ...storedJob,
+        ...patch
+      };
+    });
+    if (updated) {
+      upsertJob(workspaceRoot, patch);
+    }
   };
 }
 
