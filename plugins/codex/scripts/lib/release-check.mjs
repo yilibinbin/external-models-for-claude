@@ -13,6 +13,7 @@ export const PLUGIN_CODEX_AUTHOR = { name: "OpenAI" };
 export const EXPECTED_COMMANDS = [
   "adversarial-review.md",
   "cancel.md",
+  "doctor.md",
   "rescue.md",
   "result.md",
   "review.md",

@@ -6,7 +6,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { parseArgs, normalizeArgv } from "./lib/args.mjs";
+import { parseStrictCommandInput } from "./lib/command-policy.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -22,6 +23,7 @@ import {
   } from "./lib/codex.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { doctorReport } from "./lib/doctor.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { runReleaseCheck } from "./lib/release-check.mjs";
@@ -76,6 +78,7 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
+      "  node scripts/codex-companion.mjs doctor [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
@@ -124,17 +127,6 @@ function normalizeReasoningEffort(effort) {
     );
   }
   return normalized;
-}
-
-function normalizeArgv(argv) {
-  if (argv.length === 1) {
-    const [raw] = argv;
-    if (!raw || !raw.trim()) {
-      return [];
-    }
-    return splitRawArgumentString(raw);
-  }
-  return argv;
 }
 
 function parseCommandInput(argv, config = {}) {
@@ -212,10 +204,14 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 }
 
 async function handleSetup(argv) {
-  const { options } = parseCommandInput(argv, {
+  const { options, positionals } = parseStrictCommandInput("setup", argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
+    booleanOptions: ["json", "enable-review-gate", "disable-review-gate"],
+    aliasMap: { C: "cwd" }
   });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected setup argument: ${positionals.join(" ")}`);
+  }
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
@@ -235,6 +231,30 @@ async function handleSetup(argv) {
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
+}
+
+function renderDoctorReport(report) {
+  const lines = [
+    `${report.ready ? "READY" : "NOT READY"} ${report.summary}`,
+    `node: ${report.checks.node.ok ? "ok" : "missing"}`,
+    `codex: ${report.checks.codexExecutable.ok ? "ok" : "missing"}`,
+    `claude: ${report.checks.claudeExecutable.ok ? "ok" : "missing"}`,
+    `state: ${report.stateDir.available && report.stateDir.writable ? "ok" : "unavailable"}`,
+    `installed plugin: ${report.checks.installedPlugin.ok ? "detected" : "not detected"}`
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+function handleDoctor(argv) {
+  const { options, positionals } = parseStrictCommandInput("doctor", argv, {
+    booleanOptions: ["json"]
+  });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected doctor argument: ${positionals.join(" ")}`);
+  }
+
+  const report = doctorReport(process.cwd(), process.env);
+  outputResult(options.json ? report : renderDoctorReport(report), options.json);
 }
 
 function buildAdversarialReviewPrompt(context, focusText) {
@@ -991,7 +1011,7 @@ function renderReleaseCheckDetail(detail) {
 }
 
 function handleReleaseCheck(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
+  const { options, positionals } = parseStrictCommandInput("release-check", argv, {
     booleanOptions: ["json"]
   });
   if (positionals.length > 0) {
@@ -1024,6 +1044,9 @@ async function main() {
   switch (subcommand) {
     case "setup":
       await handleSetup(argv);
+      break;
+    case "doctor":
+      handleDoctor(argv);
       break;
     case "review":
       await handleReview(argv);

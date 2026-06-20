@@ -22,6 +22,7 @@ FALLBACK_PLUGIN_CODEX_AUTHOR = {"name": "OpenAI"}
 FALLBACK_EXPECTED_COMMANDS = [
     "adversarial-review.md",
     "cancel.md",
+    "doctor.md",
     "rescue.md",
     "result.md",
     "review.md",
@@ -134,6 +135,82 @@ def run_release_check(root=ROOT, args=None):
     )
 
 
+def run_companion(args, cwd=ROOT, env=None):
+    command_env = os.environ.copy()
+    if env:
+        command_env.update(env)
+    return subprocess.run(
+        [NODE, str(PLUGIN / "scripts" / "codex-companion.mjs"), *args],
+        cwd=cwd,
+        env=command_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def write_executable(path, text):
+    path.write_text(text, encoding="utf8")
+    path.chmod(0o755)
+
+
+def fake_cli_dir(tmp_path, claude_plugin_list):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_executable(
+        bin_dir / "codex",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then\n"
+        "  printf 'codex 1.0.0\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf 'fake codex\\n'\n",
+    )
+    write_executable(
+        bin_dir / "claude",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then\n"
+        "  printf 'claude 1.0.0\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ] && [ \"$3\" = \"--json\" ]; then\n"
+        f"  printf '%s\\n' '{json.dumps(claude_plugin_list)}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf 'unexpected fake claude args: %s\\n' \"$*\" >&2\n"
+        "exit 1\n",
+    )
+    return bin_dir
+
+
+def companion_env(tmp_path, bin_dir):
+    return {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data"),
+    }
+
+
+def fenced_bash_blocks(text):
+    return re.findall(r"```bash\n(.*?)```", text, re.DOTALL)
+
+
+def js_function_body(source, name):
+    match = re.search(rf"(?:async\s+)?function\s+{re.escape(name)}\s*\([^)]*\)\s*\{{", source)
+    assert match, name
+    index = match.end()
+    depth = 1
+    while index < len(source) and depth:
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        index += 1
+    assert depth == 0, name
+    return source[match.end(): index - 1]
+
+
 def release_check_payload(result):
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -191,6 +268,11 @@ def test_codex_plugin_is_local_fork_with_openai_attribution():
     assert "validatorUnavailable: true" in version_evidence or "claude plugin validate --strict" in version_evidence
     assert "validatorUnavailable: false" in version_evidence or "validatorUnavailable: true" in version_evidence
     assert CODEX_VERSION in version_evidence or "0.2.0 fallback" in version_evidence or "fallback B" in version_evidence
+    assert "claude plugin list --json" in version_evidence
+    assert "codex@external-models-for-claude" in version_evidence
+    assert "not installed" in version_evidence.lower()
+    assert "unverified/skipped" in version_evidence.lower()
+    assert_no_machine_paths(version_evidence)
     if "validatorUnavailable: true" in version_evidence:
         assert "release blocked" in version_evidence.lower()
 
@@ -225,6 +307,12 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "Local extended version: 1.1.0-fh.1" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
+
+
+def test_codex_commands_do_not_disable_model_invocation():
+    for command_path in sorted((PLUGIN / "commands").glob("*.md")):
+        text = read_text(command_path)
+        assert "disable-model-invocation" not in text, command_path.name
 
 
 def test_machine_path_pattern_catches_common_local_path_shapes():
@@ -592,11 +680,327 @@ def test_codex_release_check_rejects_unexpected_extra_hook_commands(tmp_path):
 
 
 def test_codex_release_check_rejects_unknown_flags_and_positionals():
-    for args in [["--bogus", "--json"], ["unexpected-positional", "--json"]]:
-        result = run_release_check(args=args)
-        assert result.returncode != 0
-        assert "Unexpected release-check argument" in result.stderr
+    unknown = run_release_check(args=["--bogus", "--json"])
+    assert unknown.returncode != 0
+    assert "Unsupported option --bogus" in unknown.stderr
+    assert unknown.stdout == ""
+
+    positional = run_release_check(args=["unexpected-positional", "--json"])
+    assert positional.returncode != 0
+    assert "Unexpected release-check argument" in positional.stderr
+    assert positional.stdout == ""
+
+
+def test_codex_doctor_json_reports_local_diagnostics(tmp_path):
+    bin_dir = fake_cli_dir(tmp_path, {"plugins": []})
+    result = run_companion(
+        ["doctor", "--json"],
+        cwd=tmp_path,
+        env=companion_env(tmp_path, bin_dir),
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(tmp_path) not in result.stdout
+
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert isinstance(payload["ready"], bool)
+    assert payload["checks"]["node"]["ok"] is True
+    assert payload["checks"]["codexExecutable"]["ok"] is True
+    assert payload["checks"]["claudeExecutable"]["ok"] is True
+    assert payload["checks"]["installedPlugin"]["ok"] is False
+    assert payload["stateDir"]["available"] is True
+    assert payload["stateDir"]["writable"] is True
+    assert "basename" in payload["stateDir"]
+    assert "path" not in payload["stateDir"]
+
+    doctor_source = read_text(PLUGIN / "scripts" / "lib" / "doctor.mjs")
+    assert "ensureStateDir(cwd)" in doctor_source
+    assert "writeFileSync" in doctor_source
+    assert "probe" in doctor_source
+    assert "unlinkSync" in doctor_source
+
+
+def test_codex_doctor_omits_failed_command_output_from_json(tmp_path):
+    bin_dir = fake_cli_dir(tmp_path, {"plugins": []})
+    leaked_path = tmp_path / "private" / "codex-error.log"
+    write_executable(
+        bin_dir / "codex",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then\n"
+        f"  printf 'failed near {leaked_path}\\n'\n"
+        f"  printf 'debug file: {leaked_path}\\n' >&2\n"
+        "  exit 7\n"
+        "fi\n"
+        "exit 1\n",
+    )
+
+    result = run_companion(
+        ["doctor", "--json"],
+        cwd=tmp_path,
+        env=companion_env(tmp_path, bin_dir),
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(leaked_path) not in result.stdout
+    assert str(tmp_path) not in result.stdout
+
+    payload = json.loads(result.stdout)
+    codex_check = payload["checks"]["codexExecutable"]
+    assert codex_check["ok"] is False
+    assert codex_check["reason"] == "exit 7"
+    assert "version" not in codex_check
+
+
+def test_codex_doctor_redacts_installed_plugin_path(tmp_path):
+    install_root = tmp_path / "installed" / "codex"
+    (install_root / "scripts").mkdir(parents=True)
+    (install_root / "scripts" / "codex-companion.mjs").write_text("", encoding="utf8")
+    bin_dir = fake_cli_dir(
+        tmp_path,
+        {"plugins": [{"name": "codex", "installPath": str(install_root)}]},
+    )
+
+    result = run_companion(
+        ["doctor", "--json"],
+        cwd=tmp_path,
+        env=companion_env(tmp_path, bin_dir),
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(install_root) not in result.stdout
+    assert str(tmp_path) not in result.stdout
+
+    payload = json.loads(result.stdout)
+    installed = payload["checks"]["installedPlugin"]
+    assert installed["ok"] is True
+    assert installed["basename"] == "codex"
+    assert "installPath" not in installed
+
+
+def test_codex_doctor_treats_malformed_installed_plugin_root_as_advisory(tmp_path):
+    bin_dir = fake_cli_dir(
+        tmp_path,
+        {"plugins": [{"name": "codex", "installPath": {}}]},
+    )
+
+    result = run_companion(
+        ["doctor", "--json"],
+        cwd=tmp_path,
+        env=companion_env(tmp_path, bin_dir),
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+
+    payload = json.loads(result.stdout)
+    installed = payload["checks"]["installedPlugin"]
+    assert installed["ok"] is False
+    assert installed["advisory"] is True
+    assert installed["reason"] == "installed codex plugin entry has no supported root field"
+    assert payload["advisoryFailures"] == ["installedPlugin"]
+
+
+def test_codex_doctor_command_exists_and_is_argument_safe():
+    command_path = PLUGIN / "commands" / "doctor.md"
+    text = read_text(command_path)
+
+    assert "disable-model-invocation" not in text
+    assert "allowed-tools: Bash(node:*)" in text
+    assert '${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs' in text
+    assert "$ARGUMENTS" in text
+    for block in fenced_bash_blocks(text):
+        assert "$ARGUMENTS" not in block
+
+
+def test_codex_new_commands_reject_unsupported_flags(tmp_path):
+    bin_dir = fake_cli_dir(tmp_path, {"plugins": []})
+    env = companion_env(tmp_path, bin_dir)
+    cases = [
+        (["doctor", "--bad"], tmp_path),
+        (["release-check", "--bad"], ROOT),
+        (["setup", "--bad"], tmp_path),
+    ]
+    for args, cwd in cases:
+        result = run_companion(args, cwd=cwd, env=env)
+        assert result.returncode != 0, args
+        assert "Unsupported option --bad" in result.stderr
         assert result.stdout == ""
+
+
+def test_codex_new_commands_reject_unexpected_positionals(tmp_path):
+    bin_dir = fake_cli_dir(tmp_path, {"plugins": []})
+    env = companion_env(tmp_path, bin_dir)
+    cases = [
+        (["setup", "unexpected-positional", "--json"], tmp_path, "Unexpected setup argument"),
+        (["doctor", "unexpected-positional", "--json"], tmp_path, "Unexpected doctor argument"),
+        (["release-check", "unexpected-positional", "--json"], ROOT, "Unexpected release-check argument"),
+    ]
+    for args, cwd, expected_error in cases:
+        result = run_companion(args, cwd=cwd, env=env)
+        assert result.returncode != 0, args
+        assert expected_error in result.stderr
+        assert result.stdout == ""
+
+
+def test_codex_command_policy_rejects_missing_value():
+    result = run_companion(["setup", "--cwd"])
+    assert result.returncode != 0
+    assert "--cwd requires a value" in result.stderr
+
+
+def test_codex_command_policy_rejects_option_token_as_value():
+    result = run_companion(["setup", "--cwd", "--json"])
+    assert result.returncode != 0
+    assert "--cwd requires a value" in result.stderr
+    assert "--cwd=--json" in result.stderr
+
+
+def test_codex_command_policy_rejects_unknown_dash_token_as_value():
+    result = run_companion(["setup", "--cwd", "--bogus"])
+    assert result.returncode != 0
+    assert "--cwd requires a value" in result.stderr
+    assert "--cwd=--bogus" in result.stderr
+
+
+def test_codex_command_policy_allows_equals_values_starting_with_dash():
+    script = """
+        import { parseStrictCommandInput } from './plugins/codex/scripts/lib/command-policy.mjs';
+        const parsed = parseStrictCommandInput('review', ['--model=-1'], {
+          valueOptions: ['model']
+        });
+        console.log(JSON.stringify(parsed));
+    """
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", script],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["options"]["model"] == "-1"
+    assert payload["positionals"] == []
+
+
+def test_codex_new_commands_use_strict_command_parser():
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    args_module = read_text(PLUGIN / "scripts" / "lib" / "args.mjs")
+    command_policy = read_text(PLUGIN / "scripts" / "lib" / "command-policy.mjs")
+
+    assert "export function normalizeArgv" in args_module
+    assert "normalizeArgv" in companion
+    assert 'from "./lib/args.mjs"' in companion
+    assert 'from "./args.mjs"' in command_policy
+    assert "function normalizeArgv" not in companion
+
+    for name in ["handleSetup", "handleDoctor", "handleReleaseCheck"]:
+        body = js_function_body(companion, name)
+        assert "parseStrictCommandInput" in body
+        assert "parseCommandInput" not in body
+        assert "assertKnownOptions" not in body
+
+
+def test_codex_strict_parser_preserves_legacy_slash_argument_normalization():
+    script = """
+        import { parseArgs, normalizeArgv } from './plugins/codex/scripts/lib/args.mjs';
+        import { parseStrictCommandInput } from './plugins/codex/scripts/lib/command-policy.mjs';
+        const config = {
+          valueOptions: ['model', 'cwd'],
+          booleanOptions: ['json'],
+          aliasMap: { m: 'model', C: 'cwd' }
+        };
+        const raw = ['-m spark --json --cwd repo focus text'];
+        const tokenized = ['-m', 'spark', '--json', '--cwd', 'repo', 'focus', 'text'];
+        const legacyRaw = parseArgs(normalizeArgv(raw), config);
+        const legacyTokenized = parseArgs(normalizeArgv(tokenized), config);
+        const strictRaw = parseStrictCommandInput('review', raw, config);
+        const strictTokenized = parseStrictCommandInput('review', tokenized, config);
+        console.log(JSON.stringify({ legacyRaw, legacyTokenized, strictRaw, strictTokenized }));
+    """
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", script],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["legacyRaw"] == payload["legacyTokenized"]
+    assert payload["strictRaw"] == payload["strictTokenized"]
+    assert payload["legacyRaw"] == payload["strictRaw"]
+
+
+def test_codex_strict_command_parser_preserves_aliases_and_terminator():
+    script = """
+        import { parseStrictCommandInput } from './plugins/codex/scripts/lib/command-policy.mjs';
+        const parsed = parseStrictCommandInput('review', ['-C', 'repo', '-m', 'spark', '--', '--bad', 'focus'], {
+          valueOptions: ['cwd', 'model'],
+          aliasMap: { C: 'cwd', m: 'model' }
+        });
+        console.log(JSON.stringify(parsed));
+    """
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", script],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["options"] == {"cwd": "repo", "model": "spark"}
+    assert payload["positionals"] == ["--bad", "focus"]
+
+
+def test_codex_setup_command_does_not_interpolate_raw_arguments():
+    text = read_text(PLUGIN / "commands" / "setup.md")
+
+    assert "disable-model-invocation" not in text
+    assert "AskUserQuestion" in text
+    assert "npm install -g @openai/codex" in text
+    assert "$ARGUMENTS" in text
+    for block in fenced_bash_blocks(text):
+        assert "$ARGUMENTS" not in block
+    assert 'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json' in text
+    assert (
+        'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --enable-review-gate'
+        in text
+    )
+    assert (
+        'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --disable-review-gate'
+        in text
+    )
+
+
+def test_codex_install_consistency_parses_claude_plugin_list_schema():
+    script = """
+        import { installedCodexEntry } from './plugins/codex/scripts/lib/install-consistency.mjs';
+        const cases = [
+          installedCodexEntry([{ name: 'codex', installPath: '/tmp/codex-a' }]),
+          installedCodexEntry({ plugins: [{ id: 'codex@external-models-for-claude', path: '/tmp/codex-b' }] }),
+          installedCodexEntry(JSON.stringify({ plugins: [{ name: 'codex', root: '/tmp/codex-c' }] })),
+          installedCodexEntry({ items: [{ name: 'codex', installPath: '/tmp/wrong-shape' }] }),
+          installedCodexEntry({ plugins: [{ name: 'codex', location: '/tmp/speculative' }] })
+        ];
+        console.log(JSON.stringify(cases));
+    """
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", script],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    cases = json.loads(result.stdout)
+    assert cases[0]["installPath"] == "/tmp/codex-a"
+    assert cases[1]["installPath"] == "/tmp/codex-b"
+    assert cases[2]["installPath"] == "/tmp/codex-c"
+    assert cases[3] is None
+    assert cases[4]["installPath"] == ""
 
 
 def test_codex_release_check_allows_ci_placeholder_paths(tmp_path):

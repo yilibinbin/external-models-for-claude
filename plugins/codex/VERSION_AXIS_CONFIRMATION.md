@@ -12,6 +12,7 @@ Baseline commands:
 
 - `claude plugin validate --strict .claude-plugin/marketplace.json` exited 0.
 - `claude plugin validate --strict plugins/codex` exited 0.
+- `claude plugin list --json` live schema probe exited 0. The local `codex@external-models-for-claude` marketplace plugin was not installed, so installed Codex root compatibility is explicitly unverified/skipped and no root field was verified.
 
 Throwaway version-axis commands:
 
