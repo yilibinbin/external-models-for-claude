@@ -2170,6 +2170,283 @@ def test_codex_status_reaps_transferred_terminal_job_lease_even_if_pid_looks_ali
     assert payload == {"first": True, "released": 1, "second": True}
 
 
+def test_codex_job_lifecycle_classifies_running_suspect_and_lost():
+    payload = run_node_script(
+        """
+        import {
+          JOB_LOST_AFTER_MS,
+          JOB_SUSPECT_AFTER_MS,
+          classifyJobLiveness
+        } from './plugins/codex/scripts/lib/job-lifecycle.mjs';
+
+        const nowMs = 1_000_000;
+        const alive = () => true;
+        const dead = () => false;
+        const cases = {
+          terminal: classifyJobLiveness({ id: 'done', status: 'completed' }, { nowMs, isProcessAlive: alive }),
+          healthy: classifyJobLiveness(
+            { id: 'healthy', status: 'running', heartbeatAtMs: nowMs - 1000, pid: process.pid },
+            { nowMs, isProcessAlive: alive }
+          ),
+          suspect: classifyJobLiveness(
+            { id: 'suspect', status: 'running', heartbeatAtMs: nowMs - JOB_SUSPECT_AFTER_MS - 1, pid: process.pid },
+            { nowMs, isProcessAlive: alive }
+          ),
+          lost: classifyJobLiveness(
+            { id: 'lost', status: 'running', heartbeatAtMs: nowMs - JOB_LOST_AFTER_MS - 1, pid: process.pid },
+            { nowMs, isProcessAlive: alive }
+          ),
+          deadSuspect: classifyJobLiveness(
+            { id: 'dead-suspect', status: 'running', heartbeatAtMs: nowMs - 1000, pid: 99999999 },
+            { nowMs, isProcessAlive: dead }
+          ),
+          deadLost: classifyJobLiveness(
+            { id: 'dead-lost', status: 'running', heartbeatAtMs: nowMs - JOB_LOST_AFTER_MS - 1, pid: 99999999 },
+            { nowMs, isProcessAlive: dead }
+          ),
+          missingHeartbeat: classifyJobLiveness(
+            { id: 'missing', status: 'running', pid: process.pid },
+            { nowMs, isProcessAlive: alive }
+          )
+        };
+        console.log(JSON.stringify(cases));
+        """
+    )
+
+    assert payload["terminal"] == {"state": "terminal", "reason": "completed"}
+    assert payload["healthy"]["state"] == "healthy"
+    assert payload["healthy"]["reason"] == "heartbeat-current"
+    assert payload["suspect"]["state"] == "suspect"
+    assert payload["suspect"]["reason"] == "heartbeat-stale"
+    assert payload["lost"]["state"] == "lost"
+    assert payload["lost"]["reason"] == "heartbeat-lost"
+    assert payload["deadSuspect"]["state"] == "suspect"
+    assert payload["deadSuspect"]["reason"] == "process-not-alive"
+    assert payload["deadLost"]["state"] == "lost"
+    assert payload["deadLost"]["reason"] == "process-not-alive"
+    assert payload["missingHeartbeat"]["state"] == "lost"
+    assert payload["missingHeartbeat"]["reason"] == "heartbeat-lost"
+
+
+def test_codex_job_lifecycle_uses_updated_at_for_legacy_jobs():
+    payload = run_node_script(
+        """
+        import { JOB_SUSPECT_AFTER_MS, classifyJobLiveness } from './plugins/codex/scripts/lib/job-lifecycle.mjs';
+        const nowMs = Date.parse('2026-01-01T00:10:00.000Z');
+        const fresh = new Date(nowMs - 1000).toISOString();
+        const stale = new Date(nowMs - JOB_SUSPECT_AFTER_MS - 1).toISOString();
+        console.log(JSON.stringify({
+          fresh: classifyJobLiveness({ id: 'fresh', status: 'running', updatedAt: fresh }, { nowMs }),
+          stale: classifyJobLiveness({ id: 'stale', status: 'running', updatedAt: stale }, { nowMs })
+        }));
+        """
+    )
+
+    assert payload["fresh"]["state"] == "healthy"
+    assert payload["fresh"]["reason"] == "heartbeat-current"
+    assert payload["stale"]["state"] == "suspect"
+    assert payload["stale"]["reason"] == "heartbeat-stale"
+
+
+def test_codex_heartbeat_does_not_rewrite_global_job_state_or_terminal_jobs(tmp_path):
+    payload = run_node_script(
+        """
+        import { writeHeartbeatIfRunning } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import { listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const running = { id: 'running-heartbeat', status: 'running', workspaceRoot: cwd, heartbeatAtMs: 10, heartbeat: 'old' };
+        const terminal = { id: 'terminal-heartbeat', status: 'completed', workspaceRoot: cwd };
+        upsertJob(cwd, { ...running, sharedOnly: true });
+        writeJobFile(cwd, running.id, running);
+        upsertJob(cwd, terminal);
+        writeJobFile(cwd, terminal.id, terminal);
+        writeHeartbeatIfRunning(running, 123456, () => true);
+        writeHeartbeatIfRunning(terminal, 123456, () => true);
+        console.log(JSON.stringify({
+          sharedRunning: listJobs(cwd).find((job) => job.id === running.id),
+          storedRunning: readJobFile(resolveJobFile(cwd, running.id)),
+          storedTerminal: readJobFile(resolveJobFile(cwd, terminal.id))
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["sharedRunning"]["heartbeatAtMs"] == 10
+    assert payload["sharedRunning"]["heartbeat"] == "old"
+    assert payload["sharedRunning"]["sharedOnly"] is True
+    assert payload["storedRunning"]["heartbeatAtMs"] == 123456
+    assert payload["storedRunning"]["heartbeat"] == "1970-01-01T00:02:03.456Z"
+    assert "heartbeatAtMs" not in payload["storedTerminal"]
+
+
+def test_codex_stop_child_disables_heartbeat_and_progress_updates():
+    source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
+    heartbeat = js_function_body(source, "writeHeartbeatIfRunning")
+    progress = js_function_body(source, "createJobProgressUpdater")
+    assert 'process.env.CODEX_FOR_CLAUDE_DISABLE_HEARTBEAT === "1"' in heartbeat
+    assert 'process.env.CODEX_FOR_CLAUDE_DISABLE_PROGRESS_UPDATES === "1"' in progress
+
+
+def test_codex_progress_updates_use_locked_job_file_mutation():
+    source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
+    body = js_function_body(source, "createJobProgressUpdater")
+    assert "mutateJobFile(workspaceRoot, jobId" in body
+    assert "upsertJob(workspaceRoot, patch)" in body
+    assert body.index("upsertJob(workspaceRoot, patch)") < body.index("mutateJobFile(workspaceRoot, jobId")
+    assert "resolveJobFile(workspaceRoot, jobId)" not in body
+    assert "readJobFile(jobFile)" not in body
+    assert "writeJobFile(workspaceRoot, jobId" not in body
+
+
+def test_codex_state_preserves_liveness_fields_through_save_state(tmp_path):
+    payload = run_node_script(
+        """
+        import { listJobs, saveState } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        saveState(cwd, {
+          jobs: [{
+            id: 'liveness-state',
+            status: 'running',
+            heartbeatAtMs: 123,
+            heartbeat: '1970-01-01T00:00:00.123Z',
+            updatedAt: '1970-01-01T00:00:00.123Z'
+          }]
+        });
+        console.log(JSON.stringify({ job: listJobs(cwd)[0] }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["job"]["heartbeatAtMs"] == 123
+    assert payload["job"]["heartbeat"] == "1970-01-01T00:00:00.123Z"
+
+
+def test_codex_session_lifecycle_cleanup_uses_locked_update_state():
+    source = read_text(PLUGIN / "scripts" / "session-lifecycle-hook.mjs")
+    assert "saveState" not in source
+    assert "updateState" in source
+    cleanup = js_function_body(source, "cleanupSessionJobs")
+    assert "updateState(workspaceRoot" in cleanup
+    assert "state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId)" in cleanup
+
+
+def test_codex_state_lock_order_is_one_way():
+    source = read_text(PLUGIN / "scripts" / "lib" / "state.mjs")
+    assert "const LOCK_CONTEXT" in source
+    assert "LOCK_CONTEXT.stateDepth" in source
+    assert "LOCK_CONTEXT.jobDepth" in source
+    with_state = js_function_body(source, "withStateLock")
+    with_job = js_function_body(source, "withJobFileLock")
+    assert "LOCK_CONTEXT.jobDepth" in with_state
+    assert "state lock cannot be acquired while holding a job-file lock" in with_state
+    assert "LOCK_CONTEXT.jobDepth" in with_job
+    assert "job-file lock cannot be nested" in with_job
+
+
+def test_codex_job_file_lock_enforces_runtime_order(tmp_path):
+    payload = run_node_script(
+        """
+        import { mutateJobFile, updateState, withJobFileLock } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const nestedJob = (() => {
+          try {
+            withJobFileLock(cwd, 'job-lock-order', () => mutateJobFile(cwd, 'job-lock-order', (job) => job));
+            return null;
+          } catch (error) {
+            return error.message;
+          }
+        })();
+        const stateInsideJob = (() => {
+          try {
+            withJobFileLock(cwd, 'job-lock-order', () => updateState(cwd, () => {}));
+            return null;
+          } catch (error) {
+            return error.message;
+          }
+        })();
+        console.log(JSON.stringify({ nestedJob, stateInsideJob }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["nestedJob"] == "job-file lock cannot be nested"
+    assert payload["stateInsideJob"] == "state lock cannot be acquired while holding a job-file lock"
+
+
+def test_codex_progress_upsert_prune_completes_before_job_file_mutation():
+    source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
+    body = js_function_body(source, "createJobProgressUpdater")
+    assert body.index("upsertJob(workspaceRoot, patch)") < body.index("mutateJobFile(workspaceRoot, jobId")
+
+
+def test_codex_status_json_includes_liveness(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    run_node_script(
+        """
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const job = {
+          id: 'json-liveness',
+          status: 'running',
+          phase: 'running',
+          workspaceRoot: cwd,
+          updatedAt: new Date().toISOString(),
+          heartbeatAtMs: Date.now(),
+          heartbeat: new Date().toISOString(),
+          pid: null
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    job = next(item for item in payload["running"] if item["id"] == "json-liveness")
+    assert job["liveness"]["state"] == "healthy"
+    assert job["liveness"]["reason"] == "heartbeat-current"
+
+
+def test_codex_status_liveness_reads_per_job_heartbeat(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    run_node_script(
+        """
+        import { JOB_LOST_AFTER_MS } from './plugins/codex/scripts/lib/job-lifecycle.mjs';
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const old = new Date(Date.now() - JOB_LOST_AFTER_MS - 1000).toISOString();
+        const shared = {
+          id: 'per-job-liveness',
+          status: 'running',
+          phase: 'running',
+          workspaceRoot: cwd,
+          updatedAt: old,
+          heartbeatAtMs: Date.now() - JOB_LOST_AFTER_MS - 1000,
+          heartbeat: old,
+          pid: null
+        };
+        upsertJob(cwd, shared);
+        writeJobFile(cwd, shared.id, {
+          ...shared,
+          heartbeatAtMs: Date.now(),
+          heartbeat: new Date().toISOString()
+        });
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    job = next(item for item in payload["running"] if item["id"] == "per-job-liveness")
+    assert job["liveness"]["state"] == "healthy"
+    assert job["liveness"]["reason"] == "heartbeat-current"
+
+
 def test_codex_companion_import_is_side_effect_free():
     result = subprocess.run(
         [NODE, "--input-type=module", "-e", "await import('./plugins/codex/scripts/codex-companion.mjs')"],

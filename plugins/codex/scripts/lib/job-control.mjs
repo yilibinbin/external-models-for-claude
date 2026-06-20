@@ -1,6 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
+import { classifyJobLiveness } from "./job-lifecycle.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -158,8 +159,19 @@ function inferLegacyJobPhase(job, progressPreview = []) {
   return job.jobClass === "review" ? "reviewing" : "running";
 }
 
-export function enrichJob(job, options = {}) {
+export function latestJobForLiveness(job, workspaceRoot) {
+  if (!workspaceRoot || !job?.id) {
+    return job;
+  }
+  return {
+    ...job,
+    ...(readStoredJob(workspaceRoot, job.id) ?? {})
+  };
+}
+
+export function enrichJob(job, workspaceRoot, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
+  const livenessJob = latestJobForLiveness(job, workspaceRoot);
   const enriched = {
     ...job,
     kindLabel: getJobTypeLabel(job),
@@ -171,7 +183,8 @@ export function enrichJob(job, options = {}) {
     duration:
       job.status === "completed" || job.status === "failed" || job.status === "cancelled"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
-        : null
+        : null,
+    liveness: classifyJobLiveness(livenessJob, options.liveness ?? options)
   };
 
   return {
@@ -218,14 +231,14 @@ export function buildStatusSnapshot(workspaceRoot, options = {}) {
 
   const running = jobs
     .filter((job) => job.status === "queued" || job.status === "running")
-    .map((job) => enrichJob(job, { maxProgressLines }));
+    .map((job) => enrichJob(job, workspaceRoot, { maxProgressLines }));
 
   const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
-  const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
+  const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, workspaceRoot, { maxProgressLines }) : null;
 
   const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
     .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
-    .map((job) => enrichJob(job, { maxProgressLines }));
+    .map((job) => enrichJob(job, workspaceRoot, { maxProgressLines }));
 
   return {
     workspaceRoot,
@@ -247,7 +260,7 @@ export function buildSingleJobSnapshot(workspaceRoot, reference, options = {}) {
 
   return {
     workspaceRoot,
-    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
+    job: enrichJob(selected, workspaceRoot, { maxProgressLines: options.maxProgressLines })
   };
 }
 
