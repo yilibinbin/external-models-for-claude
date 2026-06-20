@@ -1476,7 +1476,9 @@ def test_codex_background_missing_worker_pid_releases_lease_once():
     assert body.index("!Number.isInteger(child.pid)") < body.index("transferLease(backgroundLease")
     assert 'error?.code === "ESESSIONENDED"' in body
     assert body.index('error?.code === "ESESSIONENDED"') < body.index("if (!transferred)")
-    assert body.count("backgroundLease.release()") == 2
+    assert "hasEndedSession(queuedRecord.workspaceRoot, queuedRecord.sessionId)" in body
+    assert body.index("hasEndedSession(queuedRecord.workspaceRoot, queuedRecord.sessionId)") < body.index("if (!transferred)")
+    assert body.count("backgroundLease.release()") == 3
 
 
 def test_codex_background_launch_failures_do_not_leave_active_jobs(tmp_path):
@@ -1658,6 +1660,92 @@ def test_codex_background_enqueue_aborts_when_session_ends_after_shared_publish(
     assert payload["spawnCalled"] is False
     assert payload["jobs"] == []
     assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+
+
+def test_codex_background_enqueue_failure_after_session_end_does_not_write_failed_sidecar(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { __testHooks } from './plugins/codex/scripts/codex-companion.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'task-ended-session-failure',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task: ended session failure',
+          summary: 'ended session failure',
+          write: true,
+          sessionId: 'session-ended-failure',
+          workspaceRoot: cwd
+        };
+        const request = {
+          cwd,
+          model: null,
+          effort: null,
+          prompt: 'ended session failure secret',
+          write: true,
+          resumeLast: false,
+          jobId: job.id
+        };
+        const lease = {
+          disabled: false,
+          lease: { id: 'background-job-ended-session-failure' },
+          released: false,
+          release() {
+            this.released = true;
+          }
+        };
+        let errorCode = null;
+        let errorMessage = null;
+        try {
+          __testHooks.enqueueBackgroundTask(cwd, job, request, lease, {
+            spawnTaskWorker() {
+              updateState(cwd, (state) => {
+                markSessionEnded(state, 'session-ended-failure');
+                state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-ended-failure');
+              });
+              throw new Error('spawn failed after session end');
+            },
+            transferResourceLease() {
+              return true;
+            }
+          });
+        } catch (error) {
+          errorCode = error.code ?? null;
+          errorMessage = error.message;
+        }
+        const jobFile = resolveJobFile(cwd, job.id);
+        const logFile = resolveJobLogFile(cwd, job.id);
+        console.log(JSON.stringify({
+          errorCode,
+          errorMessage,
+          released: lease.released,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        env=governor_env(tmp_path),
+        args=[str(tmp_path)],
+    )
+
+    assert payload["errorCode"] == "ESESSIONENDED"
+    assert "ended before background task" in payload["errorMessage"]
+    assert payload["released"] is True
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert "ended session failure secret" not in payload["jobFileText"]
     assert payload["logFileExists"] is False
 
 

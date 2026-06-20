@@ -761,6 +761,7 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
   const spawnTaskWorker = dependencies.spawnTaskWorker ?? spawnDetachedTaskWorker;
   const transferLease = dependencies.transferResourceLease ?? transferResourceLease;
   let transferred = false;
+  let childPid = null;
   const queuedRecord = {
     ...job,
     status: "queued",
@@ -789,6 +790,7 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
     throwIfBackgroundSessionEnded(queuedRecord);
 
     const child = spawnTaskWorker(cwd, job.id);
+    childPid = child.pid;
     if (!Number.isInteger(child.pid) || child.pid <= 0) {
       throw new Error("Failed to start background task worker: missing worker pid.");
     }
@@ -817,6 +819,11 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
     if (error?.code === "ESESSIONENDED") {
       backgroundLease.release();
       throw error;
+    }
+    if (queuedRecord.sessionId && hasEndedSession(queuedRecord.workspaceRoot, queuedRecord.sessionId)) {
+      backgroundLease.release();
+      removeBackgroundJobForEndedSession(queuedRecord, childPid);
+      throw backgroundSessionEndedError(queuedRecord);
     }
     if (!transferred) {
       backgroundLease.release();
