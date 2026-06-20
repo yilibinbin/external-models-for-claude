@@ -2539,6 +2539,51 @@ def test_codex_state_preserves_liveness_fields_through_save_state(tmp_path):
     assert payload["job"]["heartbeat"] == "1970-01-01T00:00:00.123Z"
 
 
+def test_codex_state_upsert_rejects_ended_session_jobs(tmp_path):
+    payload = run_node_script(
+        """
+        import {
+          listJobs,
+          markSessionEnded,
+          updateState,
+          upsertJob
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        upsertJob(cwd, {
+          id: 'existing-ended-session',
+          status: 'running',
+          sessionId: 'session-upsert-ended',
+          workspaceRoot: cwd
+        });
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-upsert-ended');
+        });
+        const minimalApplied = upsertJob(cwd, {
+          id: 'existing-ended-session',
+          phase: 'running'
+        });
+        const directApplied = upsertJob(cwd, {
+          id: 'direct-ended-session',
+          status: 'running',
+          sessionId: 'session-upsert-ended',
+          workspaceRoot: cwd
+        });
+
+        console.log(JSON.stringify({
+          minimalApplied,
+          directApplied,
+          jobs: listJobs(cwd)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["minimalApplied"] is False
+    assert payload["directApplied"] is False
+    assert payload["jobs"] == []
+
+
 def test_codex_state_uses_required_slice_contracts():
     source = read_text(PLUGIN / "scripts" / "lib" / "state.mjs")
     save_state = js_function_body(source, "saveState")
@@ -2815,12 +2860,14 @@ def test_codex_session_lifecycle_cleanup_uses_locked_update_state():
     assert "saveState" not in source
     assert "updateState" in source
     assert "removeJobSidecar" in source
+    assert "listJobSidecars" in source
     cleanup = js_function_body(source, "cleanupSessionJobs")
     assert "updateState(workspaceRoot" in cleanup
     assert "markSessionEnded(state, sessionId)" in cleanup
     assert "let removedJobs = []" in cleanup
     assert "removedJobs = state.jobs.filter((job) => job.sessionId === sessionId)" in cleanup
     assert "state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId)" in cleanup
+    assert "for (const job of listJobSidecars(workspaceRoot))" in cleanup
     assert cleanup.index("removedJobs = state.jobs.filter((job) => job.sessionId === sessionId)") < cleanup.index("state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId)")
     assert cleanup.index("updateState(workspaceRoot") < cleanup.index("removeJobSidecar(workspaceRoot, job)")
 
@@ -3016,6 +3063,72 @@ def test_codex_session_lifecycle_records_ended_session_without_jobs(tmp_path):
     assert payload["status"] == 0, payload["stderr"]
     assert payload["ended"] is True
     assert payload["jobs"] == []
+
+
+def test_codex_session_lifecycle_removes_pruned_active_sidecars(tmp_path):
+    payload = run_node_script(
+        f"""
+        import fs from 'node:fs';
+        import {{ spawnSync }} from 'node:child_process';
+        import {{
+          listJobs,
+          resolveJobFile,
+          resolveJobLogFile,
+          saveState,
+          writeJobFile
+        }} from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const hook = {json.dumps(str(PLUGIN / "scripts" / "session-lifecycle-hook.mjs"))};
+        const active = {{
+          id: 'session-pruned-active-cleanup',
+          status: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-pruned-cleanup',
+          pid: 99999999,
+          request: {{ secret: 'pruned active secret' }},
+          logFile: resolveJobLogFile(cwd, 'session-pruned-active-cleanup'),
+          updatedAt: '2000-01-01T00:00:00.000Z'
+        }};
+        writeJobFile(cwd, active.id, active);
+        fs.writeFileSync(active.logFile, 'pruned active log\\\\n', 'utf8');
+        const newerJobs = Array.from({{ length: 51 }}, (_, index) => ({{
+          id: `newer-job-${{index}}`,
+          status: 'completed',
+          workspaceRoot: cwd,
+          sessionId: `other-session-${{index}}`,
+          updatedAt: new Date(Date.now() + index).toISOString()
+        }}));
+        saveState(cwd, {{ jobs: [active, ...newerJobs] }});
+
+        const result = spawnSync(
+          process.execPath,
+          [hook, 'SessionEnd'],
+          {{
+            cwd,
+            input: JSON.stringify({{ cwd, session_id: 'session-pruned-cleanup' }}),
+            encoding: 'utf8'
+          }}
+        );
+        const jobFile = resolveJobFile(cwd, active.id);
+
+        console.log(JSON.stringify({{
+          status: result.status,
+          stderr: result.stderr,
+          sharedHasActive: listJobs(cwd).some((job) => job.id === active.id),
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(active.logFile)
+        }}));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["status"] == 0, payload["stderr"]
+    assert payload["sharedHasActive"] is False
+    assert payload["jobFileExists"] is False
+    assert "pruned active secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
 
 
 def test_codex_state_lock_order_is_one_way():

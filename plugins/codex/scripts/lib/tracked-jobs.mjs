@@ -183,7 +183,9 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     if (cleanupTrackedJobIfSessionEnded(updated)) {
       return;
     }
-    upsertJob(workspaceRoot, sharedProgressJobPatch(updated));
+    if (!upsertJob(workspaceRoot, sharedProgressJobPatch(updated))) {
+      removeTrackedJobAfterSessionEnd(updated);
+    }
   };
 }
 
@@ -280,8 +282,9 @@ export async function runTrackedJob(job, runner, options = {}) {
     if (cleanupTrackedJobIfSessionEnded(runningRecord)) {
       return execution;
     }
-    upsertJob(job.workspaceRoot, {
+    if (!upsertJob(job.workspaceRoot, {
       id: job.id,
+      sessionId: runningRecord.sessionId,
       status: completionStatus,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
@@ -289,7 +292,10 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,
       completedAt
-    });
+    })) {
+      removeTrackedJobAfterSessionEnd(runningRecord);
+      return execution;
+    }
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
@@ -315,14 +321,18 @@ export async function runTrackedJob(job, runner, options = {}) {
     }
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
-    upsertJob(job.workspaceRoot, {
+    if (!upsertJob(job.workspaceRoot, {
       id: job.id,
+      sessionId: runningRecord.sessionId,
       status: "failed",
       phase: "failed",
       pid: null,
       errorMessage,
       completedAt
-    });
+    })) {
+      removeTrackedJobAfterSessionEnd(runningRecord);
+      throw error;
+    }
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",

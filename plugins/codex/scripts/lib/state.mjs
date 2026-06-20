@@ -315,15 +315,23 @@ export function generateJobId(prefix = "job") {
 }
 
 export function upsertJob(cwd, jobPatch) {
-  return updateState(cwd, (state) => {
+  let applied = false;
+  updateState(cwd, (state) => {
     const timestamp = nowIso();
     const existingIndex = state.jobs.findIndex((job) => job.id === jobPatch.id);
+    const existing = existingIndex === -1 ? null : state.jobs[existingIndex];
+    const sessionId = jobPatch.sessionId ?? existing?.sessionId ?? null;
+    if (stateHasEndedSession(state, sessionId)) {
+      state.jobs = state.jobs.filter((job) => job.id !== jobPatch.id);
+      return;
+    }
     if (existingIndex === -1) {
       state.jobs.unshift({
         createdAt: timestamp,
         updatedAt: timestamp,
         ...jobPatch
       });
+      applied = true;
       return;
     }
     state.jobs[existingIndex] = {
@@ -331,7 +339,9 @@ export function upsertJob(cwd, jobPatch) {
       ...jobPatch,
       updatedAt: timestamp
     };
+    applied = true;
   });
+  return applied;
 }
 
 export function listJobs(cwd) {
@@ -357,6 +367,21 @@ export function writeJobFile(cwd, jobId, payload) {
 
 export function readJobFile(jobFile) {
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
+}
+
+export function listJobSidecars(cwd) {
+  ensureStateDir(cwd);
+  return fs.readdirSync(resolveJobsDir(cwd))
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => {
+      try {
+        const job = readJobFile(path.join(resolveJobsDir(cwd), name));
+        return job?.id ? job : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
 }
 
 export function mutateJobFile(cwd, jobId, mutate) {
