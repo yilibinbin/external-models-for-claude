@@ -92,10 +92,16 @@ function sharedProgressJobPatch(job) {
   return shared;
 }
 
-function removeOrphanProgressPatch(workspaceRoot, jobId) {
+function removeOrphanProgressPatch(workspaceRoot, jobId, terminalJob = null) {
   updateState(workspaceRoot, (state) => {
     const existing = state.jobs.find((job) => job.id === jobId);
     if (!existing) {
+      return;
+    }
+    if (["completed", "failed", "cancelled"].includes(existing.status)) {
+      if (terminalJob?.id === jobId && ["completed", "failed", "cancelled"].includes(terminalJob.status)) {
+        state.jobs = state.jobs.map((job) => (job.id === jobId ? sharedProgressJobPatch(terminalJob) : job));
+      }
       return;
     }
     if (stateHasEndedSession(state, existing.sessionId)) {
@@ -183,7 +189,16 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       };
     });
     if (!updated) {
-      removeOrphanProgressPatch(workspaceRoot, jobId);
+      let terminalJob = null;
+      try {
+        const storedJob = readJobFile(resolveJobFile(workspaceRoot, jobId));
+        if (["completed", "failed", "cancelled"].includes(storedJob?.status)) {
+          terminalJob = storedJob;
+        }
+      } catch {
+        // Missing sidecars are handled by removing only the progress patch below.
+      }
+      removeOrphanProgressPatch(workspaceRoot, jobId, terminalJob);
       return;
     }
     if (cleanupTrackedJobIfSessionEnded(updated)) {
@@ -305,7 +320,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       removeTrackedJobAfterSessionEnd(runningRecord);
       return execution;
     }
-    writeJobFile(job.workspaceRoot, job.id, {
+    const completedJobFile = writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
       threadId: execution.threadId ?? null,
@@ -316,7 +331,9 @@ export async function runTrackedJob(job, runner, options = {}) {
       result: execution.payload,
       rendered: execution.rendered
     });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    if (completedJobFile) {
+      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    }
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);

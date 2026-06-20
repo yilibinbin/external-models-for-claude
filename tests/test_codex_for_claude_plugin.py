@@ -2576,6 +2576,8 @@ def test_codex_stop_child_disables_heartbeat_and_progress_updates():
     assert "if (!upsertJob(job.workspaceRoot, runningRecord))" in run_tracked
     assert run_tracked.index("heartbeatActive = false") < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
     assert run_tracked.index("upsertJob(job.workspaceRoot, {", run_tracked.index("const execution = await runner()")) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
+    assert "const completedJobFile = writeJobFile(job.workspaceRoot, job.id" in run_tracked
+    assert run_tracked.index("if (completedJobFile)") < run_tracked.index("appendLogBlock(")
     catch_index = run_tracked.index("} catch (error) {")
     assert run_tracked.index("heartbeatActive = false", catch_index) < run_tracked.index("readStoredJobOrNull", catch_index)
     assert run_tracked.index("upsertJob(job.workspaceRoot, {", catch_index) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", catch_index)
@@ -2588,8 +2590,7 @@ def test_codex_progress_updates_use_locked_job_file_mutation():
     assert "mutateJobFile(workspaceRoot, jobId" in body
     assert "upsertJob(workspaceRoot, patch)" in body
     assert "upsertJob(workspaceRoot, sharedProgressJobPatch(updated))" in body
-    assert "resolveJobFile(workspaceRoot, jobId)" not in body
-    assert "readJobFile(jobFile)" not in body
+    assert body.index("mutateJobFile(workspaceRoot, jobId") < body.index("readJobFile(resolveJobFile(workspaceRoot, jobId))")
     assert "writeJobFile(workspaceRoot, jobId" not in body
 
 
@@ -3313,11 +3314,12 @@ def test_codex_progress_upsert_prune_completes_before_job_file_mutation():
     body = js_function_body(source, "createJobProgressUpdater")
     assert "function sharedProgressJobPatch(job)" in source
     assert "pruneJobFiles: false" in js_function_body(source, "removeOrphanProgressPatch")
+    assert "sharedProgressJobPatch(terminalJob)" in js_function_body(source, "removeOrphanProgressPatch")
     assert "request," in js_function_body(source, "sharedProgressJobPatch")
     assert "result," in js_function_body(source, "sharedProgressJobPatch")
     assert body.index("upsertJob(workspaceRoot, patch)") < body.index("mutateJobFile(workspaceRoot, jobId")
     assert body.index("mutateJobFile(workspaceRoot, jobId") < body.index("upsertJob(workspaceRoot, sharedProgressJobPatch(updated))")
-    assert "removeOrphanProgressPatch(workspaceRoot, jobId)" in body
+    assert "removeOrphanProgressPatch(workspaceRoot, jobId, terminalJob)" in body
     assert "if (!updated)" in body
 
 
@@ -3510,6 +3512,49 @@ def test_codex_progress_update_ignores_terminal_sidecar_without_republish(tmp_pa
     assert "threadId" not in payload["stored"]
 
 
+def test_codex_progress_update_preserves_shared_terminal_job(tmp_path):
+    payload = run_node_script(
+        """
+        import {
+          createJobProgressUpdater
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'progress-shared-terminal',
+          status: 'completed',
+          phase: 'done',
+          workspaceRoot: cwd,
+          threadId: 'thread-final',
+          turnId: 'turn-final',
+          completedAt: new Date().toISOString(),
+          updatedAt: '2026-01-01T00:00:00.000Z'
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        const update = createJobProgressUpdater(cwd, job.id);
+        update({ phase: 'running', threadId: 'thread-late-progress' });
+
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert len(payload["jobs"]) == 1
+    job = payload["jobs"][0]
+    assert job["status"] == "completed"
+    assert job["phase"] == "done"
+    assert job["threadId"] == "thread-final"
+    assert job["turnId"] == "turn-final"
+
+
 def test_codex_run_tracked_job_completion_after_session_end_does_not_republish_result(tmp_path):
     payload = run_node_script(
         """
@@ -3573,6 +3618,79 @@ def test_codex_run_tracked_job_completion_after_session_end_does_not_republish_r
     assert payload["jobFileExists"] is False
     assert "terminal secret" not in payload["jobFileText"]
     assert payload["logFileExists"] is False
+
+
+def test_codex_run_tracked_job_does_not_recreate_log_when_terminal_write_rejected(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+
+        const cwd = process.argv[1];
+        const originalRenameSync = fs.renameSync;
+        let injected = false;
+        fs.renameSync = function patchedRenameSync(from, to) {
+          originalRenameSync.call(this, from, to);
+          if (injected || !String(to).endsWith('/state.json')) {
+            return;
+          }
+          try {
+            const state = JSON.parse(fs.readFileSync(to, 'utf8'));
+            const hasCompleted = state.jobs?.some((job) => job.id === 'terminal-log-race' && job.status === 'completed');
+            if (!hasCompleted) {
+              return;
+            }
+            injected = true;
+            state.endedSessions = [...(state.endedSessions || []), 'session-terminal-log-race'];
+            state.jobs = state.jobs.filter((job) => job.id !== 'terminal-log-race');
+            fs.writeFileSync(to, `${JSON.stringify(state, null, 2)}\\n`, 'utf8');
+          } catch {
+            // Non-state files or transient partial reads are irrelevant for this test.
+          }
+        };
+
+        const tracked = await import('./plugins/codex/scripts/lib/tracked-jobs.mjs');
+        const state = await import('./plugins/codex/scripts/lib/state.mjs');
+        const job = {
+          id: 'terminal-log-race',
+          status: 'queued',
+          kind: 'task',
+          title: 'Terminal log race',
+          workspaceRoot: cwd,
+          sessionId: 'session-terminal-log-race',
+          phase: 'queued',
+          pid: null,
+          logFile: state.resolveJobLogFile(cwd, 'terminal-log-race')
+        };
+        const execution = await tracked.runTrackedJob(
+          job,
+          async () => ({
+            exitStatus: 0,
+            threadId: 'thread-log-race',
+            turnId: 'turn-log-race',
+            summary: 'terminal log summary',
+            payload: { secret: 'terminal log secret' },
+            rendered: 'terminal log rendered secret'
+          }),
+          { logFile: job.logFile }
+        );
+        const jobFile = state.resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          executionStatus: execution.exitStatus,
+          jobs: state.listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile),
+          logFileText: fs.existsSync(job.logFile) ? fs.readFileSync(job.logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["executionStatus"] == 0
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+    assert "terminal log rendered secret" not in payload["logFileText"]
 
 
 def test_codex_companion_publishes_background_and_cancel_state_before_job_file_writes():
