@@ -1474,7 +1474,9 @@ def test_codex_background_missing_worker_pid_releases_lease_once():
     assert "child.pid" in body
     assert "backgroundLease.release()" in body
     assert body.index("!Number.isInteger(child.pid)") < body.index("transferLease(backgroundLease")
-    assert body.count("backgroundLease.release()") == 1
+    assert 'error?.code === "ESESSIONENDED"' in body
+    assert body.index('error?.code === "ESESSIONENDED"') < body.index("if (!transferred)")
+    assert body.count("backgroundLease.release()") == 2
 
 
 def test_codex_background_launch_failures_do_not_leave_active_jobs(tmp_path):
@@ -1567,6 +1569,96 @@ def test_codex_background_enqueue_success_preserves_sanitized_shared_metadata(tm
     assert "request" not in shared_job
     assert "backgroundLeaseId" not in shared_job
     assert payload["storedRequestBackgroundLeaseId"] == "background-job-success"
+
+
+def test_codex_background_enqueue_aborts_when_session_ends_after_shared_publish(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { __testHooks } from './plugins/codex/scripts/codex-companion.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'task-ended-session-race',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task: ended session race',
+          summary: 'ended session race',
+          write: true,
+          sessionId: 'session-ended-race',
+          workspaceRoot: cwd
+        };
+        const request = {
+          cwd,
+          model: null,
+          effort: null,
+          prompt: 'ended session race',
+          write: true,
+          resumeLast: false,
+          jobId: job.id
+        };
+        const lease = {
+          disabled: false,
+          lease: { id: 'background-job-ended-session-race' },
+          released: false,
+          release() {
+            this.released = true;
+          }
+        };
+        let spawnCalled = false;
+        let errorCode = null;
+        let errorMessage = null;
+        try {
+          __testHooks.enqueueBackgroundTask(cwd, job, request, lease, {
+            afterQueuedStatePublished() {
+              updateState(cwd, (state) => {
+                markSessionEnded(state, 'session-ended-race');
+                state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-ended-race');
+              });
+            },
+            spawnTaskWorker() {
+              spawnCalled = true;
+              return { pid: 12345 };
+            },
+            transferResourceLease() {
+              return true;
+            }
+          });
+        } catch (error) {
+          errorCode = error.code ?? null;
+          errorMessage = error.message;
+        }
+        const jobFile = resolveJobFile(cwd, job.id);
+        const logFile = resolveJobLogFile(cwd, job.id);
+        console.log(JSON.stringify({
+          errorCode,
+          errorMessage,
+          released: lease.released,
+          spawnCalled,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        env=governor_env(tmp_path),
+        args=[str(tmp_path)],
+    )
+
+    assert payload["errorCode"] == "ESESSIONENDED"
+    assert "ended before background task" in payload["errorMessage"]
+    assert payload["released"] is True
+    assert payload["spawnCalled"] is False
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
 
 
 def test_codex_task_worker_preserves_stored_job_bindings_before_claim():
@@ -2637,6 +2729,7 @@ def test_codex_session_lifecycle_cleanup_uses_locked_update_state():
     assert "removeJobSidecar" in source
     cleanup = js_function_body(source, "cleanupSessionJobs")
     assert "updateState(workspaceRoot" in cleanup
+    assert "markSessionEnded(state, sessionId)" in cleanup
     assert "let removedJobs = []" in cleanup
     assert "removedJobs = state.jobs.filter((job) => job.sessionId === sessionId)" in cleanup
     assert "state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId)" in cleanup
@@ -2799,6 +2892,42 @@ def test_codex_session_lifecycle_cleanup_removes_jobs_added_after_snapshot(tmp_p
     assert payload["initialLogFileExists"] is False
     assert payload["injectedJobFileExists"] is False
     assert payload["injectedLogFileExists"] is False
+
+
+def test_codex_session_lifecycle_records_ended_session_without_jobs(tmp_path):
+    payload = run_node_script(
+        f"""
+        import {{ spawnSync }} from 'node:child_process';
+        import {{
+          hasEndedSession,
+          listJobs
+        }} from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const hook = {json.dumps(str(PLUGIN / "scripts" / "session-lifecycle-hook.mjs"))};
+        const result = spawnSync(
+          process.execPath,
+          [hook, 'SessionEnd'],
+          {{
+            cwd,
+            input: JSON.stringify({{ cwd, session_id: 'session-empty-cleanup' }}),
+            encoding: 'utf8'
+          }}
+        );
+
+        console.log(JSON.stringify({{
+          status: result.status,
+          stderr: result.stderr,
+          ended: hasEndedSession(cwd, 'session-empty-cleanup'),
+          jobs: listJobs(cwd)
+        }}));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["status"] == 0, payload["stderr"]
+    assert payload["ended"] is True
+    assert payload["jobs"] == []
 
 
 def test_codex_state_lock_order_is_one_way():

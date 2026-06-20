@@ -30,8 +30,11 @@ import { runReleaseCheck } from "./lib/release-check.mjs";
 import {
   generateJobId,
   getConfig,
+  hasEndedSession,
   listJobs,
+  removeJobSidecar,
   setConfig,
+  updateState,
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
@@ -699,6 +702,34 @@ function sharedBackgroundJobPatch(job, patch) {
   };
 }
 
+function backgroundSessionEndedError(job) {
+  const error = new Error(`Claude session ${job.sessionId} ended before background task ${job.id} could start.`);
+  error.code = "ESESSIONENDED";
+  return error;
+}
+
+function removeBackgroundJobForEndedSession(job, childPid = null) {
+  if (Number.isInteger(childPid) && childPid > 0) {
+    try {
+      terminateProcessTree(childPid);
+    } catch {
+      // Best-effort cleanup only; the session lifecycle hook also tears down matching jobs.
+    }
+  }
+  updateState(job.workspaceRoot, (state) => {
+    state.jobs = state.jobs.filter((item) => item.id !== job.id);
+  });
+  removeJobSidecar(job.workspaceRoot, job);
+}
+
+function throwIfBackgroundSessionEnded(job, childPid = null) {
+  if (!job.sessionId || !hasEndedSession(job.workspaceRoot, job.sessionId)) {
+    return;
+  }
+  removeBackgroundJobForEndedSession(job, childPid);
+  throw backgroundSessionEndedError(job);
+}
+
 function recordBackgroundLaunchFailure(job, queuedRecord, logFile, error) {
   const errorMessage = error instanceof Error ? error.message : String(error);
   const completedAt = nowIso();
@@ -744,6 +775,7 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
   };
 
   try {
+    throwIfBackgroundSessionEnded(queuedRecord);
     upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
       status: "queued",
       phase: "queued",
@@ -751,7 +783,10 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
       logFile,
       ...(governorEnabledLease ? { governorVersion: 1 } : {})
     }));
+    dependencies.afterQueuedStatePublished?.(queuedRecord);
+    throwIfBackgroundSessionEnded(queuedRecord);
     writeJobFile(job.workspaceRoot, job.id, queuedRecord);
+    throwIfBackgroundSessionEnded(queuedRecord);
 
     const child = spawnTaskWorker(cwd, job.id);
     if (!Number.isInteger(child.pid) || child.pid <= 0) {
@@ -762,6 +797,7 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
       throw new Error("Failed to transfer background resource lease to task worker.");
     }
     transferred = governorEnabledLease;
+    throwIfBackgroundSessionEnded(queuedRecord, child.pid);
 
     const spawnedRecord = {
       ...queuedRecord,
@@ -774,8 +810,14 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
       logFile,
       ...(governorEnabledLease ? { governorVersion: 1 } : {})
     }));
+    throwIfBackgroundSessionEnded(spawnedRecord, child.pid);
     writeJobFile(job.workspaceRoot, job.id, spawnedRecord);
+    throwIfBackgroundSessionEnded(spawnedRecord, child.pid);
   } catch (error) {
+    if (error?.code === "ESESSIONENDED") {
+      backgroundLease.release();
+      throw error;
+    }
     if (!transferred) {
       backgroundLease.release();
     }

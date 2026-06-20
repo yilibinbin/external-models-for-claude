@@ -12,6 +12,7 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const MAX_ENDED_SESSIONS = 50;
 const LOCK_STALE_AFTER_MS = 30000;
 const FILE_LOCK_WAIT_ENV = "CODEX_FOR_CLAUDE_FILE_LOCK_WAIT_MS";
 const DEFAULT_FILE_LOCK_WAIT_MS = LOCK_STALE_AFTER_MS + 5000;
@@ -31,6 +32,7 @@ function defaultState() {
     config: {
       stopReviewGate: false
     },
+    endedSessions: [],
     jobs: []
   };
 }
@@ -79,11 +81,36 @@ export function loadState(cwd) {
         ...defaultState().config,
         ...(parsed.config ?? {})
       },
+      endedSessions: normalizeEndedSessions(parsed.endedSessions),
       jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
     };
   } catch {
     return defaultState();
   }
+}
+
+function normalizeEndedSessions(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => String(item ?? "").trim()).filter(Boolean).slice(-MAX_ENDED_SESSIONS);
+}
+
+export function markSessionEnded(state, sessionId) {
+  const normalizedSessionId = String(sessionId ?? "").trim();
+  if (!normalizedSessionId) {
+    return;
+  }
+  const existing = normalizeEndedSessions(state.endedSessions).filter((item) => item !== normalizedSessionId);
+  state.endedSessions = [...existing, normalizedSessionId].slice(-MAX_ENDED_SESSIONS);
+}
+
+export function hasEndedSession(cwd, sessionId) {
+  const normalizedSessionId = String(sessionId ?? "").trim();
+  if (!normalizedSessionId) {
+    return false;
+  }
+  return normalizeEndedSessions(loadState(cwd).endedSessions).includes(normalizedSessionId);
 }
 
 function pruneJobs(jobs) {
@@ -215,6 +242,7 @@ export function saveStateUnlocked(cwd, state, previousJobs = []) {
       ...defaultState().config,
       ...(state.config ?? {})
     },
+    endedSessions: normalizeEndedSessions(state.endedSessions),
     jobs: nextJobs
   };
 

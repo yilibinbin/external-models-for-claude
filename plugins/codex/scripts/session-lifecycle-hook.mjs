@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, removeJobSidecar, resolveStateFile, updateState } from "./lib/state.mjs";
+import { loadState, markSessionEnded, removeJobSidecar, updateState } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -44,11 +44,6 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const stateFile = resolveStateFile(workspaceRoot);
-  if (!fs.existsSync(stateFile)) {
-    return;
-  }
-
   const state = loadState(workspaceRoot);
   const initiallyRemovedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
   const initiallyRemovedIds = new Set(initiallyRemovedJobs.map((job) => job.id));
@@ -71,6 +66,7 @@ function cleanupSessionJobs(cwd, sessionId) {
 
   let removedJobs = [];
   updateState(workspaceRoot, (state) => {
+    markSessionEnded(state, sessionId);
     removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
     state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
   });
