@@ -96,6 +96,14 @@ function normalizeEndedSessions(value) {
   return value.map((item) => String(item ?? "").trim()).filter(Boolean).slice(-MAX_ENDED_SESSIONS);
 }
 
+export function stateHasEndedSession(state, sessionId) {
+  const normalizedSessionId = String(sessionId ?? "").trim();
+  if (!normalizedSessionId) {
+    return false;
+  }
+  return normalizeEndedSessions(state?.endedSessions).includes(normalizedSessionId);
+}
+
 export function markSessionEnded(state, sessionId) {
   const normalizedSessionId = String(sessionId ?? "").trim();
   if (!normalizedSessionId) {
@@ -106,11 +114,7 @@ export function markSessionEnded(state, sessionId) {
 }
 
 export function hasEndedSession(cwd, sessionId) {
-  const normalizedSessionId = String(sessionId ?? "").trim();
-  if (!normalizedSessionId) {
-    return false;
-  }
-  return normalizeEndedSessions(loadState(cwd).endedSessions).includes(normalizedSessionId);
+  return stateHasEndedSession(loadState(cwd), sessionId);
 }
 
 function pruneJobs(jobs) {

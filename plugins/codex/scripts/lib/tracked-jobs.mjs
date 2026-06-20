@@ -2,7 +2,18 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { JOB_HEARTBEAT_INTERVAL_MS } from "./job-lifecycle.mjs";
-import { mutateJobFile, readJobFile, resolveJobFile, resolveJobLogFile, updateState, upsertJob, writeJobFile } from "./state.mjs";
+import {
+  hasEndedSession,
+  mutateJobFile,
+  readJobFile,
+  removeJobSidecar,
+  resolveJobFile,
+  resolveJobLogFile,
+  stateHasEndedSession,
+  updateState,
+  upsertJob,
+  writeJobFile
+} from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -87,6 +98,10 @@ function removeOrphanProgressPatch(workspaceRoot, jobId) {
     if (!existing) {
       return;
     }
+    if (stateHasEndedSession(state, existing.sessionId)) {
+      state.jobs = state.jobs.filter((job) => job.id !== jobId);
+      return;
+    }
     const hasLifecycleFields = existing.status
       || existing.kind
       || existing.title
@@ -98,6 +113,21 @@ function removeOrphanProgressPatch(workspaceRoot, jobId) {
       state.jobs = state.jobs.filter((job) => job.id !== jobId);
     }
   });
+}
+
+function removeTrackedJobAfterSessionEnd(job) {
+  updateState(job.workspaceRoot, (state) => {
+    state.jobs = state.jobs.filter((item) => item.id !== job.id);
+  });
+  removeJobSidecar(job.workspaceRoot, job);
+}
+
+function cleanupTrackedJobIfSessionEnded(job) {
+  if (!job?.sessionId || !hasEndedSession(job.workspaceRoot, job.sessionId)) {
+    return false;
+  }
+  removeTrackedJobAfterSessionEnd(job);
+  return true;
 }
 
 export function createJobProgressUpdater(workspaceRoot, jobId) {
@@ -148,6 +178,9 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     });
     if (!updated) {
       removeOrphanProgressPatch(workspaceRoot, jobId);
+      return;
+    }
+    if (cleanupTrackedJobIfSessionEnded(updated)) {
       return;
     }
     upsertJob(workspaceRoot, sharedProgressJobPatch(updated));
@@ -209,6 +242,10 @@ export function writeHeartbeatIfRunning(job, nowMs = null, isRunning = null) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
+  if (cleanupTrackedJobIfSessionEnded(job)) {
+    throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could run.`);
+  }
+
   const runningRecord = {
     ...job,
     status: "running",
@@ -240,6 +277,9 @@ export async function runTrackedJob(job, runner, options = {}) {
       clearInterval(heartbeat);
       heartbeat = null;
     }
+    if (cleanupTrackedJobIfSessionEnded(runningRecord)) {
+      return execution;
+    }
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: completionStatus,
@@ -269,6 +309,9 @@ export async function runTrackedJob(job, runner, options = {}) {
     if (heartbeat) {
       clearInterval(heartbeat);
       heartbeat = null;
+    }
+    if (cleanupTrackedJobIfSessionEnded(runningRecord)) {
+      throw error;
     }
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();

@@ -3173,6 +3173,130 @@ def test_codex_progress_update_restores_complete_active_shared_job(tmp_path):
     assert "backgroundLeaseId" not in shared
 
 
+def test_codex_progress_update_after_session_end_removes_sidecar_without_republish(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          createJobProgressUpdater
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'progress-ended-session',
+          status: 'running',
+          kind: 'task',
+          title: 'Progress ended session',
+          workspaceRoot: cwd,
+          sessionId: 'session-progress-ended',
+          phase: 'starting',
+          pid: process.pid,
+          request: { secret: 'progress secret' },
+          logFile: resolveJobLogFile(cwd, 'progress-ended-session'),
+          updatedAt: new Date().toISOString()
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'progress log\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-progress-ended');
+          state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-progress-ended');
+        });
+
+        const update = createJobProgressUpdater(cwd, job.id);
+        update({ phase: 'running', threadId: 'thread-ended' });
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(job.logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert "progress secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
+
+
+def test_codex_run_tracked_job_completion_after_session_end_does_not_republish_result(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          runTrackedJob
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'terminal-ended-session',
+          status: 'queued',
+          kind: 'task',
+          title: 'Terminal ended session',
+          workspaceRoot: cwd,
+          sessionId: 'session-terminal-ended',
+          phase: 'queued',
+          pid: null,
+          logFile: resolveJobLogFile(cwd, 'terminal-ended-session')
+        };
+        const execution = await runTrackedJob(
+          job,
+          async () => {
+            updateState(cwd, (state) => {
+              markSessionEnded(state, 'session-terminal-ended');
+              state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-terminal-ended');
+            });
+            return {
+              exitStatus: 0,
+              threadId: 'thread-terminal',
+              turnId: 'turn-terminal',
+              summary: 'terminal summary',
+              payload: { secret: 'terminal secret' },
+              rendered: 'terminal rendered secret'
+            };
+          },
+          { logFile: job.logFile }
+        );
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          executionStatus: execution.exitStatus,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(job.logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["executionStatus"] == 0
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert "terminal secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
+
+
 def test_codex_companion_publishes_background_and_cancel_state_before_job_file_writes():
     source = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
     failure = js_function_body(source, "recordBackgroundLaunchFailure")
