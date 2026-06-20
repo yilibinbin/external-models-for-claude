@@ -2296,9 +2296,10 @@ def test_codex_heartbeat_does_not_rewrite_global_job_state_or_terminal_jobs(tmp_
     assert payload["sharedRunning"]["heartbeat"] == "old"
     assert payload["sharedRunning"]["sharedOnly"] is True
     assert payload["storedRunning"]["heartbeatAtMs"] == 123456
-    assert payload["storedRunning"]["heartbeat"] == "1970-01-01T00:02:03.456Z"
-    assert payload["runningResult"]["heartbeatAtMs"] == 123456
-    assert payload["terminalResult"] is None
+    assert payload["storedRunning"]["heartbeatAt"] == "1970-01-01T00:02:03.456Z"
+    assert payload["storedRunning"]["heartbeat"] == "old"
+    assert payload["runningResult"] is True
+    assert payload["terminalResult"] is False
     assert payload["terminalMtimeUnchanged"] is True
     assert "heartbeatAtMs" not in payload["storedTerminal"]
 
@@ -2328,6 +2329,7 @@ def test_codex_progress_updates_use_locked_job_file_mutation():
     source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
     body = js_function_body(source, "createJobProgressUpdater")
     assert "mutateJobFile(workspaceRoot, jobId" in body
+    assert "upsertJob(workspaceRoot, patch)" in body
     assert "upsertJob(workspaceRoot, sharedProgressJobPatch(updated))" in body
     assert "resolveJobFile(workspaceRoot, jobId)" not in body
     assert "readJobFile(jobFile)" not in body
@@ -2755,8 +2757,10 @@ def test_codex_progress_upsert_prune_completes_before_job_file_mutation():
     assert "function sharedProgressJobPatch(job)" in source
     assert "request," in js_function_body(source, "sharedProgressJobPatch")
     assert "result," in js_function_body(source, "sharedProgressJobPatch")
+    assert body.index("upsertJob(workspaceRoot, patch)") < body.index("mutateJobFile(workspaceRoot, jobId")
     assert body.index("mutateJobFile(workspaceRoot, jobId") < body.index("upsertJob(workspaceRoot, sharedProgressJobPatch(updated))")
-    assert "if (updated)" in body
+    assert "removeOrphanProgressPatch(workspaceRoot, jobId)" in body
+    assert "if (!updated)" in body
 
 
 def test_codex_progress_update_does_not_publish_orphan_shared_job(tmp_path):

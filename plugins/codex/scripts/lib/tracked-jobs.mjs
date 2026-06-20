@@ -2,7 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { JOB_HEARTBEAT_INTERVAL_MS } from "./job-lifecycle.mjs";
-import { mutateJobFile, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { mutateJobFile, readJobFile, resolveJobFile, resolveJobLogFile, updateState, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -81,6 +81,25 @@ function sharedProgressJobPatch(job) {
   return shared;
 }
 
+function removeOrphanProgressPatch(workspaceRoot, jobId) {
+  updateState(workspaceRoot, (state) => {
+    const existing = state.jobs.find((job) => job.id === jobId);
+    if (!existing) {
+      return;
+    }
+    const hasLifecycleFields = existing.status
+      || existing.kind
+      || existing.title
+      || existing.workspaceRoot
+      || existing.logFile
+      || existing.pid
+      || existing.sessionId;
+    if (!hasLifecycleFields) {
+      state.jobs = state.jobs.filter((job) => job.id !== jobId);
+    }
+  });
+}
+
 export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
@@ -117,6 +136,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
+    upsertJob(workspaceRoot, patch);
     const updated = mutateJobFile(workspaceRoot, jobId, (storedJob) => {
       if (!storedJob?.id) {
         return null;
@@ -126,9 +146,11 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
         ...patch
       };
     });
-    if (updated) {
-      upsertJob(workspaceRoot, sharedProgressJobPatch(updated));
+    if (!updated) {
+      removeOrphanProgressPatch(workspaceRoot, jobId);
+      return;
     }
+    upsertJob(workspaceRoot, sharedProgressJobPatch(updated));
   };
 }
 
@@ -157,35 +179,34 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
-function writeHeartbeatIfRunning(job, nowMs = null, isRunning = null) {
+export function writeHeartbeatIfRunning(job, nowMs = null, isRunning = null) {
   if (process.env.CODEX_FOR_CLAUDE_DISABLE_HEARTBEAT === "1") {
-    return null;
+    return false;
   }
   if (!job?.workspaceRoot || !job?.id) {
-    return null;
+    return false;
   }
   if (job.status !== "queued" && job.status !== "running") {
-    return null;
+    return false;
   }
   const shouldWrite = isRunning ?? (() => true);
   if (!shouldWrite()) {
-    return null;
+    return false;
   }
 
   const heartbeatAtMs = Number.isFinite(nowMs) ? nowMs : Date.now();
-  return mutateJobFile(job.workspaceRoot, job.id, (storedJob) => {
-    if (storedJob.status !== "queued" && storedJob.status !== "running") {
+  const updated = mutateJobFile(job.workspaceRoot, job.id, (storedJob) => {
+    if (!storedJob?.id || !storedJob.status || ["completed", "failed", "cancelled"].includes(storedJob.status)) {
       return null;
     }
     return {
       ...storedJob,
       heartbeatAtMs,
-      heartbeat: new Date(heartbeatAtMs).toISOString()
+      heartbeatAt: new Date(heartbeatAtMs).toISOString()
     };
   });
+  return Boolean(updated);
 }
-
-export { writeHeartbeatIfRunning };
 
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = {
