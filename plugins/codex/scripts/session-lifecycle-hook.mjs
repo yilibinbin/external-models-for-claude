@@ -50,26 +50,40 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
-  }
+  const initiallyRemovedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  const initiallyRemovedIds = new Set(initiallyRemovedJobs.map((job) => job.id));
 
-  for (const job of removedJobs) {
+  const terminateJob = (job) => {
     const stillRunning = job.status === "queued" || job.status === "running";
     if (!stillRunning) {
-      continue;
+      return;
     }
     try {
       terminateProcessTree(job.pid ?? Number.NaN);
     } catch {
       // Ignore teardown failures during session shutdown.
     }
+  };
+
+  for (const job of initiallyRemovedJobs) {
+    terminateJob(job);
   }
 
+  let removedJobs = [];
   updateState(workspaceRoot, (state) => {
+    removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
     state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
   });
+
+  if (removedJobs.length === 0) {
+    return;
+  }
+
+  for (const job of removedJobs) {
+    if (!initiallyRemovedIds.has(job.id)) {
+      terminateJob(job);
+    }
+  }
 
   for (const job of removedJobs) {
     removeJobSidecar(workspaceRoot, job);

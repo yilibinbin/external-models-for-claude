@@ -2637,7 +2637,10 @@ def test_codex_session_lifecycle_cleanup_uses_locked_update_state():
     assert "removeJobSidecar" in source
     cleanup = js_function_body(source, "cleanupSessionJobs")
     assert "updateState(workspaceRoot" in cleanup
+    assert "let removedJobs = []" in cleanup
+    assert "removedJobs = state.jobs.filter((job) => job.sessionId === sessionId)" in cleanup
     assert "state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId)" in cleanup
+    assert cleanup.index("removedJobs = state.jobs.filter((job) => job.sessionId === sessionId)") < cleanup.index("state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId)")
     assert cleanup.index("updateState(workspaceRoot") < cleanup.index("removeJobSidecar(workspaceRoot, job)")
 
 
@@ -2695,6 +2698,107 @@ def test_codex_session_lifecycle_cleanup_removes_active_sidecars(tmp_path):
     assert payload["jobs"] == []
     assert payload["jobFileExists"] is False
     assert payload["logFileExists"] is False
+
+
+def test_codex_session_lifecycle_cleanup_removes_jobs_added_after_snapshot(tmp_path):
+    payload = run_node_script(
+        f"""
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import {{ spawnSync }} from 'node:child_process';
+        import {{
+          listJobs,
+          resolveJobFile,
+          resolveJobLogFile,
+          resolveStateFile,
+          upsertJob,
+          writeJobFile
+        }} from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const hook = {json.dumps(str(PLUGIN / "scripts" / "session-lifecycle-hook.mjs"))};
+        const initialJob = {{
+          id: 'session-snapshot-cleanup',
+          status: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-cleanup-race',
+          pid: 99999999,
+          request: {{ secret: 'initial' }},
+          logFile: resolveJobLogFile(cwd, 'session-snapshot-cleanup'),
+          updatedAt: new Date().toISOString()
+        }};
+        const injectedJob = {{
+          id: 'session-injected-cleanup',
+          status: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-cleanup-race',
+          pid: 99999999,
+          request: {{ secret: 'injected' }},
+          logFile: resolveJobLogFile(cwd, 'session-injected-cleanup'),
+          updatedAt: new Date().toISOString()
+        }};
+        upsertJob(cwd, initialJob);
+        writeJobFile(cwd, initialJob.id, initialJob);
+        fs.writeFileSync(initialJob.logFile, 'initial log\\\\n', 'utf8');
+
+        const preload = path.join(cwd, 'inject-after-first-state-read.cjs');
+        fs.writeFileSync(preload, `
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const originalReadFileSync = fs.readFileSync;
+          let injected = false;
+          fs.readFileSync = function patchedReadFileSync(file, ...args) {{
+            const result = originalReadFileSync.call(this, file, ...args);
+            if (!injected && String(file) === process.env.CODEX_TEST_STATE_FILE) {{
+              injected = true;
+              const job = JSON.parse(process.env.CODEX_TEST_INJECT_JOB);
+              const state = JSON.parse(String(result));
+              state.jobs = [...(state.jobs || []), job];
+              fs.writeFileSync(process.env.CODEX_TEST_STATE_FILE, JSON.stringify(state, null, 2) + "\\\\n", 'utf8');
+              fs.mkdirSync(path.dirname(process.env.CODEX_TEST_INJECT_JOB_FILE), {{ recursive: true }});
+              fs.writeFileSync(process.env.CODEX_TEST_INJECT_JOB_FILE, JSON.stringify(job, null, 2) + "\\\\n", 'utf8');
+              fs.writeFileSync(job.logFile, 'injected log\\\\n', 'utf8');
+            }}
+            return result;
+          }};
+        `, 'utf8');
+
+        const result = spawnSync(
+          process.execPath,
+          [hook, 'SessionEnd'],
+          {{
+            cwd,
+            input: JSON.stringify({{ cwd, session_id: 'session-cleanup-race' }}),
+            encoding: 'utf8',
+            env: {{
+              ...process.env,
+              NODE_OPTIONS: `--require ${{preload}}`,
+              CODEX_TEST_STATE_FILE: resolveStateFile(cwd),
+              CODEX_TEST_INJECT_JOB: JSON.stringify(injectedJob),
+              CODEX_TEST_INJECT_JOB_FILE: resolveJobFile(cwd, injectedJob.id)
+            }}
+          }}
+        );
+
+        console.log(JSON.stringify({{
+          status: result.status,
+          stderr: result.stderr,
+          jobs: listJobs(cwd),
+          initialJobFileExists: fs.existsSync(resolveJobFile(cwd, initialJob.id)),
+          initialLogFileExists: fs.existsSync(initialJob.logFile),
+          injectedJobFileExists: fs.existsSync(resolveJobFile(cwd, injectedJob.id)),
+          injectedLogFileExists: fs.existsSync(injectedJob.logFile)
+        }}));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["status"] == 0, payload["stderr"]
+    assert payload["jobs"] == []
+    assert payload["initialJobFileExists"] is False
+    assert payload["initialLogFileExists"] is False
+    assert payload["injectedJobFileExists"] is False
+    assert payload["injectedLogFileExists"] is False
 
 
 def test_codex_state_lock_order_is_one_way():
