@@ -104,7 +104,7 @@ def test_claude_marketplace_lists_antigravity_for_claude():
 
     assert marketplace["name"] == "external-models-for-claude"
     assert marketplace["metadata"]["description"]
-    assert marketplace["metadata"]["version"] == "0.1.0"
+    assert marketplace["metadata"]["version"] == "0.2.0"
     plugins = {item["name"]: item for item in marketplace["plugins"]}
     assert plugins["antigravity-for-claude"]["source"] == "./plugins/antigravity-for-claude"
     assert plugins["antigravity-for-claude"]["version"] == "0.1.0"

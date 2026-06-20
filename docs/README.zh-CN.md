@@ -7,6 +7,7 @@
 - `codex`：OpenAI 官方 Codex for Claude Code 插件，用于 Codex 审阅和任务委托。
 - `gemini-for-claude`：通过 Gemini CLI 提供只读审阅、计划审阅、scorecard、角色包、多任务、GitHub Actions 模板和可选 Stop gate。
 - `antigravity-for-claude`：通过 Antigravity CLI 提供只读审阅、计划审阅、scorecard、多任务、GitHub Actions 模板，并支持显式选择 Gemini 或 Claude provider。
+- `claude-for-claude`：通过隔离的 Claude CLI 子进程提供只读审阅、计划审阅、scorecard、角色包、多任务、GitHub Actions 模板和可选 Stop gate。
 
 ## 安装
 
@@ -15,6 +16,7 @@ claude plugin marketplace add yilibinbin/external-models-for-claude --scope user
 claude plugin install codex@external-models-for-claude --scope user
 claude plugin install gemini-for-claude@external-models-for-claude --scope user
 claude plugin install antigravity-for-claude@external-models-for-claude --scope user
+claude plugin install claude-for-claude@external-models-for-claude --scope user
 ```
 
 安装后请重载 Claude Code 插件。
@@ -27,6 +29,7 @@ claude plugin install antigravity-for-claude@external-models-for-claude --scope 
 /codex:setup
 /gemini-for-claude:setup
 /antigravity-for-claude:setup
+/claude-for-claude:doctor
 ```
 
 Antigravity 可以显式选择 provider：
@@ -47,6 +50,7 @@ claude plugin validate --strict .claude-plugin/marketplace.json
 claude plugin validate --strict plugins/codex
 claude plugin validate --strict plugins/gemini-for-claude
 claude plugin validate --strict plugins/antigravity-for-claude
+claude plugin validate --strict plugins/claude-for-claude
 python3 -m pytest -q
 ```
 
@@ -56,4 +60,4 @@ python3 -m pytest -q
 
 `plugins/codex` 是 OpenAI 官方插件，使用 Apache-2.0 许可。请见 `plugins/codex/LICENSE` 和 `plugins/codex/NOTICE`。
 
-本仓库 marketplace 文件以及 `gemini-for-claude`、`antigravity-for-claude` 默认使用 MIT 许可，除非具体文件另有说明。
+本仓库 marketplace 文件以及 `gemini-for-claude`、`antigravity-for-claude`、`claude-for-claude` 默认使用 MIT 许可，除非具体文件另有说明。

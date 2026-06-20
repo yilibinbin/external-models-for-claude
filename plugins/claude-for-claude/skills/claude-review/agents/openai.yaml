@@ -1,0 +1,5 @@
+interface:
+  display_name: "Claude Review"
+  short_description: "Run read-only Claude CLI review from Claude Code"
+  brand_color: "#4F46E5"
+  default_prompt: "Use Claude for Claude to run a read-only Claude review of the current git changes and summarize actionable findings."

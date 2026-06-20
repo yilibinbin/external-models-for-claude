@@ -7,6 +7,7 @@
 - `codex`: OpenAI's official Claude Code plugin for Codex review and delegation.
 - `gemini-for-claude`: Gemini CLI review, planning, scorecards, role packs, tracked jobs, GitHub Actions workflow rendering, and opt-in stop gates.
 - `antigravity-for-claude`: Antigravity CLI review, planning, scorecards, tracked jobs, GitHub Actions workflow rendering, and explicit Gemini/Claude provider selection.
+- `claude-for-claude`: Isolated Claude CLI child-process review, planning, scorecards, role packs, tracked jobs, GitHub Actions workflow rendering, and opt-in stop gates.
 
 ## Installation
 
@@ -15,6 +16,7 @@ claude plugin marketplace add yilibinbin/external-models-for-claude --scope user
 claude plugin install codex@external-models-for-claude --scope user
 claude plugin install gemini-for-claude@external-models-for-claude --scope user
 claude plugin install antigravity-for-claude@external-models-for-claude --scope user
+claude plugin install claude-for-claude@external-models-for-claude --scope user
 ```
 
 Reload Claude Code plugins after installing.
@@ -27,6 +29,7 @@ Run the setup command for the plugin you install:
 /codex:setup
 /gemini-for-claude:setup
 /antigravity-for-claude:setup
+/claude-for-claude:doctor
 ```
 
 For Antigravity provider selection:
@@ -47,6 +50,7 @@ claude plugin validate --strict .claude-plugin/marketplace.json
 claude plugin validate --strict plugins/codex
 claude plugin validate --strict plugins/gemini-for-claude
 claude plugin validate --strict plugins/antigravity-for-claude
+claude plugin validate --strict plugins/claude-for-claude
 python3 -m pytest -q
 ```
 
@@ -56,4 +60,4 @@ Live provider smoke tests are opt-in because they consume provider quota and dep
 
 `plugins/codex` is OpenAI's official plugin, licensed under Apache-2.0. See `plugins/codex/LICENSE` and `plugins/codex/NOTICE`.
 
-The marketplace files plus `gemini-for-claude` and `antigravity-for-claude` are MIT licensed unless a file states otherwise.
+The marketplace files plus `gemini-for-claude`, `antigravity-for-claude`, and `claude-for-claude` are MIT licensed unless a file states otherwise.

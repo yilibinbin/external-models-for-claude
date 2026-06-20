@@ -1,0 +1,22 @@
+{
+  "name": "claude-for-claude",
+  "version": "0.1.0",
+  "description": "Use Claude CLI from Claude Code for read-only review, planning, scorecard quality loops, role-pack review teams, advisory coordination, tracked jobs, and opt-in stop gates.",
+  "author": {
+    "name": "fanghao",
+    "url": "https://github.com/yilibinbin"
+  },
+  "homepage": "https://github.com/yilibinbin/external-models-for-claude",
+  "repository": "https://github.com/yilibinbin/external-models-for-claude",
+  "license": "MIT",
+  "keywords": [
+    "claude",
+    "claude-cli",
+    "claude-code",
+    "review",
+    "planning",
+    "multi-model",
+    "code-review",
+    "hooks"
+  ]
+}
