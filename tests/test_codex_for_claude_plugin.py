@@ -2371,6 +2371,49 @@ def test_codex_state_pruned_job_files_are_removed_under_job_file_lock():
     assert "removeJobFile" not in save_unlocked
 
 
+def test_codex_state_skips_pruned_file_delete_when_job_reappears(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          listJobs,
+          removePrunedJobFiles,
+          resolveJobFile,
+          resolveJobLogFile,
+          saveState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'reappeared-job',
+          status: 'running',
+          workspaceRoot: cwd,
+          updatedAt: new Date().toISOString()
+        };
+        const logFile = resolveJobLogFile(cwd, job.id);
+        saveState(cwd, { jobs: [job] });
+        writeJobFile(cwd, job.id, { ...job, progress: 'new job file' });
+        fs.writeFileSync(logFile, 'new log\\n', 'utf8');
+
+        removePrunedJobFiles(cwd, [{ ...job, logFile }], []);
+
+        console.log(JSON.stringify({
+          stateHasJob: listJobs(cwd).some((item) => item.id === job.id),
+          jobFileExists: fs.existsSync(resolveJobFile(cwd, job.id)),
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload == {
+        "stateHasJob": True,
+        "jobFileExists": True,
+        "logFileExists": True,
+    }
+
+
 def test_codex_state_file_lock_wait_env_controls_timeout(tmp_path):
     state_source = read_text(PLUGIN / "scripts" / "lib" / "state.mjs")
     assert "CODEX_FOR_CLAUDE_FILE_LOCK_WAIT_MS" in state_source

@@ -229,6 +229,10 @@ export function removePrunedJobFiles(cwd, previousJobs, nextJobs) {
       continue;
     }
     withJobFileLock(cwd, job.id, () => {
+      const currentState = loadState(cwd);
+      if ((currentState.jobs ?? []).some((currentJob) => currentJob.id === job.id)) {
+        return;
+      }
       removeJobFile(resolveJobFile(cwd, job.id));
       removeFileIfExists(job.logFile);
     });
