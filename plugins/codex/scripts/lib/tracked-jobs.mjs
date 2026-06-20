@@ -68,6 +68,19 @@ export function createJobRecord(base, options = {}) {
   };
 }
 
+function sharedProgressJobPatch(job) {
+  const {
+    request,
+    result,
+    rendered,
+    backgroundLease,
+    backgroundLeaseId,
+    lease,
+    ...shared
+  } = job;
+  return shared;
+}
+
 export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
@@ -114,7 +127,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       };
     });
     if (updated) {
-      upsertJob(workspaceRoot, patch);
+      upsertJob(workspaceRoot, sharedProgressJobPatch(updated));
     }
   };
 }

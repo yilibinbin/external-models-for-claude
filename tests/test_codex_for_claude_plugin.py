@@ -2318,7 +2318,7 @@ def test_codex_progress_updates_use_locked_job_file_mutation():
     source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
     body = js_function_body(source, "createJobProgressUpdater")
     assert "mutateJobFile(workspaceRoot, jobId" in body
-    assert "upsertJob(workspaceRoot, patch)" in body
+    assert "upsertJob(workspaceRoot, sharedProgressJobPatch(updated))" in body
     assert "resolveJobFile(workspaceRoot, jobId)" not in body
     assert "readJobFile(jobFile)" not in body
     assert "writeJobFile(workspaceRoot, jobId" not in body
@@ -2684,7 +2684,10 @@ def test_codex_job_file_lock_enforces_runtime_order(tmp_path):
 def test_codex_progress_upsert_prune_completes_before_job_file_mutation():
     source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
     body = js_function_body(source, "createJobProgressUpdater")
-    assert body.index("mutateJobFile(workspaceRoot, jobId") < body.index("upsertJob(workspaceRoot, patch)")
+    assert "function sharedProgressJobPatch(job)" in source
+    assert "request," in js_function_body(source, "sharedProgressJobPatch")
+    assert "result," in js_function_body(source, "sharedProgressJobPatch")
+    assert body.index("mutateJobFile(workspaceRoot, jobId") < body.index("upsertJob(workspaceRoot, sharedProgressJobPatch(updated))")
     assert "if (updated)" in body
 
 
@@ -2716,6 +2719,65 @@ def test_codex_progress_update_does_not_publish_orphan_shared_job(tmp_path):
         "sharedJob": None,
         "jobFileExists": False,
     }
+
+
+def test_codex_progress_update_restores_complete_active_shared_job(tmp_path):
+    payload = run_node_script(
+        """
+        import {
+          createJobProgressUpdater
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          removePrunedJobFiles,
+          resolveJobLogFile,
+          saveState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'active-pruned-restore',
+          status: 'running',
+          kind: 'task',
+          title: 'Active restore',
+          workspaceRoot: cwd,
+          phase: 'starting',
+          pid: process.pid,
+          sessionId: 'session-1',
+          request: { secret: true },
+          result: { heavy: true },
+          rendered: 'large output',
+          backgroundLeaseId: 'lease-1',
+          logFile: resolveJobLogFile(cwd, 'active-pruned-restore'),
+          updatedAt: new Date().toISOString()
+        };
+        saveState(cwd, { jobs: [] });
+        writeJobFile(cwd, job.id, job);
+        removePrunedJobFiles(cwd, [job], []);
+
+        const update = createJobProgressUpdater(cwd, job.id);
+        update({ phase: 'running', threadId: 'thread-1' });
+        const sharedJob = listJobs(cwd).find((item) => item.id === job.id) ?? null;
+
+        console.log(JSON.stringify({ sharedJob }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    shared = payload["sharedJob"]
+    assert shared["id"] == "active-pruned-restore"
+    assert shared["status"] == "running"
+    assert shared["workspaceRoot"] == str(tmp_path)
+    assert shared["kind"] == "task"
+    assert shared["title"] == "Active restore"
+    assert shared["phase"] == "running"
+    assert shared["threadId"] == "thread-1"
+    assert shared["logFile"]
+    assert "request" not in shared
+    assert "result" not in shared
+    assert "rendered" not in shared
+    assert "backgroundLeaseId" not in shared
 
 
 def test_codex_companion_publishes_background_and_cancel_state_before_job_file_writes():
