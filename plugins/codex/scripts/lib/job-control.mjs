@@ -160,12 +160,22 @@ function inferLegacyJobPhase(job, progressPreview = []) {
 }
 
 export function latestJobForLiveness(job, workspaceRoot) {
-  if (!workspaceRoot || !job?.id) {
+  const root = job.workspaceRoot ?? workspaceRoot;
+  if (!root || !job?.id) {
+    return job;
+  }
+  let stored = null;
+  try {
+    stored = readStoredJob(root, job.id);
+  } catch {
+    stored = null;
+  }
+  if (stored?.id !== job.id) {
     return job;
   }
   return {
     ...job,
-    ...(readStoredJob(workspaceRoot, job.id) ?? {})
+    ...stored
   };
 }
 

@@ -40,10 +40,6 @@ function resolveHeartbeatMs(job) {
   if (Number.isFinite(job?.heartbeatAtMs)) {
     return job.heartbeatAtMs;
   }
-  const heartbeat = Date.parse(job?.heartbeat ?? "");
-  if (Number.isFinite(heartbeat)) {
-    return heartbeat;
-  }
   const updatedAt = Date.parse(job?.updatedAt ?? "");
   if (Number.isFinite(updatedAt)) {
     return updatedAt;

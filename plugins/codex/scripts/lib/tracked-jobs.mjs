@@ -179,15 +179,26 @@ export async function runTrackedJob(job, runner, options = {}) {
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
   writeHeartbeatIfRunning(runningRecord);
-  const heartbeat = process.env.CODEX_FOR_CLAUDE_DISABLE_HEARTBEAT === "1"
-    ? null
-    : setInterval(() => writeHeartbeatIfRunning(runningRecord), JOB_HEARTBEAT_INTERVAL_MS);
+  let heartbeatActive = true;
+  let heartbeat = null;
+  if (process.env.CODEX_FOR_CLAUDE_DISABLE_HEARTBEAT !== "1") {
+    heartbeat = setInterval(() => {
+      if (heartbeatActive) {
+        writeHeartbeatIfRunning(runningRecord);
+      }
+    }, JOB_HEARTBEAT_INTERVAL_MS);
+  }
   heartbeat?.unref?.();
 
   try {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
+    heartbeatActive = false;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = null;
+    }
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
@@ -213,6 +224,11 @@ export async function runTrackedJob(job, runner, options = {}) {
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
+    heartbeatActive = false;
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = null;
+    }
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
@@ -234,6 +250,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     });
     throw error;
   } finally {
+    heartbeatActive = false;
     if (heartbeat) {
       clearInterval(heartbeat);
     }

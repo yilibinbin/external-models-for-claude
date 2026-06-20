@@ -13,6 +13,8 @@ const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 const LOCK_STALE_AFTER_MS = 30000;
+const FILE_LOCK_WAIT_ENV = "CODEX_FOR_CLAUDE_FILE_LOCK_WAIT_MS";
+const DEFAULT_FILE_LOCK_WAIT_MS = LOCK_STALE_AFTER_MS + 5000;
 
 export const LOCK_CONTEXT = {
   stateDepth: 0,
@@ -101,8 +103,20 @@ function sleepSync(ms) {
   Atomics.wait(shared, 0, 0, ms);
 }
 
+function resolveFileLockWaitMs() {
+  const rawValue = process.env[FILE_LOCK_WAIT_ENV];
+  if (rawValue != null && rawValue !== "") {
+    const parsed = Number(rawValue);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_FILE_LOCK_WAIT_MS;
+}
+
 function acquireLock(lockDir) {
   const startedAt = Date.now();
+  const waitMs = resolveFileLockWaitMs();
   while (true) {
     try {
       fs.mkdirSync(lockDir, { recursive: false });
@@ -126,7 +140,7 @@ function acquireLock(lockDir) {
       } catch {
         continue;
       }
-      if (Date.now() - startedAt > LOCK_STALE_AFTER_MS) {
+      if (Date.now() - startedAt > waitMs) {
         throw new Error(`Timed out acquiring lock ${lockDir}`);
       }
       sleepSync(20);
@@ -190,7 +204,7 @@ export function writeAtomicJson(filePath, payload) {
   return filePath;
 }
 
-export function saveStateUnlocked(cwd, state) {
+export function saveStateUnlocked(cwd, state, previousJobs = []) {
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
     version: STATE_VERSION,
@@ -214,32 +228,36 @@ export function removePrunedJobFiles(cwd, previousJobs, nextJobs) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
+    withJobFileLock(cwd, job.id, () => {
+      removeJobFile(resolveJobFile(cwd, job.id));
+      removeFileIfExists(job.logFile);
+    });
   }
 }
 
 export function saveState(cwd, state) {
-  let previousJobs = [];
+  const previousJobs = (state.jobs ?? []).slice();
   const nextState = withStateLock(cwd, () => {
-    previousJobs = loadState(cwd).jobs;
-    return saveStateUnlocked(cwd, state);
+    return saveStateUnlocked(cwd, state, previousJobs);
   });
 
   removePrunedJobFiles(cwd, previousJobs, nextState.jobs);
   return nextState;
 }
 
-export function updateState(cwd, mutate) {
-  let previousJobs = [];
-  const nextState = withStateLock(cwd, () => {
-    const state = loadState(cwd);
-    previousJobs = state.jobs;
-    mutate(state);
-    return saveStateUnlocked(cwd, state);
+export function updateState(cwd, mutator) {
+  let nextState;
+  let prunedPreviousJobs = [];
+  nextState = withStateLock(cwd, () => {
+    const current = loadState(cwd);
+    const previousJobs = current.jobs.slice();
+    prunedPreviousJobs = previousJobs;
+    mutator(current);
+    nextState = saveStateUnlocked(cwd, current, previousJobs);
+    return nextState;
   });
 
-  removePrunedJobFiles(cwd, previousJobs, nextState.jobs);
+  removePrunedJobFiles(cwd, prunedPreviousJobs, nextState.jobs);
   return nextState;
 }
 
