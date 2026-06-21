@@ -5645,11 +5645,12 @@ def test_codex_status_uses_active_sidecar_when_partial_shared_progress_row_exist
 
 def test_codex_status_omits_tombstoned_sidecar_only_active_job(tmp_path):
     env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
-    run_node_script(
+    setup_payload = run_node_script(
         """
         import fs from 'node:fs';
         import {
           markSessionEnded,
+          resolveJobFile,
           resolveJobLogFile,
           updateState,
           writeJobFile
@@ -5675,7 +5676,10 @@ def test_codex_status_omits_tombstoned_sidecar_only_active_job(tmp_path):
           markSessionEnded(state, 'session-status-tombstoned-sidecar');
           state.jobs = state.jobs.filter((item) => item.id !== job.id);
         });
-        console.log(JSON.stringify({ ok: true }));
+        console.log(JSON.stringify({
+          jobFile: resolveJobFile(cwd, job.id),
+          logFile: job.logFile
+        }));
         """,
         env=env,
         args=[str(tmp_path)],
@@ -5683,11 +5687,13 @@ def test_codex_status_omits_tombstoned_sidecar_only_active_job(tmp_path):
 
     result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
     assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
-    text = json.dumps(payload)
-    assert all(job["id"] != "status-tombstoned-sidecar-only" for job in payload["running"])
+    status_payload = json.loads(result.stdout)
+    text = json.dumps(status_payload)
+    assert all(job["id"] != "status-tombstoned-sidecar-only" for job in status_payload["running"])
     assert "PRIVATE_TOMBSTONED_REQUEST" not in text
     assert "PRIVATE_TOMBSTONED_LOG" not in text
+    assert not pathlib.Path(setup_payload["jobFile"]).exists()
+    assert not pathlib.Path(setup_payload["logFile"]).exists()
 
 
 def test_codex_status_rechecks_tombstone_while_merging_sidecars(tmp_path):
@@ -5862,9 +5868,7 @@ def test_codex_status_rechecks_tombstone_after_progress_log_read(tmp_path):
     text = json.dumps(payload["snapshot"])
     assert payload["injected"] is True
     assert "PRIVATE_PROGRESS_READ_RACE" not in text
-    for job in payload["snapshot"]["running"]:
-        if job["id"] == "status-progress-read-race":
-            assert job["progressPreview"] == []
+    assert all(job["id"] != "status-progress-read-race" for job in payload["snapshot"]["running"])
 
 
 def test_codex_single_status_filters_current_session_unless_all(tmp_path):

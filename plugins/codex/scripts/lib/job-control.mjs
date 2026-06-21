@@ -72,6 +72,10 @@ function hasEndedSessionFresh(workspaceRoot, sessionId) {
   return stateHasEndedSession(loadState(workspaceRoot), sessionId);
 }
 
+function jobSessionEndedFresh(job, workspaceRoot) {
+  return hasEndedSessionFresh(job.workspaceRoot ?? workspaceRoot, job.sessionId);
+}
+
 export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES, options = {}) {
   if (!logFile || !fs.existsSync(logFile)) {
     return [];
@@ -329,6 +333,7 @@ function listStatusJobs(workspaceRoot) {
     }
     if (stateHasEndedSession(state, job.sessionId) || hasEndedSessionFresh(workspaceRoot, job.sessionId)) {
       byId.delete(job.id);
+      removeJobSidecar(workspaceRoot, job);
       continue;
     }
     const existing = byId.get(job.id);
@@ -348,21 +353,24 @@ export function buildStatusSnapshot(workspaceRoot, options = {}) {
 
   const running = jobs
     .filter((job) => job.status === "queued" || job.status === "running")
-    .map((job) => enrichJob(job, workspaceRoot, { maxProgressLines }));
+    .map((job) => enrichJob(job, workspaceRoot, { maxProgressLines }))
+    .filter((job) => !jobSessionEndedFresh(job, workspaceRoot));
 
   const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
   const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, workspaceRoot, { maxProgressLines }) : null;
+  const visibleLatestFinished = latestFinished && !jobSessionEndedFresh(latestFinished, workspaceRoot) ? latestFinished : null;
 
   const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
-    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
-    .map((job) => enrichJob(job, workspaceRoot, { maxProgressLines }));
+    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== visibleLatestFinished?.id)
+    .map((job) => enrichJob(job, workspaceRoot, { maxProgressLines }))
+    .filter((job) => !jobSessionEndedFresh(job, workspaceRoot));
 
   return {
     workspaceRoot,
     config,
     sessionRuntime: getSessionRuntimeStatus(options.env, workspaceRoot),
     running,
-    latestFinished,
+    latestFinished: visibleLatestFinished,
     recent,
     needsReview: Boolean(config.stopReviewGate)
   };
