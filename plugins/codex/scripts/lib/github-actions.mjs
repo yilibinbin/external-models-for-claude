@@ -20,7 +20,9 @@ function result(ok, name, detail = "") {
 
 function topLevelBlockLines(text, header) {
   const lines = text.split(/\r?\n/);
-  const start = lines.findIndex((line) => line === header);
+  const key = header.replace(/:$/, "");
+  const keyPattern = new RegExp(`^(?:"${key}"|'${key}'|${key})\\s*:\\s*(?:#.*)?$`);
+  const start = lines.findIndex((line) => keyPattern.test(line));
   if (start < 0) {
     return [];
   }
@@ -148,7 +150,7 @@ function hasSingleCodexReviewJob(text) {
     .filter((line) => /^\s{2}\S/.test(line))
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));
-  return entries.length === 1 && entries[0] === "codex-review:";
+  return countTopLevelKey(text, "jobs") === 1 && entries.length === 1 && entries[0] === "codex-review:";
 }
 
 function normalizedCommandText(text) {
