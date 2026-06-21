@@ -1825,6 +1825,87 @@ def test_codex_cancel_after_session_end_does_not_write_cancelled_sidecar(tmp_pat
     assert payload["logFileExists"] is False
 
 
+def test_codex_cancel_rejects_when_session_ends_before_cancel_sidecar_write(tmp_path):
+    env = governor_env(tmp_path)
+    script = f"""
+        import fs from 'node:fs';
+
+        const cwd = process.argv[1];
+        const originalRenameSync = fs.renameSync;
+        let injected = false;
+        fs.renameSync = function patchedRenameSync(from, to) {{
+          originalRenameSync.call(this, from, to);
+          if (injected || !String(to).endsWith('/state.json')) {{
+            return;
+          }}
+          try {{
+            const state = JSON.parse(fs.readFileSync(to, 'utf8'));
+            const hasCancelled = state.jobs?.some((job) => job.id === 'cancel-write-race' && job.status === 'cancelled');
+            if (!hasCancelled) {{
+              return;
+            }}
+            injected = true;
+            state.endedSessions = [...(state.endedSessions || []), 'session-cancel-write-race'];
+            state.jobs = state.jobs.filter((job) => job.id !== 'cancel-write-race');
+            fs.writeFileSync(to, `${{JSON.stringify(state, null, 2)}}\\n`, 'utf8');
+          }} catch {{
+            // Non-target state writes are irrelevant for this race injection.
+          }}
+        }};
+
+        const state = await import('./plugins/codex/scripts/lib/state.mjs');
+        const companion = await import('./plugins/codex/scripts/codex-companion.mjs');
+        const job = {{
+          id: 'cancel-write-race',
+          status: 'running',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Cancel write race',
+          workspaceRoot: cwd,
+          sessionId: 'session-cancel-write-race',
+          pid: 99999999,
+          logFile: state.resolveJobLogFile(cwd, 'cancel-write-race'),
+          request: {{ secret: 'cancel write race secret' }},
+          updatedAt: new Date().toISOString()
+        }};
+        state.upsertJob(cwd, job);
+        state.writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'cancel write race log\\n', 'utf8');
+        const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+        let capturedStdout = '';
+        process.stdout.write = (chunk, ...args) => {{
+          capturedStdout += String(chunk);
+          return true;
+        }};
+        let errorMessage = '';
+        try {{
+          await companion.__testHooks.handleCancel(['cancel-write-race', '--cwd', cwd, '--json']);
+        }} catch (error) {{
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }} finally {{
+          process.stdout.write = originalStdoutWrite;
+        }}
+        const jobFile = state.resolveJobFile(cwd, job.id);
+        console.log(JSON.stringify({{
+          injected,
+          capturedStdout,
+          errorMessage,
+          jobs: state.listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile)
+        }}));
+    """
+    payload = run_node_script(script, env=env, args=[str(tmp_path)])
+
+    assert payload["injected"] is True
+    assert payload["capturedStdout"] == ""
+    assert "ended before job cancel-write-race could be cancelled" in payload["errorMessage"]
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+
+
 def test_codex_task_worker_preserves_stored_job_bindings_before_claim():
     body = js_function_body(read_text(PLUGIN / "scripts" / "codex-companion.mjs"), "handleTaskWorker")
     assert body.index("const storedJob") < body.index("const request")
@@ -4610,6 +4691,8 @@ def test_codex_companion_publishes_background_and_cancel_state_before_job_file_w
     assert cancel.index("upsertJob(workspaceRoot") < cancel.index("writeJobFile(workspaceRoot, job.id")
     assert "if (!upsertJob(workspaceRoot" in cancel
     assert "sessionId: job.sessionId" in cancel
+    assert "const cancelledJobFile = writeJobFile(workspaceRoot, job.id" in cancel
+    assert "if (!cancelledJobFile)" in cancel
     assert "const runningJobFile = writeJobFile(job.workspaceRoot, job.id, runningRecord)" in run_tracked
     assert "if (!runningJobFile)" in run_tracked
     assert "const failedJobFile = writeJobFile(job.workspaceRoot, job.id, failedRecord)" in run_tracked

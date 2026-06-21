@@ -1251,11 +1251,15 @@ async function handleCancel(argv) {
     removeJobSidecar(workspaceRoot, job);
     throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
   }
-  writeJobFile(workspaceRoot, job.id, {
+  const cancelledJobFile = writeJobFile(workspaceRoot, job.id, {
     ...existing,
     ...nextJob,
     cancelledAt: completedAt
   });
+  if (!cancelledJobFile) {
+    removeJobSidecar(workspaceRoot, nextJob);
+    throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
+  }
 
   const payload = {
     jobId: job.id,
@@ -1375,5 +1379,6 @@ if (isDirectEntrypoint()) {
 
 export const __testHooks = {
   enqueueBackgroundTask,
+  handleCancel,
   shouldReclaimBackgroundLease
 };
