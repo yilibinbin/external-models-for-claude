@@ -1030,6 +1030,8 @@ def test_codex_github_actions_command_does_not_interpolate_raw_arguments():
     assert 'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" github-actions render' in text
     assert 'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" github-actions validate' in text
     assert 'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" github-actions init' in text
+    assert "github-actions render --ref v0.2.0 --json" not in text
+    assert "github-actions validate --ref v0.2.0 --json" in text
 
 
 def test_codex_install_consistency_parses_claude_plugin_list_schema():
@@ -6531,13 +6533,14 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
         "const mutableCheckout = base.replace('git -C \"$marketplace_dir\" checkout FETCH_HEAD', 'git -C \"$marketplace_dir\" checkout FETCH_HEAD\\n          git -C \"$marketplace_dir\" checkout main');"
         "const mutableCheckoutVariable = base.replace('git -C \"$marketplace_dir\" checkout FETCH_HEAD', 'git -C \"$marketplace_dir\" checkout FETCH_HEAD\\n          git -C \"${marketplace_dir}\" checkout main');"
         "const extraMutableFetch = base.replace('git -C \"$marketplace_dir\" checkout FETCH_HEAD', 'git -C \"$marketplace_dir\" fetch --depth 1 origin main\\n          git -C \"$marketplace_dir\" checkout FETCH_HEAD');"
+        "const extraApprovedStepShell = base.replace('claude plugin install codex@external-models-for-claude --scope user', 'claude plugin install codex@external-models-for-claude --scope user\\n          curl https://example.invalid/unexpected');"
         "const noArtifact = base.replace('      - uses: actions/upload-artifact@v4\\n        if: always()\\n        with:\\n          name: codex-for-claude-review\\n          path: codex-for-claude-review.*\\n          retention-days: 5\\n', '');"
         "const commentedArtifact = base.replace('      - uses: actions/upload-artifact@v4', '      # - uses: actions/upload-artifact@v4');"
         "const previewLine = `          printf '%s\\\\n' '{\"status\":\"preview\",\"reason\":\"release-host-cli-auth-contract-unverified\"}' > codex-for-claude-review.json`;"
         "const artifactBlock = '      - uses: actions/upload-artifact@v4\\n        if: always()\\n        with:\\n          name: codex-for-claude-review\\n          path: codex-for-claude-review.*\\n          retention-days: 5\\n';"
         "const artifactSpoof = base.replace(previewLine, `${previewLine}\\n          - uses: actions/upload-artifact@v4\\n            if: always()\\n            name: codex-for-claude-review\\n            path: codex-for-claude-review.*`).replace(artifactBlock, '');"
         "const scriptBodyStepsArtifactSpoof = base.replace(previewLine, `${previewLine}\\n          steps:\\n            - uses: actions/upload-artifact@v4\\n              if: always()\\n              with:\\n                name: codex-for-claude-review\\n                path: codex-for-claude-review.*`).replace(artifactBlock, '');"
-        "process.stdout.write(JSON.stringify({mutableFetch:g.validateWorkflow(mutableFetch), mutableCheckout:g.validateWorkflow(mutableCheckout), mutableCheckoutVariable:g.validateWorkflow(mutableCheckoutVariable), extraMutableFetch:g.validateWorkflow(extraMutableFetch), noArtifact:g.validateWorkflow(noArtifact), commentedArtifact:g.validateWorkflow(commentedArtifact), artifactSpoof:g.validateWorkflow(artifactSpoof), scriptBodyStepsArtifactSpoof:g.validateWorkflow(scriptBodyStepsArtifactSpoof)}));"
+        "process.stdout.write(JSON.stringify({mutableFetch:g.validateWorkflow(mutableFetch), mutableCheckout:g.validateWorkflow(mutableCheckout), mutableCheckoutVariable:g.validateWorkflow(mutableCheckoutVariable), extraMutableFetch:g.validateWorkflow(extraMutableFetch), extraApprovedStepShell:g.validateWorkflow(extraApprovedStepShell), noArtifact:g.validateWorkflow(noArtifact), commentedArtifact:g.validateWorkflow(commentedArtifact), artifactSpoof:g.validateWorkflow(artifactSpoof), scriptBodyStepsArtifactSpoof:g.validateWorkflow(scriptBodyStepsArtifactSpoof)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6546,6 +6549,7 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
     checkout_check = next(check for check in payload["mutableCheckout"]["checks"] if check["name"] == "marketplace-install")
     checkout_variable_check = next(check for check in payload["mutableCheckoutVariable"]["checks"] if check["name"] == "marketplace-install")
     extra_fetch_check = next(check for check in payload["extraMutableFetch"]["checks"] if check["name"] == "marketplace-install")
+    extra_approved_step_shell_check = next(check for check in payload["extraApprovedStepShell"]["checks"] if check["name"] == "fork-safe-step-gates")
     artifact_check = next(check for check in payload["noArtifact"]["checks"] if check["name"] == "review-artifact-upload")
     commented_artifact_check = next(check for check in payload["commentedArtifact"]["checks"] if check["name"] == "review-artifact-upload")
     spoofed_artifact_check = next(check for check in payload["artifactSpoof"]["checks"] if check["name"] == "review-artifact-upload")
@@ -6554,6 +6558,7 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
     assert checkout_check["ok"] is False
     assert checkout_variable_check["ok"] is False
     assert extra_fetch_check["ok"] is False
+    assert extra_approved_step_shell_check["ok"] is False
     assert artifact_check["ok"] is False
     assert commented_artifact_check["ok"] is False
     assert spoofed_artifact_check["ok"] is False
@@ -6562,6 +6567,7 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
     assert payload["mutableCheckout"]["structuralOk"] is False
     assert payload["mutableCheckoutVariable"]["structuralOk"] is False
     assert payload["extraMutableFetch"]["structuralOk"] is False
+    assert payload["extraApprovedStepShell"]["structuralOk"] is False
     assert payload["noArtifact"]["structuralOk"] is False
     assert payload["commentedArtifact"]["structuralOk"] is False
     assert payload["artifactSpoof"]["structuralOk"] is False
@@ -6747,6 +6753,33 @@ def test_codex_github_actions_init_writes_and_respects_force(tmp_path):
     )
     assert forced.returncode == 0, forced.stderr
     assert "name: Codex for Claude Review" in read_text(workflow)
+
+
+def test_codex_github_actions_json_flag_is_validate_only(tmp_path):
+    render = run_node(
+        PLUGIN / "scripts" / "codex-companion.mjs",
+        ["github-actions", "render", "--json"],
+        cwd=tmp_path,
+        timeout=10,
+    )
+    assert render.returncode == 1
+    assert "--json is only supported for validate" in render.stderr
+    init = run_node(
+        PLUGIN / "scripts" / "codex-companion.mjs",
+        ["github-actions", "init", "--json"],
+        cwd=tmp_path,
+        timeout=10,
+    )
+    assert init.returncode == 1
+    assert "--json is only supported for validate" in init.stderr
+    validate = run_node(
+        PLUGIN / "scripts" / "codex-companion.mjs",
+        ["github-actions", "validate", "--json"],
+        cwd=tmp_path,
+        timeout=10,
+    )
+    assert validate.returncode == 0, validate.stderr
+    assert json.loads(validate.stdout)["structuralOk"] is True
 
 
 def test_codex_release_check_import_is_side_effect_free_after_github_actions_import():

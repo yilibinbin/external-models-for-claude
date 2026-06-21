@@ -236,26 +236,141 @@ function hasActiveForkSafetyDetector(text) {
   return matchingForkSafetyDetectorCount(text) === 1;
 }
 
-function expectedStepFirstLines(contractsVerified) {
+function expectedPluginInstallBlock() {
   return [
-    "- uses: actions/checkout@v4",
-    "- name: Detect fork safety",
-    "- uses: actions/setup-node@v4",
-    "- name: Install Claude Code",
-    "- name: Install Codex CLI",
-    contractsVerified ? "- name: Verify Codex API-key login support" : null,
-    contractsVerified ? "- name: Authenticate Codex" : null,
     "- name: Install Codex for Claude plugin",
-    "- name: Resolve installed plugin root",
-    contractsVerified ? "- name: Run Codex review" : "- name: Preview Codex review",
-    "- uses: actions/upload-artifact@v4"
-  ].filter(Boolean);
+    FORK_SAFE_IF,
+    "run: |",
+    'marketplace_dir="$RUNNER_TEMP/external-models-for-claude"',
+    'git init "$marketplace_dir"',
+    'git -C "$marketplace_dir" remote add origin https://github.com/yilibinbin/external-models-for-claude',
+    'git -C "$marketplace_dir" fetch --depth 1 origin "refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF"',
+    'git -C "$marketplace_dir" checkout FETCH_HEAD',
+    'claude plugin marketplace add "$marketplace_dir" --scope user',
+    "claude plugin install codex@external-models-for-claude --scope user"
+  ];
 }
 
-function hasExpectedStepInventory(text, contractsVerified) {
-  const actual = activeStepBlocks(text).map((block) => block[0]?.trim()).filter(Boolean);
-  const expected = expectedStepFirstLines(contractsVerified);
-  return actual.length === expected.length && expected.every((line, index) => actual[index] === line);
+function expectedPluginRootResolverBlock() {
+  return [
+    "- name: Resolve installed plugin root",
+    FORK_SAFE_IF,
+    "run: |",
+    'CLAUDE_PLUGIN_ROOT="$(claude plugin list --json | node -e \'',
+    "// codex-plugin-root-resolver-begin",
+    'const fs = require("fs");',
+    'const data = JSON.parse(fs.' + 'readFileSync(0, "utf8"));',
+    "const plugins = Array.isArray(data) ? data : data.plugins || [];",
+    'const plugin = plugins.find((item) => item.name === "codex" || item.id === "codex@external-models-for-claude");',
+    "const root = plugin && (plugin.installPath || plugin.path || plugin.root);",
+    "if (!root) {",
+    "console" + '.error("Could not resolve codex@external-models-for-claude install root from claude plugin list --json.");',
+    "process.exit(1);",
+    "}",
+    "process." + "stdout.write(root);",
+    "// codex-plugin-root-resolver-end",
+    `')"`,
+    'echo "CLAUDE_PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT" >> "$GITHUB_ENV"'
+  ];
+}
+
+function expectedCodexAuthBlocks() {
+  return [
+    [
+      "- name: Verify Codex API-key login support",
+      FORK_SAFE_IF,
+      `run: "${CODEX_CLI_AUTH_HELP_COMMAND}"`
+    ],
+    [
+      "- name: Authenticate Codex",
+      FORK_SAFE_IF,
+      "env:",
+      "OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}",
+      "shell: bash",
+      "run: |",
+      'if [ -z "$OPENAI_API_KEY" ]; then',
+      'echo "OPENAI_API_KEY secret is required for internal pull-request review." >&2',
+      "exit 1",
+      "fi",
+      CODEX_CLI_AUTH_LOGIN_COMMAND
+    ]
+  ];
+}
+
+function expectedCodexReviewBlock(contractsVerified) {
+  if (!contractsVerified) {
+    return [
+      "- name: Preview Codex review",
+      FORK_SAFE_IF,
+      "shell: bash",
+      "run: |",
+      'echo "Codex review execution omitted until release-host CLI/auth contract is verified."',
+      `printf '%s\\n' '{"status":"preview","reason":"release-host-cli-auth-contract-unverified"}' > codex-for-claude-review.json`
+    ];
+  }
+  return [
+    "- name: Run Codex review",
+    FORK_SAFE_IF,
+    "shell: bash",
+    "run: |",
+    "set +e",
+    'node "$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs" review --base "$BASE_SHA" --json > codex-for-claude-review.json 2> codex-for-claude-review.stderr',
+    "status=$?",
+    'if [ "$status" -ne 0 ]; then',
+    "node -e '",
+    'const fs = require("fs");',
+    "const status = Number(process.argv[1]);",
+    'const stderr = fs.existsSync("codex-for-claude-review.stderr") ? fs.' + 'readFileSync("codex-for-claude-review.stderr", "utf8").trim() : "";',
+    'fs.writeFileSync("codex-for-claude-review.json", JSON.stringify({status: "failed", exitStatus: status, stderr}, null, 2) + "\\n");',
+    `' "$status"`,
+    'exit "$status"',
+    "fi"
+  ];
+}
+
+function expectedStepBlocks(contractsVerified) {
+  return [
+    [
+      "- uses: actions/checkout@v4",
+      "with:",
+      "fetch-depth: 0"
+    ],
+    expectedForkSafetyDetectorBlock(),
+    [
+      "- uses: actions/setup-node@v4",
+      FORK_SAFE_IF,
+      "with:",
+      'node-version: "20"'
+    ],
+    [
+      "- name: Install Claude Code",
+      FORK_SAFE_IF,
+      'run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_NPM_VERSION"'
+    ],
+    [
+      "- name: Install Codex CLI",
+      FORK_SAFE_IF,
+      'run: npm install -g "@openai/codex@$CODEX_CLI_NPM_VERSION"'
+    ],
+    ...(contractsVerified ? expectedCodexAuthBlocks() : []),
+    expectedPluginInstallBlock(),
+    expectedPluginRootResolverBlock(),
+    expectedCodexReviewBlock(contractsVerified),
+    [
+      "- uses: actions/upload-artifact@v4",
+      "if: always()",
+      "with:",
+      "name: codex-for-claude-review",
+      "path: codex-for-claude-review.*",
+      "retention-days: 5"
+    ]
+  ];
+}
+
+function hasExpectedStepBlocks(text, contractsVerified) {
+  const actual = activeStepBlocks(text);
+  const expected = expectedStepBlocks(contractsVerified);
+  return actual.length === expected.length && expected.every((block, index) => blockMatchesExpected(actual[index], block));
 }
 
 function hasForkSafeStepGates(text, contractsVerified) {
@@ -288,7 +403,7 @@ function hasForkSafeStepGates(text, contractsVerified) {
       blockHasFieldLine(block, FORK_SAFE_IF)
     );
   });
-  return hasExpectedStepInventory(text, contractsVerified) && hasActiveForkSafetyDetector(text) && requiredStepsGated && executableStepsGated;
+  return hasExpectedStepBlocks(text, contractsVerified) && hasActiveForkSafetyDetector(text) && requiredStepsGated && executableStepsGated;
 }
 
 export function validateReleaseRef(value) {

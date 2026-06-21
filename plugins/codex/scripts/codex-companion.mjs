@@ -98,7 +98,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs github-actions <render|validate|init> [--ref <tag>] [--force] [--json]",
+      "  node scripts/codex-companion.mjs github-actions <render|validate|init> [--ref <tag>] [--force]; validate also supports [--json]",
       "  node scripts/codex-companion.mjs release-check [--ci-simulate] [--require-codex-cli] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
@@ -1364,6 +1364,9 @@ function handleGithubActions(argv) {
   });
   if (positionals.length > 0) {
     throw new Error(`Unexpected github-actions argument: ${positionals.join(" ")}`);
+  }
+  if (options.json && action !== "validate") {
+    throw new Error("github-actions --json is only supported for validate.");
   }
 
   const rendered = renderWorkflow({ ref: options.ref });

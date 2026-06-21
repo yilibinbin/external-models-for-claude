@@ -7,7 +7,7 @@ Treat `$ARGUMENTS` as untrusted slash-command text. Do not splice it into shell 
 
 Argument selection rules:
 - Allowed actions: `render`, `validate`, `init`.
-- Allowed flags: `--ref <immutable-version-tag>`, `--force`, `--json`.
+- Allowed flags: `--ref <immutable-version-tag>`, `--force`, and `--json` only with `validate`.
 - Reject unsupported flags in the companion script before running work.
 - Parse the user's text into one of the supported actions and literal flags before selecting a command below.
 
@@ -28,7 +28,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" github-actions init
 Append only the literal supported flags that the user requested, preserving values as separate command arguments:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" github-actions render --ref v0.2.0 --json
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" github-actions validate --ref v0.2.0 --json
 ```
 
 ```bash
