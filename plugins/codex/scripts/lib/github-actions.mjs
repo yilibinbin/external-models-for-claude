@@ -64,6 +64,37 @@ function activeBlockStartingWith(text, trimmedStart) {
   return block;
 }
 
+function activeStepBlocks(text) {
+  const blocks = [];
+  let block = [];
+  let blockIndent = 0;
+  for (const line of activeWorkflowLines(text)) {
+    const trimmed = line.trim();
+    const indent = leadingSpaces(line);
+    if (/^-\s+/.test(trimmed)) {
+      if (block.length > 0) {
+        blocks.push(block);
+      }
+      block = [line];
+      blockIndent = indent;
+      continue;
+    }
+    if (block.length > 0) {
+      if (trimmed && indent <= blockIndent) {
+        blocks.push(block);
+        block = [];
+        blockIndent = 0;
+      } else {
+        block.push(line);
+      }
+    }
+  }
+  if (block.length > 0) {
+    blocks.push(block);
+  }
+  return blocks;
+}
+
 function blockIncludesLine(text, trimmedStart, requiredLine) {
   return activeBlockStartingWith(text, trimmedStart).some((line) => line.trim() === requiredLine);
 }
@@ -71,7 +102,11 @@ function blockIncludesLine(text, trimmedStart, requiredLine) {
 function hasUnexpectedCommandSubstitution(text) {
   return activeWorkflowLines(text).some((line) => {
     const trimmed = line.trim();
-    return (trimmed.includes("$(") && trimmed !== PLUGIN_ROOT_RESOLVER_SUBSTITUTION) || trimmed.includes("`");
+    return (
+      (trimmed.includes("$(") && trimmed !== PLUGIN_ROOT_RESOLVER_SUBSTITUTION) ||
+      trimmed.includes("`") ||
+      /\$\{(?!\{)/.test(trimmed)
+    );
   });
 }
 
@@ -154,7 +189,18 @@ function hasForkSafeStepGates(text, contractsVerified) {
     contractsVerified ? "- name: Authenticate Codex" : null,
     contractsVerified ? "- name: Run Codex review" : "- name: Preview Codex review"
   ].filter(Boolean);
-  return requiredSteps.every((step) => blockIncludesLine(text, step, FORK_SAFE_IF));
+  const requiredStepsGated = requiredSteps.every((step) => blockIncludesLine(text, step, FORK_SAFE_IF));
+  const allowedUngatedSteps = new Set([
+    "- uses: actions/checkout@v4",
+    "- name: Detect fork safety",
+    "- uses: actions/upload-artifact@v4"
+  ]);
+  const executableStepsGated = activeStepBlocks(text).every((block) => {
+    const firstLine = block[0]?.trim() ?? "";
+    const hasExecutableSurface = firstLine.startsWith("- uses:") || block.some((line) => line.trim().startsWith("run:"));
+    return !hasExecutableSurface || allowedUngatedSteps.has(firstLine) || block.some((line) => line.trim() === FORK_SAFE_IF);
+  });
+  return requiredStepsGated && executableStepsGated;
 }
 
 export function validateReleaseRef(value) {
