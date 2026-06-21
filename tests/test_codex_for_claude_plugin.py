@@ -4601,6 +4601,72 @@ def test_codex_run_tracked_job_does_not_start_runner_when_initial_heartbeat_reje
     assert payload["logFileExists"] is False
 
 
+def test_codex_run_tracked_job_starts_when_heartbeat_disabled(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          runTrackedJob
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          readJobFile,
+          resolveJobFile,
+          resolveJobLogFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        process.env.CODEX_FOR_CLAUDE_DISABLE_HEARTBEAT = '1';
+        let runnerStarted = false;
+        const job = {
+          id: 'disable-heartbeat-run',
+          status: 'queued',
+          kind: 'task',
+          title: 'Disable heartbeat run',
+          workspaceRoot: cwd,
+          sessionId: 'session-disable-heartbeat',
+          phase: 'queued',
+          pid: null,
+          logFile: resolveJobLogFile(cwd, 'disable-heartbeat-run')
+        };
+        const execution = await runTrackedJob(
+          job,
+          async () => {
+            runnerStarted = true;
+            return {
+              exitStatus: 0,
+              threadId: 'thread-disable-heartbeat',
+              turnId: 'turn-disable-heartbeat',
+              summary: 'completed with heartbeat disabled',
+              payload: { ok: true },
+              rendered: 'completed with heartbeat disabled'
+            };
+          },
+          { logFile: job.logFile }
+        );
+        const jobFile = resolveJobFile(cwd, job.id);
+        const stored = readJobFile(jobFile);
+
+        console.log(JSON.stringify({
+          runnerStarted,
+          executionStatus: execution.exitStatus,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          storedStatus: stored.status,
+          heartbeatAtMs: stored.heartbeatAtMs ?? null
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["runnerStarted"] is True
+    assert payload["executionStatus"] == 0
+    assert payload["jobFileExists"] is True
+    assert payload["storedStatus"] == "completed"
+    assert payload["heartbeatAtMs"] is None
+    assert payload["jobs"][0]["status"] == "completed"
+
+
 def test_codex_run_tracked_job_prerun_session_end_removes_options_log(tmp_path):
     payload = run_node_script(
         """

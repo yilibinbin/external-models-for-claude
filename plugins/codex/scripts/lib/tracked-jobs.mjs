@@ -396,7 +396,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     removeTrackedJobAfterSessionEnd(runningRecord);
     throw new Error(`Claude session ${runningRecord.sessionId} ended before job ${runningRecord.id} could run.`);
   }
-  if (!writeHeartbeatIfRunning(runningRecord)) {
+  if (process.env.CODEX_FOR_CLAUDE_DISABLE_HEARTBEAT !== "1" && !writeHeartbeatIfRunning(runningRecord)) {
     removeTrackedJobAfterSessionEnd(runningRecord);
     throw new Error(`Claude session ${runningRecord.sessionId} ended before job ${runningRecord.id} could run.`);
   }
