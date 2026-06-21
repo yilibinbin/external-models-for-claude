@@ -5373,6 +5373,71 @@ def test_codex_status_json_includes_liveness(tmp_path):
     assert job["liveness"]["reason"] == "heartbeat-current"
 
 
+def test_codex_status_includes_pruned_active_sidecar_without_private_payload(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          resolveJobLogFile,
+          saveState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const active = {
+          id: 'status-pruned-active-sidecar',
+          status: 'running',
+          phase: 'running',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Pruned active sidecar',
+          summary: 'visible active sidecar',
+          workspaceRoot: cwd,
+          sessionId: 'session-status-pruned-active',
+          pid: process.pid,
+          request: { secret: 'PRIVATE_REQUEST_SECRET' },
+          result: { secret: 'PRIVATE_RESULT_SECRET' },
+          rendered: 'PRIVATE_RENDERED_SECRET',
+          backgroundLeaseId: 'PRIVATE_LEASE_SECRET',
+          logFile: resolveJobLogFile(cwd, 'status-pruned-active-sidecar'),
+          updatedAt: '2000-01-01T00:00:00.000Z',
+          heartbeatAtMs: Date.now(),
+          heartbeatAt: new Date().toISOString()
+        };
+        writeJobFile(cwd, active.id, active);
+        fs.writeFileSync(active.logFile, 'active sidecar log\\n', 'utf8');
+        const newerJobs = Array.from({ length: 51 }, (_, index) => ({
+          id: `newer-completed-${index}`,
+          status: 'completed',
+          workspaceRoot: cwd,
+          updatedAt: new Date(Date.now() + index).toISOString()
+        }));
+        saveState(cwd, { jobs: [active, ...newerJobs] });
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    job = next(item for item in payload["running"] if item["id"] == "status-pruned-active-sidecar")
+    text = json.dumps(job)
+    assert job["status"] == "running"
+    assert job["liveness"]["state"] in {"healthy", "suspect", "lost", "unknown"}
+    assert "request" not in job
+    assert "result" not in job
+    assert "rendered" not in job
+    assert "backgroundLeaseId" not in job
+    assert "PRIVATE_REQUEST_SECRET" not in text
+    assert "PRIVATE_RESULT_SECRET" not in text
+    assert "PRIVATE_RENDERED_SECRET" not in text
+    assert "PRIVATE_LEASE_SECRET" not in text
+
+
 def test_codex_single_status_filters_current_session_unless_all(tmp_path):
     env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
     env["CODEX_COMPANION_SESSION_ID"] = "session-a"

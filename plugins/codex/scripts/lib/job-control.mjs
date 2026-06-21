@@ -251,9 +251,38 @@ function listJobsWithSidecars(workspaceRoot) {
   return [...byId.values()];
 }
 
+function sharedJobPatchFromSidecar(job) {
+  const {
+    request,
+    result,
+    rendered,
+    backgroundLease,
+    backgroundLeaseId,
+    lease,
+    ...shared
+  } = job;
+  return shared;
+}
+
+function listStatusJobs(workspaceRoot) {
+  const byId = new Map();
+  for (const job of listJobs(workspaceRoot)) {
+    if (job?.id) {
+      byId.set(job.id, job);
+    }
+  }
+  for (const job of listJobSidecars(workspaceRoot)) {
+    if (!job?.id || (job.status !== "queued" && job.status !== "running") || byId.has(job.id)) {
+      continue;
+    }
+    byId.set(job.id, sharedJobPatchFromSidecar(job));
+  }
+  return [...byId.values()];
+}
+
 export function buildStatusSnapshot(workspaceRoot, options = {}) {
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listStatusJobs(workspaceRoot), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -280,7 +309,7 @@ export function buildStatusSnapshot(workspaceRoot, options = {}) {
 }
 
 export function buildSingleJobSnapshot(workspaceRoot, reference, options = {}) {
-  const allJobs = listJobs(workspaceRoot);
+  const allJobs = listStatusJobs(workspaceRoot);
   const jobs = sortJobsNewestFirst(options.all ? allJobs : filterJobsForCurrentSession(allJobs, options));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
