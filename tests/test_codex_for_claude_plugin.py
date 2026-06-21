@@ -6533,7 +6533,10 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
         "const extraMutableFetch = base.replace('git -C \"$marketplace_dir\" checkout FETCH_HEAD', 'git -C \"$marketplace_dir\" fetch --depth 1 origin main\\n          git -C \"$marketplace_dir\" checkout FETCH_HEAD');"
         "const noArtifact = base.replace('      - uses: actions/upload-artifact@v4\\n        if: always()\\n        with:\\n          name: codex-for-claude-review\\n          path: codex-for-claude-review.*\\n          retention-days: 5\\n', '');"
         "const commentedArtifact = base.replace('      - uses: actions/upload-artifact@v4', '      # - uses: actions/upload-artifact@v4');"
-        "process.stdout.write(JSON.stringify({mutableFetch:g.validateWorkflow(mutableFetch), mutableCheckout:g.validateWorkflow(mutableCheckout), mutableCheckoutVariable:g.validateWorkflow(mutableCheckoutVariable), extraMutableFetch:g.validateWorkflow(extraMutableFetch), noArtifact:g.validateWorkflow(noArtifact), commentedArtifact:g.validateWorkflow(commentedArtifact)}));"
+        "const previewLine = `          printf '%s\\\\n' '{\"status\":\"preview\",\"reason\":\"release-host-cli-auth-contract-unverified\"}' > codex-for-claude-review.json`;"
+        "const artifactBlock = '      - uses: actions/upload-artifact@v4\\n        if: always()\\n        with:\\n          name: codex-for-claude-review\\n          path: codex-for-claude-review.*\\n          retention-days: 5\\n';"
+        "const artifactSpoof = base.replace(previewLine, `${previewLine}\\n          - uses: actions/upload-artifact@v4\\n            if: always()\\n            name: codex-for-claude-review\\n            path: codex-for-claude-review.*`).replace(artifactBlock, '');"
+        "process.stdout.write(JSON.stringify({mutableFetch:g.validateWorkflow(mutableFetch), mutableCheckout:g.validateWorkflow(mutableCheckout), mutableCheckoutVariable:g.validateWorkflow(mutableCheckoutVariable), extraMutableFetch:g.validateWorkflow(extraMutableFetch), noArtifact:g.validateWorkflow(noArtifact), commentedArtifact:g.validateWorkflow(commentedArtifact), artifactSpoof:g.validateWorkflow(artifactSpoof)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6544,18 +6547,21 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
     extra_fetch_check = next(check for check in payload["extraMutableFetch"]["checks"] if check["name"] == "marketplace-install")
     artifact_check = next(check for check in payload["noArtifact"]["checks"] if check["name"] == "review-artifact-upload")
     commented_artifact_check = next(check for check in payload["commentedArtifact"]["checks"] if check["name"] == "review-artifact-upload")
+    spoofed_artifact_check = next(check for check in payload["artifactSpoof"]["checks"] if check["name"] == "review-artifact-upload")
     assert install_check["ok"] is False
     assert checkout_check["ok"] is False
     assert checkout_variable_check["ok"] is False
     assert extra_fetch_check["ok"] is False
     assert artifact_check["ok"] is False
     assert commented_artifact_check["ok"] is False
+    assert spoofed_artifact_check["ok"] is False
     assert payload["mutableFetch"]["structuralOk"] is False
     assert payload["mutableCheckout"]["structuralOk"] is False
     assert payload["mutableCheckoutVariable"]["structuralOk"] is False
     assert payload["extraMutableFetch"]["structuralOk"] is False
     assert payload["noArtifact"]["structuralOk"] is False
     assert payload["commentedArtifact"]["structuralOk"] is False
+    assert payload["artifactSpoof"]["structuralOk"] is False
 
 
 def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection():
@@ -6632,13 +6638,14 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
         "const reviewUngated = base.replace('      - name: Preview Codex review\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'', '      - name: Preview Codex review');"
         "const installUngated = base.replace('      - name: Install Codex for Claude plugin\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'', '      - name: Install Codex for Claude plugin');"
         "const extraUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Extra ungated shell\\n        shell: bash\\n        run: echo unsafe\\n      - uses: actions/upload-artifact@v4');"
+        "const disguisedUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Extra disguised ungated shell\\n        shell: bash\\n        run: |\\n          if: steps.fork-safety.outputs.safe_to_review == \\'true\\'\\n          echo unsafe\\n      - uses: actions/upload-artifact@v4');"
         "const shorthandUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - run: echo unsafe\\n      - uses: actions/upload-artifact@v4');"
         "const unsafeDetector = base.replace(/      - name: Detect fork safety[\\s\\S]*?      - uses: actions\\/setup-node@v4/, '      - name: Detect fork safety\\n        id: fork-safety\\n        shell: bash\\n        run: |\\n          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          # Codex review skipped because pull request head repository is not this repository.\\n          # {\"status\":\"skipped\",\"reason\":\"external-head-repository\"}\\n      - uses: actions/setup-node@v4');"
         "const unsafeDetectorAfterFi = base.replace('          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          fi', '          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          fi\\n          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"');"
         "const duplicateDetector = base.replace('      - uses: actions/setup-node@v4', '      - name: Detect fork safety\\n        shell: bash\\n        run: echo unsafe-from-fork\\n      - uses: actions/setup-node@v4');"
         "const detectorBlock = base.match(/      - name: Detect fork safety[\\s\\S]*?      - uses: actions\\/setup-node@v4/)[0].replace('      - uses: actions/setup-node@v4', '');"
         "const duplicateExactDetector = base.replace('      - uses: actions/setup-node@v4', `${detectorBlock}      - uses: actions/setup-node@v4`);"
-        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi), duplicateDetector:g.validateWorkflow(duplicateDetector), duplicateExactDetector:g.validateWorkflow(duplicateExactDetector)}));"
+        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), disguisedUngated:g.validateWorkflow(disguisedUngated), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi), duplicateDetector:g.validateWorkflow(duplicateDetector), duplicateExactDetector:g.validateWorkflow(duplicateExactDetector)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6646,6 +6653,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     review_check = next(check for check in payload["reviewUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     install_check = next(check for check in payload["installUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     extra_check = next(check for check in payload["extraUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
+    disguised_check = next(check for check in payload["disguisedUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     shorthand_check = next(check for check in payload["shorthandUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     detector_check = next(check for check in payload["unsafeDetector"]["checks"] if check["name"] == "fork-safe-step-gates")
     detector_after_fi_check = next(check for check in payload["unsafeDetectorAfterFi"]["checks"] if check["name"] == "fork-safe-step-gates")
@@ -6654,6 +6662,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     assert review_check["ok"] is False
     assert install_check["ok"] is False
     assert extra_check["ok"] is False
+    assert disguised_check["ok"] is False
     assert shorthand_check["ok"] is False
     assert detector_check["ok"] is False
     assert detector_after_fi_check["ok"] is False
@@ -6662,6 +6671,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     assert payload["reviewUngated"]["structuralOk"] is False
     assert payload["installUngated"]["structuralOk"] is False
     assert payload["extraUngated"]["structuralOk"] is False
+    assert payload["disguisedUngated"]["structuralOk"] is False
     assert payload["shorthandUngated"]["structuralOk"] is False
     assert payload["unsafeDetector"]["structuralOk"] is False
     assert payload["unsafeDetectorAfterFi"]["structuralOk"] is False

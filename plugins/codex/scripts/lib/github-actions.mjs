@@ -48,6 +48,9 @@ function leadingSpaces(line) {
 }
 
 function activeBlockStartingWith(text, trimmedStart) {
+  if (trimmedStart.startsWith("- ")) {
+    return activeStepBlocks(text).find((block) => block[0]?.trim() === trimmedStart) ?? [];
+  }
   const lines = activeWorkflowLines(text);
   const start = lines.findIndex((line) => line.trim() === trimmedStart);
   if (start < 0) {
@@ -65,28 +68,36 @@ function activeBlockStartingWith(text, trimmedStart) {
 }
 
 function activeStepBlocks(text) {
+  const lines = activeWorkflowLines(text);
+  const stepsIndex = lines.findIndex((line) => line.trim() === "steps:");
+  if (stepsIndex < 0) {
+    return [];
+  }
+  const stepsIndent = leadingSpaces(lines[stepsIndex]);
+  const itemIndent = lines
+    .slice(stepsIndex + 1)
+    .find((line) => line.trim() && leadingSpaces(line) > stepsIndent && /^-\s+/.test(line.trim()));
+  if (!itemIndent) {
+    return [];
+  }
+  const stepIndent = leadingSpaces(itemIndent);
   const blocks = [];
   let block = [];
-  let blockIndent = 0;
-  for (const line of activeWorkflowLines(text)) {
+  for (const line of lines.slice(stepsIndex + 1)) {
     const trimmed = line.trim();
     const indent = leadingSpaces(line);
-    if (/^-\s+/.test(trimmed)) {
+    if (trimmed && indent <= stepsIndent) {
+      break;
+    }
+    if (indent === stepIndent && /^-\s+/.test(trimmed)) {
       if (block.length > 0) {
         blocks.push(block);
       }
       block = [line];
-      blockIndent = indent;
       continue;
     }
     if (block.length > 0) {
-      if (trimmed && indent <= blockIndent) {
-        blocks.push(block);
-        block = [];
-        blockIndent = 0;
-      } else {
-        block.push(line);
-      }
+      block.push(line);
     }
   }
   if (block.length > 0) {
@@ -96,7 +107,13 @@ function activeStepBlocks(text) {
 }
 
 function blockIncludesLine(text, trimmedStart, requiredLine) {
-  return activeBlockStartingWith(text, trimmedStart).some((line) => line.trim() === requiredLine);
+  const block = activeBlockStartingWith(text, trimmedStart);
+  return blockHasFieldLine(block, requiredLine);
+}
+
+function blockHasFieldLine(block, requiredLine) {
+  const firstIndent = leadingSpaces(block[0] ?? "");
+  return block.some((line) => leadingSpaces(line) === firstIndent + 2 && line.trim() === requiredLine);
 }
 
 function hasUnexpectedCommandSubstitution(text) {
@@ -235,7 +252,7 @@ function hasForkSafeStepGates(text, contractsVerified) {
       !hasExecutableSurface ||
       allowedUngatedSteps.has(firstLine) ||
       blockMatchesExpected(block, expectedDetector) ||
-      block.some((line) => line.trim() === FORK_SAFE_IF)
+      blockHasFieldLine(block, FORK_SAFE_IF)
     );
   });
   return hasActiveForkSafetyDetector(text) && requiredStepsGated && executableStepsGated;
