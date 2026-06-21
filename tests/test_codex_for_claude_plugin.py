@@ -2095,6 +2095,56 @@ def test_codex_cancel_after_session_end_does_not_write_cancelled_sidecar(tmp_pat
     assert payload["logFileExists"] is False
 
 
+def test_codex_cancel_ignores_tombstoned_sidecar_only_active_job(tmp_path):
+    env = governor_env(tmp_path)
+    run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobLogFile,
+          updateState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        process.env.CODEX_FOR_CLAUDE_SKIP_STATE_PRUNE = '1';
+        const job = {
+          id: 'cancel-tombstoned-sidecar-only',
+          status: 'running',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Cancel tombstoned sidecar only',
+          workspaceRoot: cwd,
+          sessionId: 'session-cancel-tombstoned-sidecar',
+          pid: 99999999,
+          request: { secret: 'cancel tombstoned secret' },
+          logFile: resolveJobLogFile(cwd, 'cancel-tombstoned-sidecar-only'),
+          updatedAt: new Date().toISOString()
+        };
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'cancel tombstoned log\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-cancel-tombstoned-sidecar');
+          state.jobs = state.jobs.filter((item) => item.id !== job.id);
+        });
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(
+        ["cancel", "cancel-tombstoned-sidecar-only", "--cwd", str(tmp_path), "--json"],
+        cwd=tmp_path,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert 'No job found for "cancel-tombstoned-sidecar-only"' in result.stderr
+
+
 def test_codex_cancel_rejects_when_session_ends_before_cancel_sidecar_write(tmp_path):
     env = governor_env(tmp_path)
     script = f"""
@@ -5438,6 +5488,59 @@ def test_codex_status_includes_pruned_active_sidecar_without_private_payload(tmp
     assert "PRIVATE_LEASE_SECRET" not in text
 
 
+def test_codex_status_uses_active_sidecar_when_partial_shared_progress_row_exists(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          resolveJobLogFile,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'status-partial-progress-sidecar',
+          status: 'running',
+          phase: 'starting',
+          kind: 'task',
+          title: 'Partial progress sidecar',
+          workspaceRoot: cwd,
+          sessionId: 'session-status-partial-progress',
+          pid: process.pid,
+          request: { secret: 'PRIVATE_PARTIAL_REQUEST' },
+          rendered: 'PRIVATE_PARTIAL_RENDERED',
+          logFile: resolveJobLogFile(cwd, 'status-partial-progress-sidecar'),
+          updatedAt: new Date().toISOString()
+        };
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'partial progress log\\n', 'utf8');
+        upsertJob(cwd, {
+          id: job.id,
+          phase: 'running',
+          threadId: 'thread-partial-progress'
+        });
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    job = next(item for item in payload["running"] if item["id"] == "status-partial-progress-sidecar")
+    text = json.dumps(job)
+    assert job["status"] == "running"
+    assert job["sessionId"] == "session-status-partial-progress"
+    assert job["threadId"] == "thread-partial-progress"
+    assert "request" not in job
+    assert "rendered" not in job
+    assert "PRIVATE_PARTIAL_REQUEST" not in text
+    assert "PRIVATE_PARTIAL_RENDERED" not in text
+
+
 def test_codex_status_omits_tombstoned_sidecar_only_active_job(tmp_path):
     env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
     run_node_script(
@@ -5483,6 +5586,63 @@ def test_codex_status_omits_tombstoned_sidecar_only_active_job(tmp_path):
     assert all(job["id"] != "status-tombstoned-sidecar-only" for job in payload["running"])
     assert "PRIVATE_TOMBSTONED_REQUEST" not in text
     assert "PRIVATE_TOMBSTONED_LOG" not in text
+
+
+def test_codex_status_rechecks_tombstone_while_merging_sidecars(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobLogFile,
+          resolveJobsDir,
+          updateState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'status-sidecar-merge-race',
+          status: 'running',
+          phase: 'running',
+          kind: 'task',
+          title: 'Status sidecar merge race',
+          workspaceRoot: cwd,
+          sessionId: 'session-status-sidecar-merge-race',
+          request: { secret: 'PRIVATE_MERGE_RACE_REQUEST' },
+          logFile: resolveJobLogFile(cwd, 'status-sidecar-merge-race'),
+          updatedAt: new Date().toISOString()
+        };
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, '[2000-01-01T00:00:00.000Z] PRIVATE_MERGE_RACE_LOG\\n', 'utf8');
+
+        const jobsDir = resolveJobsDir(cwd);
+        const originalReaddirSync = fs.readdirSync;
+        let injected = false;
+        fs.readdirSync = function patchedReaddirSync(dirPath, ...args) {
+          if (!injected && String(dirPath) === jobsDir) {
+            injected = true;
+            updateState(cwd, (state) => {
+              markSessionEnded(state, 'session-status-sidecar-merge-race');
+              state.jobs = state.jobs.filter((item) => item.id !== job.id);
+            });
+          }
+          return originalReaddirSync.call(this, dirPath, ...args);
+        };
+
+        const { buildStatusSnapshot } = await import('./plugins/codex/scripts/lib/job-control.mjs');
+        const snapshot = buildStatusSnapshot(cwd, { all: true });
+        fs.readdirSync = originalReaddirSync;
+        console.log(JSON.stringify({ injected, snapshot }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    text = json.dumps(payload["snapshot"])
+    assert payload["injected"] is True
+    assert all(job["id"] != "status-sidecar-merge-race" for job in payload["snapshot"]["running"])
+    assert "PRIVATE_MERGE_RACE_REQUEST" not in text
+    assert "PRIVATE_MERGE_RACE_LOG" not in text
 
 
 def test_codex_single_status_filters_current_session_unless_all(tmp_path):

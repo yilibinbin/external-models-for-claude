@@ -2,7 +2,15 @@ import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { classifyJobLiveness } from "./job-lifecycle.mjs";
-import { getConfig, listJobSidecars, listJobs, loadState, readJobFile, resolveJobFile, stateHasEndedSession } from "./state.mjs";
+import {
+  getConfig,
+  listJobSidecars,
+  listJobs,
+  loadState,
+  readJobFile,
+  resolveJobFile,
+  stateHasEndedSession
+} from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -59,8 +67,15 @@ function isProgressBlockTitle(line) {
   );
 }
 
-export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
+function hasEndedSessionFresh(workspaceRoot, sessionId) {
+  return stateHasEndedSession(loadState(workspaceRoot), sessionId);
+}
+
+export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES, options = {}) {
   if (!logFile || !fs.existsSync(logFile)) {
+    return [];
+  }
+  if (options.workspaceRoot && options.sessionId && hasEndedSessionFresh(options.workspaceRoot, options.sessionId)) {
     return [];
   }
 
@@ -187,7 +202,10 @@ export function enrichJob(job, workspaceRoot, options = {}) {
     kindLabel: getJobTypeLabel(job),
     progressPreview:
       job.status === "queued" || job.status === "running" || job.status === "failed"
-        ? readJobProgressPreview(job.logFile, maxProgressLines)
+        ? readJobProgressPreview(job.logFile, maxProgressLines, {
+            workspaceRoot: job.workspaceRoot ?? workspaceRoot,
+            sessionId: job.sessionId
+          })
         : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
     duration:
@@ -264,6 +282,29 @@ function sharedJobPatchFromSidecar(job) {
   return shared;
 }
 
+function shouldPreferStatusSidecar(existing, sidecar) {
+  if (!existing?.id) {
+    return true;
+  }
+  if (existing.status === "queued" || existing.status === "running") {
+    return false;
+  }
+  return (sidecar.status === "queued" || sidecar.status === "running") && !existing.status;
+}
+
+function mergeStatusJobWithSidecar(existing, sidecar) {
+  const sharedSidecar = sharedJobPatchFromSidecar(sidecar);
+  return {
+    ...sharedSidecar,
+    ...(existing ?? {}),
+    status: sharedSidecar.status,
+    sessionId: sharedSidecar.sessionId ?? existing?.sessionId,
+    workspaceRoot: sharedSidecar.workspaceRoot ?? existing?.workspaceRoot,
+    logFile: sharedSidecar.logFile ?? existing?.logFile,
+    pid: sharedSidecar.pid ?? existing?.pid
+  };
+}
+
 function listStatusJobs(workspaceRoot) {
   const state = loadState(workspaceRoot);
   const byId = new Map();
@@ -273,15 +314,17 @@ function listStatusJobs(workspaceRoot) {
     }
   }
   for (const job of listJobSidecars(workspaceRoot)) {
-    if (
-      !job?.id
-      || (job.status !== "queued" && job.status !== "running")
-      || byId.has(job.id)
-      || stateHasEndedSession(state, job.sessionId)
-    ) {
+    if (!job?.id || (job.status !== "queued" && job.status !== "running")) {
       continue;
     }
-    byId.set(job.id, sharedJobPatchFromSidecar(job));
+    if (stateHasEndedSession(state, job.sessionId) || hasEndedSessionFresh(workspaceRoot, job.sessionId)) {
+      continue;
+    }
+    const existing = byId.get(job.id);
+    if (!shouldPreferStatusSidecar(existing, job)) {
+      continue;
+    }
+    byId.set(job.id, mergeStatusJobWithSidecar(existing, job));
   }
   return [...byId.values()];
 }
@@ -355,7 +398,8 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobsWithSidecars(workspaceRoot));
+  const state = loadState(workspaceRoot);
+  const jobs = sortJobsNewestFirst(listJobsWithSidecars(workspaceRoot).filter((job) => !stateHasEndedSession(state, job.sessionId)));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {
