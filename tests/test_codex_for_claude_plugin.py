@@ -3126,7 +3126,8 @@ def test_codex_stop_child_disables_heartbeat_and_progress_updates():
     assert run_tracked.index("heartbeatActive = false") < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
     assert run_tracked.index("upsertJob(job.workspaceRoot, {", run_tracked.index("const execution = await runner()")) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
     assert "const completedJobFile = writeJobFile(job.workspaceRoot, job.id" in run_tracked
-    assert run_tracked.index("if (completedJobFile)") < run_tracked.index("appendLogBlockIfJobCurrent(")
+    assert run_tracked.index("if (!completedJobFile)") < run_tracked.index("appendLogBlockIfJobCurrent(")
+    assert "throw sessionEndedFinishError(runningRecord)" in run_tracked
     catch_index = run_tracked.index("} catch (error) {")
     assert run_tracked.index("heartbeatActive = false", catch_index) < run_tracked.index("readStoredJobOrNull", catch_index)
     assert run_tracked.index("upsertJob(job.workspaceRoot, {", catch_index) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", catch_index)
@@ -4864,28 +4865,36 @@ def test_codex_run_tracked_job_completion_after_session_end_does_not_republish_r
           pid: null,
           logFile: resolveJobLogFile(cwd, 'terminal-ended-session')
         };
-        const execution = await runTrackedJob(
-          job,
-          async () => {
-            updateState(cwd, (state) => {
-              markSessionEnded(state, 'session-terminal-ended');
-              state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-terminal-ended');
-            });
-            return {
-              exitStatus: 0,
-              threadId: 'thread-terminal',
-              turnId: 'turn-terminal',
-              summary: 'terminal summary',
-              payload: { secret: 'terminal secret' },
-              rendered: 'terminal rendered secret'
-            };
-          },
-          { logFile: job.logFile }
-        );
+        let executionStatus = null;
+        let errorMessage = '';
+        try {
+          const execution = await runTrackedJob(
+            job,
+            async () => {
+              updateState(cwd, (state) => {
+                markSessionEnded(state, 'session-terminal-ended');
+                state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-terminal-ended');
+              });
+              return {
+                exitStatus: 0,
+                threadId: 'thread-terminal',
+                turnId: 'turn-terminal',
+                summary: 'terminal summary',
+                payload: { secret: 'terminal secret' },
+                rendered: 'terminal rendered secret'
+              };
+            },
+            { logFile: job.logFile }
+          );
+          executionStatus = execution.exitStatus;
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
         const jobFile = resolveJobFile(cwd, job.id);
 
         console.log(JSON.stringify({
-          executionStatus: execution.exitStatus,
+          executionStatus,
+          errorMessage,
           jobs: listJobs(cwd),
           jobFileExists: fs.existsSync(jobFile),
           jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
@@ -4895,7 +4904,8 @@ def test_codex_run_tracked_job_completion_after_session_end_does_not_republish_r
         args=[str(tmp_path)],
     )
 
-    assert payload["executionStatus"] == 0
+    assert payload["executionStatus"] is None
+    assert "ended before job terminal-ended-session could finish" in payload["errorMessage"]
     assert payload["jobs"] == []
     assert payload["jobFileExists"] is False
     assert "terminal secret" not in payload["jobFileText"]
@@ -4943,22 +4953,30 @@ def test_codex_run_tracked_job_does_not_recreate_log_when_terminal_write_rejecte
           pid: null,
           logFile: state.resolveJobLogFile(cwd, 'terminal-log-race')
         };
-        const execution = await tracked.runTrackedJob(
-          job,
-          async () => ({
-            exitStatus: 0,
-            threadId: 'thread-log-race',
-            turnId: 'turn-log-race',
-            summary: 'terminal log summary',
-            payload: { secret: 'terminal log secret' },
-            rendered: 'terminal log rendered secret'
-          }),
-          { logFile: job.logFile }
-        );
+        let executionStatus = null;
+        let errorMessage = '';
+        try {
+          const execution = await tracked.runTrackedJob(
+            job,
+            async () => ({
+              exitStatus: 0,
+              threadId: 'thread-log-race',
+              turnId: 'turn-log-race',
+              summary: 'terminal log summary',
+              payload: { secret: 'terminal log secret' },
+              rendered: 'terminal log rendered secret'
+            }),
+            { logFile: job.logFile }
+          );
+          executionStatus = execution.exitStatus;
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
         const jobFile = state.resolveJobFile(cwd, job.id);
 
         console.log(JSON.stringify({
-          executionStatus: execution.exitStatus,
+          executionStatus,
+          errorMessage,
           jobs: state.listJobs(cwd),
           jobFileExists: fs.existsSync(jobFile),
           logFileExists: fs.existsSync(job.logFile),
@@ -4968,7 +4986,8 @@ def test_codex_run_tracked_job_does_not_recreate_log_when_terminal_write_rejecte
         args=[str(tmp_path)],
     )
 
-    assert payload["executionStatus"] == 0
+    assert payload["executionStatus"] is None
+    assert "ended before job terminal-log-race could finish" in payload["errorMessage"]
     assert payload["jobs"] == []
     assert payload["jobFileExists"] is False
     assert payload["logFileExists"] is False
@@ -5022,22 +5041,30 @@ def test_codex_run_tracked_job_does_not_recreate_log_after_terminal_sidecar_clea
           logFile: state.resolveJobLogFile(cwd, 'terminal-final-output-race')
         };
         fs.writeFileSync(job.logFile, 'running log\\n', 'utf8');
-        const execution = await tracked.runTrackedJob(
-          job,
-          async () => ({
-            exitStatus: 0,
-            threadId: 'thread-final-output-race',
-            turnId: 'turn-final-output-race',
-            summary: 'terminal final output summary',
-            payload: { secret: 'terminal final output secret' },
-            rendered: 'FINAL_LOG_RENDERED_SECRET'
-          }),
-          { logFile: job.logFile }
-        );
+        let executionStatus = null;
+        let errorMessage = '';
+        try {
+          const execution = await tracked.runTrackedJob(
+            job,
+            async () => ({
+              exitStatus: 0,
+              threadId: 'thread-final-output-race',
+              turnId: 'turn-final-output-race',
+              summary: 'terminal final output summary',
+              payload: { secret: 'terminal final output secret' },
+              rendered: 'FINAL_LOG_RENDERED_SECRET'
+            }),
+            { logFile: job.logFile }
+          );
+          executionStatus = execution.exitStatus;
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
         const jobFile = state.resolveJobFile(cwd, job.id);
 
         console.log(JSON.stringify({
-          executionStatus: execution.exitStatus,
+          executionStatus,
+          errorMessage,
           injected,
           jobs: state.listJobs(cwd),
           jobFileExists: fs.existsSync(jobFile),
@@ -5048,7 +5075,8 @@ def test_codex_run_tracked_job_does_not_recreate_log_after_terminal_sidecar_clea
         args=[str(tmp_path)],
     )
 
-    assert payload["executionStatus"] == 0
+    assert payload["executionStatus"] is None
+    assert "ended before job terminal-final-output-race could finish" in payload["errorMessage"]
     assert payload["injected"] is True
     assert payload["jobs"] == []
     assert payload["jobFileExists"] is False

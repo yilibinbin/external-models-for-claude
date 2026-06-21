@@ -224,6 +224,10 @@ function cleanupTrackedJobIfSessionEnded(job) {
   return true;
 }
 
+function sessionEndedFinishError(job) {
+  return new Error(`Claude session ${job.sessionId} ended before job ${job.id} could finish.`);
+}
+
 export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
@@ -425,7 +429,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       heartbeat = null;
     }
     if (cleanupTrackedJobIfSessionEnded(runningRecord)) {
-      return execution;
+      throw sessionEndedFinishError(runningRecord);
     }
     if (!upsertJob(job.workspaceRoot, {
       id: job.id,
@@ -439,7 +443,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     })) {
       removeTrackedJobAfterSessionEnd(runningRecord);
-      return execution;
+      throw sessionEndedFinishError(runningRecord);
     }
     const completedJobFile = writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
@@ -452,8 +456,13 @@ export async function runTrackedJob(job, runner, options = {}) {
       result: execution.payload,
       rendered: execution.rendered
     });
-    if (completedJobFile) {
-      appendLogBlockIfJobCurrent(runningRecord, effectiveLogFile, "Final output", execution.rendered);
+    if (!completedJobFile) {
+      removeTrackedJobAfterSessionEnd(runningRecord);
+      throw sessionEndedFinishError(runningRecord);
+    }
+    appendLogBlockIfJobCurrent(runningRecord, effectiveLogFile, "Final output", execution.rendered);
+    if (cleanupTrackedJobIfSessionEnded(runningRecord)) {
+      throw sessionEndedFinishError(runningRecord);
     }
     return execution;
   } catch (error) {
