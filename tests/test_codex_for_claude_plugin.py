@@ -4434,6 +4434,92 @@ def test_codex_run_tracked_job_does_not_start_runner_when_running_write_rejected
     assert payload["logFileExists"] is False
 
 
+def test_codex_run_tracked_job_does_not_start_runner_when_initial_heartbeat_rejected(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+
+        const cwd = process.argv[1];
+        const originalRenameSync = fs.renameSync;
+        let injected = false;
+        fs.renameSync = function patchedRenameSync(from, to) {
+          originalRenameSync.call(this, from, to);
+          if (injected || !String(to).endsWith('/heartbeat-start-race.json')) {
+            return;
+          }
+          try {
+            const stored = JSON.parse(fs.readFileSync(to, 'utf8'));
+            if (stored.status !== 'running') {
+              return;
+            }
+            injected = true;
+            const stateFile = String(to).replace(/\\/jobs\\/heartbeat-start-race\\.json$/, '/state.json');
+            const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+            state.endedSessions = [...(state.endedSessions || []), 'session-heartbeat-start-race'];
+            state.jobs = state.jobs.filter((job) => job.id !== 'heartbeat-start-race');
+            fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\\n`, 'utf8');
+          } catch {
+            // Non-target rename calls are irrelevant for this race injection.
+          }
+        };
+
+        const tracked = await import('./plugins/codex/scripts/lib/tracked-jobs.mjs');
+        const state = await import('./plugins/codex/scripts/lib/state.mjs');
+        let runnerStarted = false;
+        let errorMessage = '';
+        const job = {
+          id: 'heartbeat-start-race',
+          status: 'queued',
+          kind: 'task',
+          title: 'Heartbeat start race',
+          workspaceRoot: cwd,
+          sessionId: 'session-heartbeat-start-race',
+          phase: 'queued',
+          pid: null,
+          logFile: state.resolveJobLogFile(cwd, 'heartbeat-start-race')
+        };
+        fs.writeFileSync(job.logFile, 'heartbeat start log\\n', 'utf8');
+        try {
+          await tracked.runTrackedJob(
+            job,
+            async () => {
+              runnerStarted = true;
+              return {
+                exitStatus: 0,
+                threadId: 'thread-heartbeat-start-race',
+                turnId: 'turn-heartbeat-start-race',
+                summary: 'should not run',
+                payload: {},
+                rendered: 'should not render'
+              };
+            },
+            { logFile: job.logFile }
+          );
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
+        const jobFile = state.resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          injected,
+          runnerStarted,
+          errorMessage,
+          jobs: state.listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["injected"] is True
+    assert payload["runnerStarted"] is False
+    assert "ended before job heartbeat-start-race could run" in payload["errorMessage"]
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+
+
 def test_codex_run_tracked_job_prerun_session_end_removes_options_log(tmp_path):
     payload = run_node_script(
         """
