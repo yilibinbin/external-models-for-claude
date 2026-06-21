@@ -139,6 +139,40 @@ function uniqueJobsById(jobs) {
   return [...byId.values()];
 }
 
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value ?? {}, key);
+}
+
+function hasLifecycleJobFields(jobPatch) {
+  return [
+    "status",
+    "kind",
+    "kindLabel",
+    "jobClass",
+    "title",
+    "summary",
+    "workspaceRoot",
+    "sessionId",
+    "logFile",
+    "pid",
+    "createdAt",
+    "startedAt",
+    "completedAt",
+    "request",
+    "result",
+    "rendered"
+  ].some((key) => hasOwn(jobPatch, key));
+}
+
+function readSidecarSessionId(cwd, jobId) {
+  try {
+    const storedJob = readJobFile(resolveJobFile(cwd, jobId));
+    return storedJob?.sessionId ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function sleepSync(ms) {
   const shared = new Int32Array(new SharedArrayBuffer(4));
   Atomics.wait(shared, 0, 0, ms);
@@ -249,18 +283,19 @@ export function writeAtomicJson(filePath, payload) {
 }
 
 export function saveStateUnlocked(cwd, state, previousJobs = []) {
-  const nextJobs = pruneJobs(state.jobs ?? []);
   const current = loadState(cwd);
+  const endedSessions = normalizeEndedSessions([
+    ...normalizeEndedSessions(current.endedSessions),
+    ...normalizeEndedSessions(state.endedSessions)
+  ]);
+  const nextJobs = pruneJobs((state.jobs ?? []).filter((job) => !stateHasEndedSession({ endedSessions }, job?.sessionId)));
   const nextState = {
     version: STATE_VERSION,
     config: {
       ...defaultState().config,
       ...(state.config ?? {})
     },
-    endedSessions: normalizeEndedSessions([
-      ...normalizeEndedSessions(current.endedSessions),
-      ...normalizeEndedSessions(state.endedSessions)
-    ]),
+    endedSessions,
     jobs: nextJobs
   };
 
@@ -336,13 +371,20 @@ export function generateJobId(prefix = "job") {
 
 export function upsertJob(cwd, jobPatch) {
   let applied = false;
+  const sidecarSessionId =
+    jobPatch?.sessionId == null && jobPatch?.id && !hasLifecycleJobFields(jobPatch)
+      ? readSidecarSessionId(cwd, jobPatch.id)
+      : null;
   updateState(cwd, (state) => {
     const timestamp = nowIso();
     const existingIndex = state.jobs.findIndex((job) => job.id === jobPatch.id);
     const existing = existingIndex === -1 ? null : state.jobs[existingIndex];
-    const sessionId = jobPatch.sessionId ?? existing?.sessionId ?? null;
+    const sessionId = jobPatch.sessionId ?? existing?.sessionId ?? sidecarSessionId ?? null;
     if (stateHasEndedSession(state, sessionId)) {
       state.jobs = state.jobs.filter((job) => job.id !== jobPatch.id);
+      return;
+    }
+    if (existingIndex === -1 && !sessionId && !hasLifecycleJobFields(jobPatch)) {
       return;
     }
     if (existingIndex === -1) {

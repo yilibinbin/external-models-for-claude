@@ -3315,6 +3315,49 @@ def test_codex_save_state_preserves_ended_session_tombstones(tmp_path):
     }
 
 
+def test_codex_save_state_replacement_filters_ended_session_jobs_from_status(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    payload = run_node_script(
+        """
+        import {
+          listJobs,
+          markSessionEnded,
+          saveState,
+          updateState
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-save-state-status-ended');
+        });
+        saveState(cwd, {
+          jobs: [{
+            id: 'save-state-status-ended-job',
+            status: 'running',
+            phase: 'running',
+            workspaceRoot: cwd,
+            sessionId: 'session-save-state-status-ended',
+            updatedAt: new Date().toISOString()
+          }]
+        });
+
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd)
+        }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+
+    assert payload["jobs"] == []
+    assert result.returncode == 0, result.stderr
+    status = json.loads(result.stdout)
+    assert status["running"] == []
+    assert status["latestFinished"] is None
+    assert status["recent"] == []
+
+
 def test_codex_save_state_replacement_removes_sidecar_only_log_path(tmp_path):
     payload = run_node_script(
         """

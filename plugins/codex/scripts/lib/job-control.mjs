@@ -2,7 +2,7 @@ import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { classifyJobLiveness } from "./job-lifecycle.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobSidecars, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -233,6 +233,24 @@ function matchJobReference(jobs, reference, predicate = () => true) {
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
 }
 
+function listJobsWithSidecars(workspaceRoot) {
+  const byId = new Map();
+  for (const job of listJobs(workspaceRoot)) {
+    if (job?.id) {
+      byId.set(job.id, job);
+    }
+  }
+  for (const job of listJobSidecars(workspaceRoot)) {
+    if (job?.id) {
+      byId.set(job.id, {
+        ...(byId.get(job.id) ?? {}),
+        ...job
+      });
+    }
+  }
+  return [...byId.values()];
+}
+
 export function buildStatusSnapshot(workspaceRoot, options = {}) {
   const config = getConfig(workspaceRoot);
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
@@ -302,7 +320,7 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(listJobsWithSidecars(workspaceRoot));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {
