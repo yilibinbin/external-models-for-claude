@@ -6639,13 +6639,14 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
         "const installUngated = base.replace('      - name: Install Codex for Claude plugin\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'', '      - name: Install Codex for Claude plugin');"
         "const extraUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Extra ungated shell\\n        shell: bash\\n        run: echo unsafe\\n      - uses: actions/upload-artifact@v4');"
         "const disguisedUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Extra disguised ungated shell\\n        shell: bash\\n        run: |\\n          if: steps.fork-safety.outputs.safe_to_review == \\'true\\'\\n          echo unsafe\\n      - uses: actions/upload-artifact@v4');"
+        "const extraJob = base.replace('          retention-days: 5\\n', '          retention-days: 5\\n  unsafe-extra-job:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - run: echo unsafe\\n');"
         "const shorthandUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - run: echo unsafe\\n      - uses: actions/upload-artifact@v4');"
         "const unsafeDetector = base.replace(/      - name: Detect fork safety[\\s\\S]*?      - uses: actions\\/setup-node@v4/, '      - name: Detect fork safety\\n        id: fork-safety\\n        shell: bash\\n        run: |\\n          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          # Codex review skipped because pull request head repository is not this repository.\\n          # {\"status\":\"skipped\",\"reason\":\"external-head-repository\"}\\n      - uses: actions/setup-node@v4');"
         "const unsafeDetectorAfterFi = base.replace('          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          fi', '          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          fi\\n          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"');"
         "const duplicateDetector = base.replace('      - uses: actions/setup-node@v4', '      - name: Detect fork safety\\n        shell: bash\\n        run: echo unsafe-from-fork\\n      - uses: actions/setup-node@v4');"
         "const detectorBlock = base.match(/      - name: Detect fork safety[\\s\\S]*?      - uses: actions\\/setup-node@v4/)[0].replace('      - uses: actions/setup-node@v4', '');"
         "const duplicateExactDetector = base.replace('      - uses: actions/setup-node@v4', `${detectorBlock}      - uses: actions/setup-node@v4`);"
-        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), disguisedUngated:g.validateWorkflow(disguisedUngated), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi), duplicateDetector:g.validateWorkflow(duplicateDetector), duplicateExactDetector:g.validateWorkflow(duplicateExactDetector)}));"
+        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), disguisedUngated:g.validateWorkflow(disguisedUngated), extraJob:g.validateWorkflow(extraJob), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi), duplicateDetector:g.validateWorkflow(duplicateDetector), duplicateExactDetector:g.validateWorkflow(duplicateExactDetector)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6654,6 +6655,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     install_check = next(check for check in payload["installUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     extra_check = next(check for check in payload["extraUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     disguised_check = next(check for check in payload["disguisedUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
+    extra_job_check = next(check for check in payload["extraJob"]["checks"] if check["name"] == "single-codex-review-job")
     shorthand_check = next(check for check in payload["shorthandUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     detector_check = next(check for check in payload["unsafeDetector"]["checks"] if check["name"] == "fork-safe-step-gates")
     detector_after_fi_check = next(check for check in payload["unsafeDetectorAfterFi"]["checks"] if check["name"] == "fork-safe-step-gates")
@@ -6663,6 +6665,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     assert install_check["ok"] is False
     assert extra_check["ok"] is False
     assert disguised_check["ok"] is False
+    assert extra_job_check["ok"] is False
     assert shorthand_check["ok"] is False
     assert detector_check["ok"] is False
     assert detector_after_fi_check["ok"] is False
@@ -6672,6 +6675,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     assert payload["installUngated"]["structuralOk"] is False
     assert payload["extraUngated"]["structuralOk"] is False
     assert payload["disguisedUngated"]["structuralOk"] is False
+    assert payload["extraJob"]["structuralOk"] is False
     assert payload["shorthandUngated"]["structuralOk"] is False
     assert payload["unsafeDetector"]["structuralOk"] is False
     assert payload["unsafeDetectorAfterFi"]["structuralOk"] is False

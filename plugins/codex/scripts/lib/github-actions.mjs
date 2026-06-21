@@ -69,39 +69,40 @@ function activeBlockStartingWith(text, trimmedStart) {
 
 function activeStepBlocks(text) {
   const lines = activeWorkflowLines(text);
-  const stepsIndex = lines.findIndex((line) => line.trim() === "steps:");
-  if (stepsIndex < 0) {
-    return [];
-  }
-  const stepsIndent = leadingSpaces(lines[stepsIndex]);
-  const itemIndent = lines
-    .slice(stepsIndex + 1)
-    .find((line) => line.trim() && leadingSpaces(line) > stepsIndent && /^-\s+/.test(line.trim()));
-  if (!itemIndent) {
-    return [];
-  }
-  const stepIndent = leadingSpaces(itemIndent);
   const blocks = [];
-  let block = [];
-  for (const line of lines.slice(stepsIndex + 1)) {
-    const trimmed = line.trim();
-    const indent = leadingSpaces(line);
-    if (trimmed && indent <= stepsIndent) {
-      break;
-    }
-    if (indent === stepIndent && /^-\s+/.test(trimmed)) {
-      if (block.length > 0) {
-        blocks.push(block);
-      }
-      block = [line];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].trim() !== "steps:") {
       continue;
     }
-    if (block.length > 0) {
-      block.push(line);
+    const stepsIndent = leadingSpaces(lines[index]);
+    const itemIndent = lines
+      .slice(index + 1)
+      .find((line) => line.trim() && leadingSpaces(line) > stepsIndent && /^-\s+/.test(line.trim()));
+    if (!itemIndent) {
+      continue;
     }
-  }
-  if (block.length > 0) {
-    blocks.push(block);
+    const stepIndent = leadingSpaces(itemIndent);
+    let block = [];
+    for (const line of lines.slice(index + 1)) {
+      const trimmed = line.trim();
+      const indent = leadingSpaces(line);
+      if (trimmed && indent <= stepsIndent) {
+        break;
+      }
+      if (indent === stepIndent && /^-\s+/.test(trimmed)) {
+        if (block.length > 0) {
+          blocks.push(block);
+        }
+        block = [line];
+        continue;
+      }
+      if (block.length > 0) {
+        block.push(line);
+      }
+    }
+    if (block.length > 0) {
+      blocks.push(block);
+    }
   }
   return blocks;
 }
@@ -140,6 +141,14 @@ function hasPullRequestOnlyTrigger(text) {
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));
   return countTopLevelKey(text, "on") === 1 && entries.length === 1 && entries[0] === "pull_request:";
+}
+
+function hasSingleCodexReviewJob(text) {
+  const entries = topLevelBlockLines(text, "jobs:")
+    .filter((line) => /^\s{2}\S/.test(line))
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  return entries.length === 1 && entries[0] === "codex-review:";
 }
 
 function normalizedCommandText(text) {
@@ -365,6 +374,7 @@ export function validateWorkflow(text) {
     !hasUnexpectedCommandSubstitution(text);
   const checks = [
     result(hasPullRequestOnlyTrigger(text), "has-pull-request-trigger"),
+    result(hasSingleCodexReviewJob(text), "single-codex-review-job"),
     result(!text.includes("pull_request_target"), "no-pull-request-target"),
     result(hasMinimalContentsReadPermission(text), "minimal-contents-permission"),
     result(hasImmutableMarketplaceInstall(text), "marketplace-install"),
