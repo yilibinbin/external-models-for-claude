@@ -2710,8 +2710,9 @@ def test_codex_state_uses_required_slice_contracts():
     source = read_text(PLUGIN / "scripts" / "lib" / "state.mjs")
     save_state = js_function_body(source, "saveState")
     update_state = js_function_body(source, "updateState")
-    assert "const previousJobs = (state.jobs ?? []).slice()" in save_state
-    assert "loadState(cwd)" not in save_state
+    assert "let previousJobs = []" in save_state
+    assert "previousJobs = loadState(cwd).jobs.slice()" in save_state
+    assert save_state.index("previousJobs = loadState(cwd).jobs.slice()") < save_state.index("saveStateUnlocked(cwd, state, previousJobs)")
     assert "const current = loadState(cwd)" in update_state
     assert "const previousJobs = current.jobs.slice()" in update_state
     assert "mutator(current)" in update_state
@@ -2738,7 +2739,9 @@ def test_codex_state_pruned_job_files_are_removed_under_job_file_lock():
     assert save_state.index("withStateLock(cwd") < save_state.index("removePrunedJobFiles(cwd")
     assert update_state.index("withStateLock(cwd") < update_state.index("removePrunedJobFiles(cwd")
     assert re.search(
+        r"let previousJobs = \[\];\s*"
         r"const nextState = withStateLock\(cwd, \(\) => \{\s*"
+        r"previousJobs = loadState\(cwd\)\.jobs\.slice\(\);\s*"
         r"return saveStateUnlocked\(cwd, state, previousJobs\);\s*"
         r"\}\);\s*"
         r"removePrunedJobFiles\(cwd, previousJobs, nextState\.jobs\);",
@@ -2755,6 +2758,45 @@ def test_codex_state_pruned_job_files_are_removed_under_job_file_lock():
     assert "withJobFileLock" not in save_unlocked
     assert "removePrunedJobFiles" not in save_unlocked
     assert "removeJobFile" not in save_unlocked
+
+
+def test_codex_save_state_replacement_removes_omitted_terminal_sidecars(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          resolveJobFile,
+          resolveJobLogFile,
+          saveState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'save-state-removed-terminal',
+          status: 'completed',
+          workspaceRoot: cwd,
+          logFile: resolveJobLogFile(cwd, 'save-state-removed-terminal'),
+          updatedAt: new Date().toISOString()
+        };
+        saveState(cwd, { jobs: [job] });
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'secret-log\\n', 'utf8');
+        saveState(cwd, { jobs: [] });
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile),
+          logFileText: fs.existsSync(job.logFile) ? fs.readFileSync(job.logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+    assert "secret-log" not in payload["logFileText"]
 
 
 def test_codex_state_skips_pruned_file_delete_when_job_reappears(tmp_path):
@@ -3643,6 +3685,7 @@ def test_codex_progress_log_only_after_session_end_does_not_recreate_log(tmp_pat
 
         const reporter = createProgressReporter({
           logFile: job.logFile,
+          job,
           onEvent: update
         });
         reporter({
@@ -3743,6 +3786,39 @@ def test_codex_progress_reporter_does_not_log_after_session_end_between_gate_and
     assert payload["jobFileExists"] is False
     assert payload["logFileExists"] is False
     assert "SECRET_AFTER_SESSION_END" not in payload["logFileText"]
+
+
+def test_codex_generic_progress_reporter_ignores_on_event_return_value(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          createProgressReporter
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+
+        const logFile = process.argv[1];
+        const reporter = createProgressReporter({
+          logFile,
+          onEvent() {
+            return false;
+          }
+        });
+        reporter({
+          message: 'generic progress line',
+          logTitle: 'Generic block',
+          logBody: 'generic progress body'
+        });
+        console.log(JSON.stringify({
+          logFileExists: fs.existsSync(logFile),
+          logFileText: fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path / "generic-progress.log")],
+    )
+
+    assert payload["logFileExists"] is True
+    assert "generic progress line" in payload["logFileText"]
+    assert "generic progress body" in payload["logFileText"]
 
 
 def test_codex_run_tracked_job_completion_after_session_end_does_not_republish_result(tmp_path):

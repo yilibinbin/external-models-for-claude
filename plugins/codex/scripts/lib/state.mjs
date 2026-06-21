@@ -284,8 +284,9 @@ export function removePrunedJobFiles(cwd, previousJobs, nextJobs) {
 }
 
 export function saveState(cwd, state) {
-  const previousJobs = (state.jobs ?? []).slice();
+  let previousJobs = [];
   const nextState = withStateLock(cwd, () => {
+    previousJobs = loadState(cwd).jobs.slice();
     return saveStateUnlocked(cwd, state, previousJobs);
   });
   removePrunedJobFiles(cwd, previousJobs, nextState.jobs);

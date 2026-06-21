@@ -311,11 +311,12 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
 
   return (eventOrMessage) => {
     const event = normalizeProgressEvent(eventOrMessage);
+    const jobBacked = Boolean(job?.workspaceRoot && job?.id);
     const shouldLog = onEvent?.(event);
-    if (shouldLog === false) {
+    if (jobBacked && shouldLog === false) {
       return;
     }
-    if (job?.workspaceRoot && job?.id && logFile) {
+    if (jobBacked && logFile) {
       if (!appendProgressLogIfJobCurrent(job, logFile, event)) {
         return;
       }
@@ -324,7 +325,7 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     if (stderr && stderrMessage) {
       process.stderr.write(`[codex] ${stderrMessage}\n`);
     }
-    if (!job?.workspaceRoot || !job?.id) {
+    if (!jobBacked) {
       appendLogLine(logFile, event.message);
       appendLogBlock(logFile, event.logTitle, event.logBody);
     }
