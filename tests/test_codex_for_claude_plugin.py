@@ -1749,6 +1749,276 @@ def test_codex_background_enqueue_failure_after_session_end_does_not_write_faile
     assert payload["logFileExists"] is False
 
 
+def test_codex_background_enqueue_consumes_queued_sidecar_rejection(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { __testHooks } from './plugins/codex/scripts/codex-companion.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'task-queued-sidecar-rejected',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task: queued sidecar rejected',
+          summary: 'queued sidecar rejected',
+          write: true,
+          sessionId: 'session-queued-sidecar-rejected',
+          workspaceRoot: cwd
+        };
+        const request = {
+          cwd,
+          model: null,
+          effort: null,
+          prompt: 'queued sidecar rejected secret',
+          write: true,
+          resumeLast: false,
+          jobId: job.id
+        };
+        const lease = {
+          disabled: false,
+          lease: { id: 'background-job-queued-sidecar-rejected' },
+          released: false,
+          release() {
+            this.released = true;
+          }
+        };
+        let spawnCalled = false;
+        let errorCode = null;
+        let errorMessage = null;
+        try {
+          __testHooks.enqueueBackgroundTask(cwd, job, request, lease, {
+            beforeQueuedJobFileWrite() {
+              updateState(cwd, (state) => {
+                markSessionEnded(state, 'session-queued-sidecar-rejected');
+                state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-queued-sidecar-rejected');
+              });
+            },
+            spawnTaskWorker() {
+              spawnCalled = true;
+              return { pid: 12345 };
+            },
+            transferResourceLease() {
+              return true;
+            }
+          });
+        } catch (error) {
+          errorCode = error.code ?? null;
+          errorMessage = error.message;
+        }
+        const jobFile = resolveJobFile(cwd, job.id);
+        const logFile = resolveJobLogFile(cwd, job.id);
+        console.log(JSON.stringify({
+          errorCode,
+          errorMessage,
+          released: lease.released,
+          spawnCalled,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        env=governor_env(tmp_path),
+        args=[str(tmp_path)],
+    )
+
+    assert payload["errorCode"] == "ESESSIONENDED"
+    assert "ended before background task" in payload["errorMessage"]
+    assert payload["released"] is True
+    assert payload["spawnCalled"] is False
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+
+
+def test_codex_background_enqueue_consumes_spawned_sidecar_rejection(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { __testHooks } from './plugins/codex/scripts/codex-companion.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'task-spawned-sidecar-rejected',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task: spawned sidecar rejected',
+          summary: 'spawned sidecar rejected',
+          write: true,
+          sessionId: 'session-spawned-sidecar-rejected',
+          workspaceRoot: cwd
+        };
+        const request = {
+          cwd,
+          model: null,
+          effort: null,
+          prompt: 'spawned sidecar rejected secret',
+          write: true,
+          resumeLast: false,
+          jobId: job.id
+        };
+        const lease = {
+          disabled: false,
+          lease: { id: 'background-job-spawned-sidecar-rejected' },
+          released: false,
+          release() {
+            this.released = true;
+          }
+        };
+        let transferCalled = false;
+        let errorCode = null;
+        let errorMessage = null;
+        try {
+          __testHooks.enqueueBackgroundTask(cwd, job, request, lease, {
+            spawnTaskWorker() {
+              return { pid: 99999999 };
+            },
+            transferResourceLease() {
+              transferCalled = true;
+              return true;
+            },
+            beforeSpawnedJobFileWrite() {
+              updateState(cwd, (state) => {
+                markSessionEnded(state, 'session-spawned-sidecar-rejected');
+                state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-spawned-sidecar-rejected');
+              });
+            }
+          });
+        } catch (error) {
+          errorCode = error.code ?? null;
+          errorMessage = error.message;
+        }
+        const jobFile = resolveJobFile(cwd, job.id);
+        const logFile = resolveJobLogFile(cwd, job.id);
+        console.log(JSON.stringify({
+          errorCode,
+          errorMessage,
+          released: lease.released,
+          transferCalled,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        env=governor_env(tmp_path),
+        args=[str(tmp_path)],
+    )
+
+    assert payload["errorCode"] == "ESESSIONENDED"
+    assert "ended before background task" in payload["errorMessage"]
+    assert payload["released"] is True
+    assert payload["transferCalled"] is True
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert "spawned sidecar rejected secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
+
+
+def test_codex_background_launch_failure_consumes_failed_sidecar_rejection(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { __testHooks } from './plugins/codex/scripts/codex-companion.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'task-failed-sidecar-rejected',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Codex Task: failed sidecar rejected',
+          summary: 'failed sidecar rejected',
+          write: true,
+          sessionId: 'session-failed-sidecar-rejected',
+          workspaceRoot: cwd
+        };
+        const request = {
+          cwd,
+          model: null,
+          effort: null,
+          prompt: 'failed sidecar rejected secret',
+          write: true,
+          resumeLast: false,
+          jobId: job.id
+        };
+        const lease = {
+          disabled: false,
+          lease: { id: 'background-job-failed-sidecar-rejected' },
+          released: false,
+          release() {
+            this.released = true;
+          }
+        };
+        let errorCode = null;
+        let errorMessage = null;
+        try {
+          __testHooks.enqueueBackgroundTask(cwd, job, request, lease, {
+            spawnTaskWorker() {
+              throw new Error('spawn failed before failed sidecar');
+            },
+            transferResourceLease() {
+              return true;
+            },
+            beforeFailedJobFileWrite() {
+              updateState(cwd, (state) => {
+                markSessionEnded(state, 'session-failed-sidecar-rejected');
+                state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-failed-sidecar-rejected');
+              });
+            }
+          });
+        } catch (error) {
+          errorCode = error.code ?? null;
+          errorMessage = error.message;
+        }
+        const jobFile = resolveJobFile(cwd, job.id);
+        const logFile = resolveJobLogFile(cwd, job.id);
+        console.log(JSON.stringify({
+          errorCode,
+          errorMessage,
+          released: lease.released,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        env=governor_env(tmp_path),
+        args=[str(tmp_path)],
+    )
+
+    assert payload["errorCode"] == "ESESSIONENDED"
+    assert "ended before background task" in payload["errorMessage"]
+    assert payload["released"] is True
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert "failed sidecar rejected secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
+
+
 def test_codex_cancel_after_session_end_does_not_write_cancelled_sidecar(tmp_path):
     env = governor_env(tmp_path)
     run_node_script(
@@ -4667,6 +4937,93 @@ def test_codex_run_tracked_job_starts_when_heartbeat_disabled(tmp_path):
     assert payload["jobs"][0]["status"] == "completed"
 
 
+def test_codex_run_tracked_job_with_heartbeat_disabled_still_checks_session_end_before_runner(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+
+        const cwd = process.argv[1];
+        process.env.CODEX_FOR_CLAUDE_DISABLE_HEARTBEAT = '1';
+        const originalRenameSync = fs.renameSync;
+        let injected = false;
+        fs.renameSync = function patchedRenameSync(from, to) {
+          originalRenameSync.call(this, from, to);
+          if (injected || !String(to).endsWith('/heartbeat-disabled-start-race.json')) {
+            return;
+          }
+          try {
+            const stored = JSON.parse(fs.readFileSync(to, 'utf8'));
+            if (stored.status !== 'running') {
+              return;
+            }
+            injected = true;
+            const stateFile = String(to).replace(/\\/jobs\\/heartbeat-disabled-start-race\\.json$/, '/state.json');
+            const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+            state.endedSessions = [...(state.endedSessions || []), 'session-heartbeat-disabled-start-race'];
+            state.jobs = state.jobs.filter((job) => job.id !== 'heartbeat-disabled-start-race');
+            fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\\n`, 'utf8');
+          } catch {
+            // Non-target rename calls are irrelevant for this race injection.
+          }
+        };
+
+        const tracked = await import('./plugins/codex/scripts/lib/tracked-jobs.mjs');
+        const state = await import('./plugins/codex/scripts/lib/state.mjs');
+        let runnerStarted = false;
+        let errorMessage = '';
+        const job = {
+          id: 'heartbeat-disabled-start-race',
+          status: 'queued',
+          kind: 'task',
+          title: 'Heartbeat disabled start race',
+          workspaceRoot: cwd,
+          sessionId: 'session-heartbeat-disabled-start-race',
+          phase: 'queued',
+          pid: null,
+          logFile: state.resolveJobLogFile(cwd, 'heartbeat-disabled-start-race')
+        };
+        fs.writeFileSync(job.logFile, 'heartbeat disabled start log\\n', 'utf8');
+        try {
+          await tracked.runTrackedJob(
+            job,
+            async () => {
+              runnerStarted = true;
+              return {
+                exitStatus: 0,
+                threadId: 'thread-heartbeat-disabled-start-race',
+                turnId: 'turn-heartbeat-disabled-start-race',
+                summary: 'should not run',
+                payload: {},
+                rendered: 'should not render'
+              };
+            },
+            { logFile: job.logFile }
+          );
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
+        const jobFile = state.resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          injected,
+          runnerStarted,
+          errorMessage,
+          jobs: state.listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["injected"] is True
+    assert payload["runnerStarted"] is False
+    assert "ended before job heartbeat-disabled-start-race could run" in payload["errorMessage"]
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+
+
 def test_codex_run_tracked_job_prerun_session_end_removes_options_log(tmp_path):
     payload = run_node_script(
         """
@@ -4752,8 +5109,18 @@ def test_codex_companion_publishes_background_and_cancel_state_before_job_file_w
     assert failure.index("upsertJob(job.workspaceRoot") < failure.index("writeJobFile(job.workspaceRoot, job.id, failedRecord)")
     assert "if (!upsertJob(job.workspaceRoot" in failure
     assert failure.index("if (!upsertJob(job.workspaceRoot") < failure.index("writeJobFile(job.workspaceRoot, job.id, failedRecord)")
+    assert "const failedJobFile = writeJobFile(job.workspaceRoot, job.id, failedRecord)" in failure
+    assert "if (!failedJobFile)" in failure
     assert enqueue.index("upsertJob(job.workspaceRoot", enqueue.index("const queuedRecord")) < enqueue.index("writeJobFile(job.workspaceRoot, job.id, queuedRecord)")
     assert enqueue.index("upsertJob(job.workspaceRoot", enqueue.index("const spawnedRecord")) < enqueue.index("writeJobFile(job.workspaceRoot, job.id, spawnedRecord)")
+    assert "const queuedStateApplied = upsertJob(job.workspaceRoot" in enqueue
+    assert "if (!queuedStateApplied)" in enqueue
+    assert "const queuedJobFile = writeJobFile(job.workspaceRoot, job.id, queuedRecord)" in enqueue
+    assert "if (!queuedJobFile)" in enqueue
+    assert "const spawnedStateApplied = upsertJob(job.workspaceRoot" in enqueue
+    assert "if (!spawnedStateApplied)" in enqueue
+    assert "const spawnedJobFile = writeJobFile(job.workspaceRoot, job.id, spawnedRecord)" in enqueue
+    assert "if (!spawnedJobFile)" in enqueue
     assert cancel.index("upsertJob(workspaceRoot") < cancel.index("writeJobFile(workspaceRoot, job.id")
     assert "if (!upsertJob(workspaceRoot" in cancel
     assert "sessionId: job.sessionId" in cancel
