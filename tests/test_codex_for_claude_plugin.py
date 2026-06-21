@@ -5724,6 +5724,73 @@ def test_codex_status_omits_tombstoned_sidecar_only_active_job(tmp_path):
     assert not pathlib.Path(setup_payload["logFile"]).exists()
 
 
+def test_codex_status_cleans_tombstoned_shared_only_job_and_log(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    setup_payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import {
+          resolveJobLogFile,
+          resolveStateFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'status-tombstoned-shared-only',
+          status: 'running',
+          phase: 'running',
+          kind: 'task',
+          title: 'PRIVATE_SHARED_ONLY_TITLE',
+          summary: 'PRIVATE_SHARED_ONLY_SUMMARY',
+          workspaceRoot: cwd,
+          sessionId: 'session-status-shared-only',
+          logFile: resolveJobLogFile(cwd, 'status-tombstoned-shared-only'),
+          updatedAt: new Date().toISOString()
+        };
+        fs.writeFileSync(job.logFile, '[2000-01-01T00:00:00.000Z] PRIVATE_SHARED_ONLY_LOG\\n', 'utf8');
+        const stateFile = resolveStateFile(cwd);
+        fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+        fs.writeFileSync(stateFile, `${JSON.stringify({
+          version: 1,
+          config: { stopReviewGate: false },
+          endedSessions: ['session-status-shared-only'],
+          jobs: [job]
+        }, null, 2)}\\n`, 'utf8');
+        console.log(JSON.stringify({ stateFile, logFile: job.logFile }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    status_payload = json.loads(result.stdout)
+    text = json.dumps(status_payload)
+    assert all(job["id"] != "status-tombstoned-shared-only" for job in status_payload["running"])
+    assert status_payload["latestFinished"] is None
+    assert all(job["id"] != "status-tombstoned-shared-only" for job in status_payload["recent"])
+    assert "PRIVATE_SHARED_ONLY_TITLE" not in text
+    assert "PRIVATE_SHARED_ONLY_SUMMARY" not in text
+    assert "PRIVATE_SHARED_ONLY_LOG" not in text
+    verify_payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { listJobs } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const logFile = process.argv[2];
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd),
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        env=env,
+        args=[str(tmp_path), setup_payload["logFile"]],
+    )
+    assert verify_payload["jobs"] == []
+    assert verify_payload["logFileExists"] is False
+
+
 def test_codex_status_rechecks_tombstone_while_merging_sidecars(tmp_path):
     payload = run_node_script(
         """
@@ -5986,6 +6053,52 @@ def test_codex_status_liveness_reads_per_job_heartbeat(tmp_path):
     assert job["liveness"]["reason"] == "heartbeat-current"
 
 
+def test_codex_status_liveness_keeps_terminal_shared_status_with_stale_sidecar(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    run_node_script(
+        """
+        import {
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const shared = {
+          id: 'terminal-shared-stale-sidecar',
+          status: 'completed',
+          phase: 'done',
+          summary: 'completed in shared state',
+          workspaceRoot: cwd,
+          sessionId: 'session-terminal-shared-stale-sidecar',
+          updatedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+          pid: null
+        };
+        upsertJob(cwd, shared);
+        writeJobFile(cwd, shared.id, {
+          ...shared,
+          status: 'running',
+          phase: 'running',
+          heartbeatAtMs: Date.now(),
+          heartbeatAt: new Date().toISOString(),
+          pid: process.pid
+        });
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert all(job["id"] != "terminal-shared-stale-sidecar" for job in payload["running"])
+    assert payload["latestFinished"]["id"] == "terminal-shared-stale-sidecar"
+    assert payload["latestFinished"]["status"] == "completed"
+    assert payload["latestFinished"]["liveness"]["state"] == "terminal"
+    assert payload["latestFinished"]["liveness"]["reason"] == "completed"
+
+
 def test_codex_status_text_includes_liveness_for_list_and_single_job(tmp_path):
     env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
     run_node_script(
@@ -6030,6 +6143,7 @@ def test_codex_status_liveness_ignores_mismatched_or_malformed_job_files(tmp_pat
     assert "const root = job.workspaceRoot ?? workspaceRoot" in latest_body
     assert "catch" in latest_body
     assert "stored?.id !== job.id" in latest_body
+    assert "isTerminalStatus(job.status)" in latest_body
     env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
     run_node_script(
         """

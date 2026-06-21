@@ -10,7 +10,8 @@ import {
   readJobFile,
   removeJobSidecar,
   resolveJobFile,
-  stateHasEndedSession
+  stateHasEndedSession,
+  updateState
 } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -188,6 +189,10 @@ function inferLegacyJobPhase(job, progressPreview = []) {
   return job.jobClass === "review" ? "reviewing" : "running";
 }
 
+function isTerminalStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
 export function latestJobForLiveness(job, workspaceRoot) {
   const root = job.workspaceRoot ?? workspaceRoot;
   if (!root || !job?.id) {
@@ -201,6 +206,15 @@ export function latestJobForLiveness(job, workspaceRoot) {
   }
   if (stored?.id !== job.id) {
     return job;
+  }
+  if (isTerminalStatus(job.status)) {
+    return {
+      ...stored,
+      ...job,
+      heartbeatAtMs: stored.heartbeatAtMs ?? job.heartbeatAtMs,
+      heartbeatAt: stored.heartbeatAt ?? job.heartbeatAt,
+      heartbeat: stored.heartbeat ?? job.heartbeat
+    };
   }
   return {
     ...job,
@@ -319,6 +333,29 @@ function mergeStatusJobWithSidecar(existing, sidecar) {
   };
 }
 
+function cleanupTombstonedStatusJobs(workspaceRoot, jobs) {
+  const tombstoned = jobs.filter((job) => job?.id && jobSessionEndedFresh(job, workspaceRoot));
+  if (tombstoned.length === 0) {
+    return jobs;
+  }
+
+  const tombstonedIds = new Set(tombstoned.map((job) => job.id));
+  updateState(workspaceRoot, (state) => {
+    state.jobs = state.jobs.filter((job) => {
+      if (!tombstonedIds.has(job.id)) {
+        return true;
+      }
+      return !stateHasEndedSession(state, job.sessionId);
+    });
+  }, { pruneJobFiles: false });
+
+  for (const job of tombstoned) {
+    removeJobSidecar(workspaceRoot, job);
+  }
+
+  return jobs.filter((job) => !tombstonedIds.has(job.id));
+}
+
 function listStatusJobs(workspaceRoot) {
   const state = loadState(workspaceRoot);
   const byId = new Map();
@@ -342,7 +379,7 @@ function listStatusJobs(workspaceRoot) {
     }
     byId.set(job.id, mergeStatusJobWithSidecar(existing, job));
   }
-  return [...byId.values()].filter((job) => !hasEndedSessionFresh(workspaceRoot, job.sessionId));
+  return cleanupTombstonedStatusJobs(workspaceRoot, [...byId.values()]);
 }
 
 export function buildStatusSnapshot(workspaceRoot, options = {}) {
