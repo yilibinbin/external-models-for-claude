@@ -182,18 +182,20 @@ function hasActiveForkSafetyDetector(text) {
   const block = activeBlockStartingWith(text, "- name: Detect fork safety")
     .map((line) => line.trim())
     .filter(Boolean);
-  return (
-    block.includes("- name: Detect fork safety") &&
-    block.includes("id: fork-safety") &&
-    block.includes("shell: bash") &&
-    block.includes('if [ "$IS_FORK" = "true" ] || [ "$HEAD_REPO" != "$BASE_REPO" ]; then') &&
-    block.includes('echo "safe_to_review=false" >> "$GITHUB_OUTPUT"') &&
-    block.includes('echo "Codex review skipped because pull request head repository is not this repository." > codex-for-claude-review.md') &&
-    block.includes('printf \'%s\\n\' \'{"status":"skipped","reason":"external-head-repository"}\' > codex-for-claude-review.json') &&
-    block.includes("else") &&
-    block.includes('echo "safe_to_review=true" >> "$GITHUB_OUTPUT"') &&
-    block.includes("fi")
-  );
+  const expected = [
+    "- name: Detect fork safety",
+    "id: fork-safety",
+    "shell: bash",
+    "run: |",
+    'if [ "$IS_FORK" = "true" ] || [ "$HEAD_REPO" != "$BASE_REPO" ]; then',
+    'echo "safe_to_review=false" >> "$GITHUB_OUTPUT"',
+    'echo "Codex review skipped because pull request head repository is not this repository." > codex-for-claude-review.md',
+    'printf \'%s\\n\' \'{"status":"skipped","reason":"external-head-repository"}\' > codex-for-claude-review.json',
+    "else",
+    'echo "safe_to_review=true" >> "$GITHUB_OUTPUT"',
+    "fi"
+  ];
+  return block.length === expected.length && expected.every((line, index) => block[index] === line);
 }
 
 function hasForkSafeStepGates(text, contractsVerified) {
@@ -215,7 +217,10 @@ function hasForkSafeStepGates(text, contractsVerified) {
   ]);
   const executableStepsGated = activeStepBlocks(text).every((block) => {
     const firstLine = block[0]?.trim() ?? "";
-    const hasExecutableSurface = firstLine.startsWith("- uses:") || block.some((line) => line.trim().startsWith("run:"));
+    const hasExecutableSurface =
+      firstLine.startsWith("- uses:") ||
+      firstLine.startsWith("- run:") ||
+      block.some((line) => line.trim().startsWith("run:"));
     return !hasExecutableSurface || allowedUngatedSteps.has(firstLine) || block.some((line) => line.trim() === FORK_SAFE_IF);
   });
   return hasActiveForkSafetyDetector(text) && requiredStepsGated && executableStepsGated;
