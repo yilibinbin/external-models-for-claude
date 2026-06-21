@@ -1443,7 +1443,6 @@ async function handleMultiReview(argv) {
   }
 
   const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
   const commandLease = acquireResourceLease("model-call", {
     env: process.env,
     command: "multi-review"
@@ -1453,6 +1452,7 @@ async function handleMultiReview(argv) {
   }
 
   try {
+    const workspaceRoot = resolveCommandWorkspace(options);
     const target = resolveReviewTarget(cwd, {
       base: options.base,
       scope: options.scope
@@ -1474,26 +1474,38 @@ async function handleMultiReview(argv) {
         const context = collectReviewContext(cwd, target);
         const results = [];
         for (const role of roles) {
-          const prompt = buildMultiReviewRolePrompt(context, role);
-          const result = await executeTaskRun({
-            cwd: context.repoRoot,
-            prompt,
-            model,
-            effort: quality.effort,
-            write: false,
-            resumeLast: false,
-            persistThread: false,
-            jobId: job.id,
-            onProgress: progress
-          });
-          const status = Number.isFinite(Number(result.exitStatus)) ? Number(result.exitStatus) : 0;
-          results.push({
-            role: role.id,
-            title: role.title,
-            status,
-            output: result.payload?.rawOutput ?? "",
-            reasoningSummary: result.payload?.reasoningSummary ?? null
-          });
+          try {
+            const prompt = buildMultiReviewRolePrompt(context, role);
+            const result = await executeTaskRun({
+              cwd: context.repoRoot,
+              prompt,
+              model,
+              effort: quality.effort,
+              write: false,
+              resumeLast: false,
+              persistThread: false,
+              jobId: job.id,
+              onProgress: progress
+            });
+            const status = Number.isFinite(Number(result.exitStatus)) ? Number(result.exitStatus) : 0;
+            results.push({
+              role: role.id,
+              title: role.title,
+              status,
+              output: result.payload?.rawOutput ?? "",
+              reasoningSummary: result.payload?.reasoningSummary ?? null
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            results.push({
+              role: role.id,
+              title: role.title,
+              status: 1,
+              output: `Role failed: ${message}`,
+              reasoningSummary: null,
+              error: message
+            });
+          }
         }
         const rendered = results.map((item) => `## ${item.title}\n\n${item.output || "No output."}`).join("\n\n");
         return {

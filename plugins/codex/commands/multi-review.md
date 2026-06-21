@@ -9,11 +9,12 @@ $ARGUMENTS
 
 Argument rules:
 - Allowed flags: `--roles <comma-list>`, `--role-pack <default|security|release>`, `--base <ref>`, `--scope <auto|working-tree|branch>`, `--model <model>`, `--quality <fast|standard|strong|max>`, `--json`.
-- Parse the user arguments into literal command arguments before calling Bash.
+- Select exactly one companion invocation.
+- Parse the user arguments into literal command arguments before calling Bash, and append only supported flags as separate arguments.
 - Reject unsupported flags in the companion script before running work.
 - Do not interpolate `$ARGUMENTS` into Bash.
+- Return the command stdout verbatim, exactly as-is.
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" multi-review --role-pack default
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" multi-review --roles correctness,security --json
 ```

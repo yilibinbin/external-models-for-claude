@@ -6823,6 +6823,12 @@ def test_codex_multi_review_command_exists_and_is_argument_safe():
     assert "allowed-tools: Bash(node:*)" in text
     assert "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" in text
     assert "multi-review" in text
+    assert "Select exactly one companion invocation" in text
+    assert "Return the command stdout verbatim" in text
+    blocks = fenced_bash_blocks(text)
+    assert len(blocks) == 1
+    assert blocks[0].count("codex-companion.mjs") == 1
+    assert "$ARGUMENTS" not in blocks[0]
 
 
 def test_codex_multi_review_uses_role_prompt_tracking_and_leases():
@@ -6873,6 +6879,9 @@ def test_codex_multi_review_uses_role_prompt_tracking_and_leases():
     assert "model: options.model" not in multi_body
     assert "resumeLast: false" in multi_body
     assert "persistThread: false" in multi_body
+    assert "} catch (error) {" in multi_body
+    assert "output: `Role failed: ${message}`" in multi_body
+    assert "error: message" in multi_body
     assert multi_start < companion.index("async function main")
 
 
@@ -6914,11 +6923,21 @@ def test_codex_multi_review_rejects_unsupported_flags():
 
 
 def test_codex_multi_review_capacity_zero_returns_capacity_blocked(tmp_path):
+    git_marker = tmp_path / "git-was-called"
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    write_executable(
+        fake_bin / "git",
+        "#!/bin/sh\n"
+        f"printf 'git called\\n' > {git_marker}\n"
+        "exit 97\n",
+    )
     result = subprocess.run(
         [NODE, str(PLUGIN / "scripts" / "codex-companion.mjs"), "multi-review", "--json"],
         cwd=tmp_path,
         env={
             **os.environ,
+            "PATH": str(fake_bin),
             "CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR": str(tmp_path / "locks"),
             "CODEX_FOR_CLAUDE_GLOBAL_MAX_MODEL_CALLS": "0",
         },
@@ -6931,6 +6950,7 @@ def test_codex_multi_review_capacity_zero_returns_capacity_blocked(tmp_path):
     assert result.returncode == 75
     assert "capacity_blocked" in result.stderr + result.stdout
     assert str(tmp_path) not in result.stderr + result.stdout
+    assert not git_marker.exists()
 
 
 def test_codex_multi_review_capacity_lease_precedes_git_and_context_collection():
@@ -6940,6 +6960,8 @@ def test_codex_multi_review_capacity_lease_precedes_git_and_context_collection()
     finally_index = body.index("finally {", lease_start)
     lease_region = body[lease_start:finally_index]
     assert lease_region.index('acquireResourceLease("model-call"') < lease_region.index("try {")
+    assert lease_region.index("try {") < lease_region.index("resolveCommandWorkspace(options)")
+    assert lease_region.index("resolveCommandWorkspace(options)") < lease_region.index("resolveReviewTarget(cwd")
     assert lease_region.index("try {") < lease_region.index("resolveReviewTarget(cwd")
     assert lease_region.index("resolveReviewTarget(cwd") < lease_region.index("createCompanionJob({")
     assert lease_region.index("createCompanionJob({") < lease_region.index("runForegroundCommand(")
