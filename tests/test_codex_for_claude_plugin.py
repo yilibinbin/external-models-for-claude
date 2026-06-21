@@ -6485,7 +6485,9 @@ def test_codex_github_actions_validator_rejects_extra_triggers_and_job_permissio
         "const duplicateTrigger = `${base}\\non:\\n  workflow_dispatch:\\n`;"
         "const duplicatePermissions = `${base}\\npermissions:\\n  pull-requests: write\\n`;"
         "const inlineJobPermissions = base.replace('    runs-on: ubuntu-latest', '    runs-on: ubuntu-latest\\n    permissions: write-all');"
-        "process.stdout.write(JSON.stringify({trigger:g.validateWorkflow(trigger), jobPermissions:g.validateWorkflow(jobPermissions), duplicateTrigger:g.validateWorkflow(duplicateTrigger), duplicatePermissions:g.validateWorkflow(duplicatePermissions), inlineJobPermissions:g.validateWorkflow(inlineJobPermissions)}));"
+        "const quotedDuplicateTrigger = `${base}\\n\"on\":\\n  workflow_dispatch:\\n`;"
+        "const quotedInlineJobPermissions = base.replace('    runs-on: ubuntu-latest', '    runs-on: ubuntu-latest\\n    \"permissions\": write-all');"
+        "process.stdout.write(JSON.stringify({trigger:g.validateWorkflow(trigger), jobPermissions:g.validateWorkflow(jobPermissions), duplicateTrigger:g.validateWorkflow(duplicateTrigger), duplicatePermissions:g.validateWorkflow(duplicatePermissions), inlineJobPermissions:g.validateWorkflow(inlineJobPermissions), quotedDuplicateTrigger:g.validateWorkflow(quotedDuplicateTrigger), quotedInlineJobPermissions:g.validateWorkflow(quotedInlineJobPermissions)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6495,16 +6497,22 @@ def test_codex_github_actions_validator_rejects_extra_triggers_and_job_permissio
     duplicate_trigger_check = next(check for check in payload["duplicateTrigger"]["checks"] if check["name"] == "has-pull-request-trigger")
     duplicate_permission_check = next(check for check in payload["duplicatePermissions"]["checks"] if check["name"] == "minimal-contents-permission")
     inline_permission_check = next(check for check in payload["inlineJobPermissions"]["checks"] if check["name"] == "minimal-contents-permission")
+    quoted_duplicate_trigger_check = next(check for check in payload["quotedDuplicateTrigger"]["checks"] if check["name"] == "has-pull-request-trigger")
+    quoted_inline_permission_check = next(check for check in payload["quotedInlineJobPermissions"]["checks"] if check["name"] == "minimal-contents-permission")
     assert trigger_check["ok"] is False
     assert permission_check["ok"] is False
     assert duplicate_trigger_check["ok"] is False
     assert duplicate_permission_check["ok"] is False
     assert inline_permission_check["ok"] is False
+    assert quoted_duplicate_trigger_check["ok"] is False
+    assert quoted_inline_permission_check["ok"] is False
     assert payload["trigger"]["structuralOk"] is False
     assert payload["jobPermissions"]["structuralOk"] is False
     assert payload["duplicateTrigger"]["structuralOk"] is False
     assert payload["duplicatePermissions"]["structuralOk"] is False
     assert payload["inlineJobPermissions"]["structuralOk"] is False
+    assert payload["quotedDuplicateTrigger"]["structuralOk"] is False
+    assert payload["quotedInlineJobPermissions"]["structuralOk"] is False
 
 
 def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload():
@@ -6558,7 +6566,8 @@ def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection
         "const reviewAnsi = base.replace('      - uses: actions/upload-artifact@v4', () => `      - name: Injected ansi Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.$'mjs'\" re$'view' --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4`);"
         "const reviewAnsiEscaped = base.replace('      - uses: actions/upload-artifact@v4', () => `      - name: Injected escaped ansi Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.$'m\\\\x6as'\" re$'v\\\\x69ew' --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4`);"
         "const reviewSubstitution = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Injected substitution Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/$(printf codex-companion.mjs)\" $(printf review) --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4');"
-        "process.stdout.write(JSON.stringify({auth:g.validateWorkflow(auth), authAlt:g.validateWorkflow(authAlt), authWrapped:g.validateWorkflow(authWrapped), authAnsi:g.validateWorkflow(authAnsi), authAnsiEscaped:g.validateWorkflow(authAnsiEscaped), review:g.validateWorkflow(review), reviewWrapped:g.validateWorkflow(reviewWrapped), reviewSplitPath:g.validateWorkflow(reviewSplitPath), reviewSplitAction:g.validateWorkflow(reviewSplitAction), reviewAnsi:g.validateWorkflow(reviewAnsi), reviewAnsiEscaped:g.validateWorkflow(reviewAnsiEscaped), reviewSubstitution:g.validateWorkflow(reviewSubstitution)}));"
+        "const reviewBacktickSubstitution = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Injected backtick Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/`printf codex-companion.mjs`\" `printf review` --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4');"
+        "process.stdout.write(JSON.stringify({auth:g.validateWorkflow(auth), authAlt:g.validateWorkflow(authAlt), authWrapped:g.validateWorkflow(authWrapped), authAnsi:g.validateWorkflow(authAnsi), authAnsiEscaped:g.validateWorkflow(authAnsiEscaped), review:g.validateWorkflow(review), reviewWrapped:g.validateWorkflow(reviewWrapped), reviewSplitPath:g.validateWorkflow(reviewSplitPath), reviewSplitAction:g.validateWorkflow(reviewSplitAction), reviewAnsi:g.validateWorkflow(reviewAnsi), reviewAnsiEscaped:g.validateWorkflow(reviewAnsiEscaped), reviewSubstitution:g.validateWorkflow(reviewSubstitution), reviewBacktickSubstitution:g.validateWorkflow(reviewBacktickSubstitution)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6575,6 +6584,7 @@ def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection
     assert payload["reviewAnsi"]["structuralOk"] is False
     assert payload["reviewAnsiEscaped"]["structuralOk"] is False
     assert payload["reviewSubstitution"]["structuralOk"] is False
+    assert payload["reviewBacktickSubstitution"]["structuralOk"] is False
     auth_check = next(check for check in payload["auth"]["checks"] if check["name"] == "codex-auth-login")
     auth_alt_check = next(check for check in payload["authAlt"]["checks"] if check["name"] == "codex-auth-login")
     auth_wrapped_check = next(check for check in payload["authWrapped"]["checks"] if check["name"] == "codex-auth-login")
@@ -6587,6 +6597,7 @@ def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection
     review_ansi_check = next(check for check in payload["reviewAnsi"]["checks"] if check["name"] == "codex-review-step")
     review_ansi_escaped_check = next(check for check in payload["reviewAnsiEscaped"]["checks"] if check["name"] == "codex-review-step")
     review_substitution_check = next(check for check in payload["reviewSubstitution"]["checks"] if check["name"] == "codex-review-step")
+    review_backtick_substitution_check = next(check for check in payload["reviewBacktickSubstitution"]["checks"] if check["name"] == "codex-review-step")
     assert auth_check["ok"] is False
     assert auth_alt_check["ok"] is False
     assert auth_wrapped_check["ok"] is False
@@ -6599,6 +6610,7 @@ def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection
     assert review_ansi_check["ok"] is False
     assert review_ansi_escaped_check["ok"] is False
     assert review_substitution_check["ok"] is False
+    assert review_backtick_substitution_check["ok"] is False
 
 
 def test_codex_github_actions_validator_requires_step_scoped_fork_gates():

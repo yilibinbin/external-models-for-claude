@@ -35,7 +35,7 @@ function topLevelBlockLines(text, header) {
 }
 
 function countTopLevelKey(text, key) {
-  const pattern = new RegExp(`^${key}:`, "gm");
+  const pattern = new RegExp(`^(?:"${key}"|'${key}'|${key}):`, "gm");
   return [...text.matchAll(pattern)].length;
 }
 
@@ -71,12 +71,12 @@ function blockIncludesLine(text, trimmedStart, requiredLine) {
 function hasUnexpectedCommandSubstitution(text) {
   return activeWorkflowLines(text).some((line) => {
     const trimmed = line.trim();
-    return trimmed.includes("$(") && trimmed !== PLUGIN_ROOT_RESOLVER_SUBSTITUTION;
+    return (trimmed.includes("$(") && trimmed !== PLUGIN_ROOT_RESOLVER_SUBSTITUTION) || trimmed.includes("`");
   });
 }
 
 function hasMinimalContentsReadPermission(text) {
-  const hasNestedPermissions = text.split(/\r?\n/).some((line) => /^\s+permissions:\s*(?:.*)?$/.test(line));
+  const hasNestedPermissions = text.split(/\r?\n/).some((line) => /^\s+(?:"permissions"|'permissions'|permissions):\s*(?:.*)?$/.test(line));
   const entries = topLevelBlockLines(text, "permissions:")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));
