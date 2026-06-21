@@ -240,13 +240,17 @@ export function writeAtomicJson(filePath, payload) {
 
 export function saveStateUnlocked(cwd, state, previousJobs = []) {
   const nextJobs = pruneJobs(state.jobs ?? []);
+  const current = loadState(cwd);
   const nextState = {
     version: STATE_VERSION,
     config: {
       ...defaultState().config,
       ...(state.config ?? {})
     },
-    endedSessions: normalizeEndedSessions(state.endedSessions),
+    endedSessions: normalizeEndedSessions([
+      ...normalizeEndedSessions(current.endedSessions),
+      ...normalizeEndedSessions(state.endedSessions)
+    ]),
     jobs: nextJobs
   };
 
@@ -269,8 +273,10 @@ export function removePrunedJobFiles(cwd, previousJobs, nextJobs) {
         return;
       }
       const jobFile = resolveJobFile(cwd, job.id);
+      let storedLogFile = null;
       try {
         const storedJob = readJobFile(jobFile);
+        storedLogFile = storedJob?.logFile ?? null;
         if (storedJob?.status === "queued" || storedJob?.status === "running") {
           return;
         }
@@ -278,6 +284,7 @@ export function removePrunedJobFiles(cwd, previousJobs, nextJobs) {
         // Missing or corrupt job files can still be removed from the sidecar set.
       }
       removeJobFile(jobFile);
+      removeFileIfExists(storedLogFile);
       removeFileIfExists(job.logFile);
     });
   }
@@ -402,8 +409,18 @@ export function mutateJobFile(cwd, jobId, mutate) {
       return null;
     }
     const current = readJobFile(jobFile);
+    if (hasEndedSession(cwd, current?.sessionId)) {
+      removeJobFile(jobFile);
+      removeFileIfExists(current?.logFile);
+      return null;
+    }
     const next = mutate(current);
     if (next == null) {
+      return null;
+    }
+    if (hasEndedSession(cwd, next?.sessionId)) {
+      removeJobFile(jobFile);
+      removeFileIfExists(next?.logFile ?? current?.logFile);
       return null;
     }
     writeAtomicJson(jobFile, next);

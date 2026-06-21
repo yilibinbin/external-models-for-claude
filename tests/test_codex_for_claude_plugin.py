@@ -2560,6 +2560,61 @@ def test_codex_heartbeat_does_not_rewrite_global_job_state_or_terminal_jobs(tmp_
     assert "heartbeatAtMs" not in payload["storedTerminal"]
 
 
+def test_codex_heartbeat_after_session_end_removes_sidecar_without_republish(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          writeHeartbeatIfRunning
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'heartbeat-ended-session',
+          status: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-ended-heartbeat',
+          request: { secret: 'heartbeat secret' },
+          logFile: resolveJobLogFile(cwd, 'heartbeat-ended-session'),
+          updatedAt: new Date().toISOString()
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'heartbeat secret log\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-ended-heartbeat');
+          state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-ended-heartbeat');
+        });
+        const result = writeHeartbeatIfRunning(job, 123456, () => true);
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          result,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(job.logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["result"] is False
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert "heartbeat secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
+
+
 def test_codex_stop_child_disables_heartbeat_and_progress_updates():
     source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
     heartbeat = js_function_body(source, "writeHeartbeatIfRunning")
@@ -2797,6 +2852,100 @@ def test_codex_save_state_replacement_removes_omitted_terminal_sidecars(tmp_path
     assert payload["jobFileExists"] is False
     assert payload["logFileExists"] is False
     assert "secret-log" not in payload["logFileText"]
+
+
+def test_codex_save_state_preserves_ended_session_tombstones(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          hasEndedSession,
+          markSessionEnded,
+          resolveJobFile,
+          saveState,
+          updateState,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-save-state-ended');
+        });
+        const endedBefore = hasEndedSession(cwd, 'session-save-state-ended');
+        saveState(cwd, { jobs: [] });
+        const endedAfterSave = hasEndedSession(cwd, 'session-save-state-ended');
+        const job = {
+          id: 'save-state-ended-session-job',
+          status: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-save-state-ended',
+          updatedAt: new Date().toISOString()
+        };
+        const upserted = upsertJob(cwd, job);
+        const writeResult = writeJobFile(cwd, job.id, job);
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          endedBefore,
+          endedAfterSave,
+          upserted,
+          writeResult: Boolean(writeResult),
+          jobFileExists: fs.existsSync(jobFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload == {
+        "endedBefore": True,
+        "endedAfterSave": True,
+        "upserted": False,
+        "writeResult": False,
+        "jobFileExists": False,
+    }
+
+
+def test_codex_save_state_replacement_removes_sidecar_only_log_path(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          resolveJobFile,
+          resolveJobLogFile,
+          saveState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const shared = {
+          id: 'save-state-sidecar-log-only',
+          status: 'completed',
+          workspaceRoot: cwd,
+          updatedAt: new Date().toISOString()
+        };
+        const sidecar = {
+          ...shared,
+          logFile: resolveJobLogFile(cwd, shared.id)
+        };
+        saveState(cwd, { jobs: [shared] });
+        writeJobFile(cwd, shared.id, sidecar);
+        fs.writeFileSync(sidecar.logFile, 'terminal secret log\\n', 'utf8');
+        saveState(cwd, { jobs: [] });
+        const jobFile = resolveJobFile(cwd, shared.id);
+
+        console.log(JSON.stringify({
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(sidecar.logFile),
+          logFileText: fs.existsSync(sidecar.logFile) ? fs.readFileSync(sidecar.logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+    assert "terminal secret log" not in payload["logFileText"]
 
 
 def test_codex_state_skips_pruned_file_delete_when_job_reappears(tmp_path):
