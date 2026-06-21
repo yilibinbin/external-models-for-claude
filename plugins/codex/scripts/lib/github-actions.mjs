@@ -35,7 +35,7 @@ function topLevelBlockLines(text, header) {
 }
 
 function countTopLevelKey(text, key) {
-  const pattern = new RegExp(`^(?:"${key}"|'${key}'|${key}):`, "gm");
+  const pattern = new RegExp(`^(?:"${key}"|'${key}'|${key})\\s*:`, "gm");
   return [...text.matchAll(pattern)].length;
 }
 
@@ -76,7 +76,7 @@ function hasUnexpectedCommandSubstitution(text) {
 }
 
 function hasMinimalContentsReadPermission(text) {
-  const hasNestedPermissions = text.split(/\r?\n/).some((line) => /^\s+(?:"permissions"|'permissions'|permissions):\s*(?:.*)?$/.test(line));
+  const hasNestedPermissions = text.split(/\r?\n/).some((line) => /^\s+(?:"permissions"|'permissions'|permissions)\s*:\s*(?:.*)?$/.test(line));
   const entries = topLevelBlockLines(text, "permissions:")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));

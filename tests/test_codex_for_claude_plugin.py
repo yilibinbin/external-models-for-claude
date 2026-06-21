@@ -6487,7 +6487,9 @@ def test_codex_github_actions_validator_rejects_extra_triggers_and_job_permissio
         "const inlineJobPermissions = base.replace('    runs-on: ubuntu-latest', '    runs-on: ubuntu-latest\\n    permissions: write-all');"
         "const quotedDuplicateTrigger = `${base}\\n\"on\":\\n  workflow_dispatch:\\n`;"
         "const quotedInlineJobPermissions = base.replace('    runs-on: ubuntu-latest', '    runs-on: ubuntu-latest\\n    \"permissions\": write-all');"
-        "process.stdout.write(JSON.stringify({trigger:g.validateWorkflow(trigger), jobPermissions:g.validateWorkflow(jobPermissions), duplicateTrigger:g.validateWorkflow(duplicateTrigger), duplicatePermissions:g.validateWorkflow(duplicatePermissions), inlineJobPermissions:g.validateWorkflow(inlineJobPermissions), quotedDuplicateTrigger:g.validateWorkflow(quotedDuplicateTrigger), quotedInlineJobPermissions:g.validateWorkflow(quotedInlineJobPermissions)}));"
+        "const spacedQuotedDuplicateTrigger = `${base}\\n\"on\" :\\n  workflow_dispatch:\\n`;"
+        "const spacedQuotedInlineJobPermissions = base.replace('    runs-on: ubuntu-latest', '    runs-on: ubuntu-latest\\n    \"permissions\" : write-all');"
+        "process.stdout.write(JSON.stringify({trigger:g.validateWorkflow(trigger), jobPermissions:g.validateWorkflow(jobPermissions), duplicateTrigger:g.validateWorkflow(duplicateTrigger), duplicatePermissions:g.validateWorkflow(duplicatePermissions), inlineJobPermissions:g.validateWorkflow(inlineJobPermissions), quotedDuplicateTrigger:g.validateWorkflow(quotedDuplicateTrigger), quotedInlineJobPermissions:g.validateWorkflow(quotedInlineJobPermissions), spacedQuotedDuplicateTrigger:g.validateWorkflow(spacedQuotedDuplicateTrigger), spacedQuotedInlineJobPermissions:g.validateWorkflow(spacedQuotedInlineJobPermissions)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6499,6 +6501,8 @@ def test_codex_github_actions_validator_rejects_extra_triggers_and_job_permissio
     inline_permission_check = next(check for check in payload["inlineJobPermissions"]["checks"] if check["name"] == "minimal-contents-permission")
     quoted_duplicate_trigger_check = next(check for check in payload["quotedDuplicateTrigger"]["checks"] if check["name"] == "has-pull-request-trigger")
     quoted_inline_permission_check = next(check for check in payload["quotedInlineJobPermissions"]["checks"] if check["name"] == "minimal-contents-permission")
+    spaced_quoted_duplicate_trigger_check = next(check for check in payload["spacedQuotedDuplicateTrigger"]["checks"] if check["name"] == "has-pull-request-trigger")
+    spaced_quoted_inline_permission_check = next(check for check in payload["spacedQuotedInlineJobPermissions"]["checks"] if check["name"] == "minimal-contents-permission")
     assert trigger_check["ok"] is False
     assert permission_check["ok"] is False
     assert duplicate_trigger_check["ok"] is False
@@ -6506,6 +6510,8 @@ def test_codex_github_actions_validator_rejects_extra_triggers_and_job_permissio
     assert inline_permission_check["ok"] is False
     assert quoted_duplicate_trigger_check["ok"] is False
     assert quoted_inline_permission_check["ok"] is False
+    assert spaced_quoted_duplicate_trigger_check["ok"] is False
+    assert spaced_quoted_inline_permission_check["ok"] is False
     assert payload["trigger"]["structuralOk"] is False
     assert payload["jobPermissions"]["structuralOk"] is False
     assert payload["duplicateTrigger"]["structuralOk"] is False
@@ -6513,6 +6519,8 @@ def test_codex_github_actions_validator_rejects_extra_triggers_and_job_permissio
     assert payload["inlineJobPermissions"]["structuralOk"] is False
     assert payload["quotedDuplicateTrigger"]["structuralOk"] is False
     assert payload["quotedInlineJobPermissions"]["structuralOk"] is False
+    assert payload["spacedQuotedDuplicateTrigger"]["structuralOk"] is False
+    assert payload["spacedQuotedInlineJobPermissions"]["structuralOk"] is False
 
 
 def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload():
