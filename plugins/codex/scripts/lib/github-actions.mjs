@@ -33,10 +33,18 @@ function topLevelBlockLines(text, header) {
 }
 
 function hasMinimalContentsReadPermission(text) {
+  const hasNestedPermissions = text.split(/\r?\n/).some((line) => /^\s+permissions:\s*(?:#.*)?$/.test(line));
   const entries = topLevelBlockLines(text, "permissions:")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));
-  return entries.length === 1 && entries[0] === "contents: read";
+  return !hasNestedPermissions && entries.length === 1 && entries[0] === "contents: read";
+}
+
+function hasPullRequestOnlyTrigger(text) {
+  const entries = topLevelBlockLines(text, "on:")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  return entries.length === 1 && entries[0] === "pull_request:";
 }
 
 function normalizedCommandText(text) {
@@ -155,7 +163,7 @@ export function validateWorkflow(text) {
     !hasRunnableCodexAuthCommand(text);
   const previewReviewSafe = !hasRunnableCodexReviewCommand(text);
   const checks = [
-    result(text.includes("pull_request:"), "has-pull-request-trigger"),
+    result(hasPullRequestOnlyTrigger(text), "has-pull-request-trigger"),
     result(!text.includes("pull_request_target"), "no-pull-request-target"),
     result(hasMinimalContentsReadPermission(text), "minimal-contents-permission"),
     result(text.includes("claude plugin marketplace add \"$marketplace_dir\" --scope user"), "marketplace-install"),

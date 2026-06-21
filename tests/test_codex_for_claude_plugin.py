@@ -6476,6 +6476,25 @@ def test_codex_github_actions_validator_rejects_extra_workflow_permissions():
     assert payload["structuralOk"] is False
 
 
+def test_codex_github_actions_validator_rejects_extra_triggers_and_job_permissions():
+    script = (
+        "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
+        "const base = g.renderWorkflow({ref:'v0.2.0'});"
+        "const trigger = base.replace('on:\\n  pull_request:', 'on:\\n  pull_request:\\n  workflow_dispatch:');"
+        "const jobPermissions = base.replace('    runs-on: ubuntu-latest', '    runs-on: ubuntu-latest\\n    permissions:\\n      pull-requests: write');"
+        "process.stdout.write(JSON.stringify({trigger:g.validateWorkflow(trigger), jobPermissions:g.validateWorkflow(jobPermissions)}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    trigger_check = next(check for check in payload["trigger"]["checks"] if check["name"] == "has-pull-request-trigger")
+    permission_check = next(check for check in payload["jobPermissions"]["checks"] if check["name"] == "minimal-contents-permission")
+    assert trigger_check["ok"] is False
+    assert permission_check["ok"] is False
+    assert payload["trigger"]["structuralOk"] is False
+    assert payload["jobPermissions"]["structuralOk"] is False
+
+
 def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection():
     script = (
         "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
