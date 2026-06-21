@@ -5724,6 +5724,96 @@ def test_codex_status_omits_tombstoned_sidecar_only_active_job(tmp_path):
     assert not pathlib.Path(setup_payload["logFile"]).exists()
 
 
+def test_codex_status_cleans_tombstoned_sidecar_with_legacy_shared_row(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    setup_payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const jobId = 'status-tombstoned-sidecar-legacy-shared';
+        const logFile = resolveJobLogFile(cwd, jobId);
+        upsertJob(cwd, {
+          id: jobId,
+          status: 'running',
+          phase: 'running',
+          kind: 'task',
+          title: 'PRIVATE_LEGACY_SHARED_TITLE',
+          summary: 'PRIVATE_LEGACY_SHARED_SUMMARY',
+          workspaceRoot: cwd,
+          logFile,
+          updatedAt: new Date().toISOString()
+        });
+        const sidecar = {
+          id: jobId,
+          status: 'running',
+          phase: 'running',
+          kind: 'task',
+          title: 'PRIVATE_LEGACY_SIDECAR_TITLE',
+          workspaceRoot: cwd,
+          sessionId: 'session-status-legacy-shared-tombstone',
+          request: { secret: 'PRIVATE_LEGACY_REQUEST' },
+          logFile,
+          updatedAt: new Date().toISOString()
+        };
+        writeJobFile(cwd, jobId, sidecar);
+        fs.writeFileSync(logFile, '[2000-01-01T00:00:00.000Z] PRIVATE_LEGACY_LOG\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-status-legacy-shared-tombstone');
+        }, { pruneJobFiles: false });
+        console.log(JSON.stringify({
+          jobFile: resolveJobFile(cwd, jobId),
+          logFile
+        }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    for _ in range(2):
+        result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        text = json.dumps(payload)
+        assert all(job["id"] != "status-tombstoned-sidecar-legacy-shared" for job in payload["running"])
+        assert all(job["id"] != "status-tombstoned-sidecar-legacy-shared" for job in payload["recent"])
+        if payload["latestFinished"]:
+            assert payload["latestFinished"]["id"] != "status-tombstoned-sidecar-legacy-shared"
+        assert "PRIVATE_LEGACY_SHARED_TITLE" not in text
+        assert "PRIVATE_LEGACY_SHARED_SUMMARY" not in text
+        assert "PRIVATE_LEGACY_SIDECAR_TITLE" not in text
+        assert "PRIVATE_LEGACY_REQUEST" not in text
+        assert "PRIVATE_LEGACY_LOG" not in text
+
+    verify_payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { listJobs } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const jobFile = process.argv[2];
+        const logFile = process.argv[3];
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(logFile)
+        }));
+        """,
+        env=env,
+        args=[str(tmp_path), setup_payload["jobFile"], setup_payload["logFile"]],
+    )
+    assert verify_payload["jobs"] == []
+    assert verify_payload["jobFileExists"] is False
+    assert verify_payload["logFileExists"] is False
+
+
 def test_codex_status_cleans_tombstoned_shared_only_job_and_log(tmp_path):
     env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
     setup_payload = run_node_script(

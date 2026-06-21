@@ -333,19 +333,24 @@ function mergeStatusJobWithSidecar(existing, sidecar) {
   };
 }
 
-function cleanupTombstonedStatusJobs(workspaceRoot, jobs) {
-  const tombstoned = jobs.filter((job) => job?.id && jobSessionEndedFresh(job, workspaceRoot));
+function cleanupTombstonedStatusJobs(workspaceRoot, jobs, extraTombstoned = []) {
+  const tombstoned = [
+    ...jobs.filter((job) => job?.id && jobSessionEndedFresh(job, workspaceRoot)),
+    ...extraTombstoned.filter((job) => job?.id && jobSessionEndedFresh(job, workspaceRoot))
+  ];
   if (tombstoned.length === 0) {
     return jobs;
   }
 
   const tombstonedIds = new Set(tombstoned.map((job) => job.id));
+  const tombstonedSessionById = new Map(tombstoned.map((job) => [job.id, job.sessionId]));
   updateState(workspaceRoot, (state) => {
     state.jobs = state.jobs.filter((job) => {
       if (!tombstonedIds.has(job.id)) {
         return true;
       }
-      return !stateHasEndedSession(state, job.sessionId);
+      const sessionId = job.sessionId ?? tombstonedSessionById.get(job.id);
+      return !stateHasEndedSession(state, sessionId);
     });
   }, { pruneJobFiles: false });
 
@@ -359,6 +364,7 @@ function cleanupTombstonedStatusJobs(workspaceRoot, jobs) {
 function listStatusJobs(workspaceRoot) {
   const state = loadState(workspaceRoot);
   const byId = new Map();
+  const tombstonedSidecars = [];
   for (const job of state.jobs ?? []) {
     if (job?.id) {
       byId.set(job.id, job);
@@ -370,6 +376,7 @@ function listStatusJobs(workspaceRoot) {
     }
     if (stateHasEndedSession(state, job.sessionId) || hasEndedSessionFresh(workspaceRoot, job.sessionId)) {
       byId.delete(job.id);
+      tombstonedSidecars.push(job);
       removeJobSidecar(workspaceRoot, job);
       continue;
     }
@@ -379,7 +386,7 @@ function listStatusJobs(workspaceRoot) {
     }
     byId.set(job.id, mergeStatusJobWithSidecar(existing, job));
   }
-  return cleanupTombstonedStatusJobs(workspaceRoot, [...byId.values()]);
+  return cleanupTombstonedStatusJobs(workspaceRoot, [...byId.values()], tombstonedSidecars);
 }
 
 export function buildStatusSnapshot(workspaceRoot, options = {}) {
