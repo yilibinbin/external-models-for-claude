@@ -39,6 +39,10 @@ function hasMinimalContentsReadPermission(text) {
   return entries.length === 1 && entries[0] === "contents: read";
 }
 
+function hasRunnableCodexReviewCommand(text) {
+  return /\bcodex-companion\.mjs"?\s+review\b/.test(text);
+}
+
 export function validateReleaseRef(value) {
   const ref = String(value ?? "v0.2.0").trim();
   const lower = ref.toLowerCase();
@@ -132,6 +136,12 @@ export function renderCodexReviewStep() {
 }
 
 export function validateWorkflow(text) {
+  const contractsVerified = releaseHostContractsVerified();
+  const previewAuthSafe =
+    !text.includes("OPENAI_API_KEY") &&
+    !text.includes(CODEX_CLI_AUTH_HELP_COMMAND) &&
+    !text.includes(CODEX_CLI_AUTH_LOGIN_COMMAND);
+  const previewReviewSafe = !hasRunnableCodexReviewCommand(text);
   const checks = [
     result(text.includes("pull_request:"), "has-pull-request-trigger"),
     result(!text.includes("pull_request_target"), "no-pull-request-target"),
@@ -170,34 +180,33 @@ export function validateWorkflow(text) {
     ),
     result(versionSentinelsPaired(), "cli-version-sentinels-paired"),
     result(
-      releaseHostContractsVerified()
+      contractsVerified
         ? text.includes("OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}") &&
             text.includes(CODEX_CLI_AUTH_HELP_COMMAND) &&
             text.includes(CODEX_CLI_AUTH_LOGIN_COMMAND)
-        : text.includes("Codex auth steps omitted until release-host CLI/auth contract is verified."),
+        : text.includes("Codex auth steps omitted until release-host CLI/auth contract is verified.") && previewAuthSafe,
       "codex-auth-login"
     ),
     result(
-      releaseHostContractsVerified()
+      contractsVerified
         ? text.includes("$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs") &&
             text.includes('review --base "$BASE_SHA" --json')
-        : text.includes("Codex review execution omitted until release-host CLI/auth contract is verified."),
+        : text.includes("Codex review execution omitted until release-host CLI/auth contract is verified.") &&
+            previewReviewSafe,
       "codex-review-step"
     ),
     result(!text.includes("CODEX_API_KEY"), "no-unsupported-codex-api-key-env"),
-    result(releaseHostContractsVerified() ? text.includes("$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs") : true, "runtime-path"),
+    result(contractsVerified ? text.includes("$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs") : true, "runtime-path"),
     result(!text.includes("--dangerously-skip-permissions"), "no-dangerous-permission-flag"),
     result(!hasMachinePath(text), "no-local-absolute-paths")
   ];
   const readyCheckNames = new Set([
     "codex-cli-version-pinned",
     "claude-code-version-pinned",
-    "codex-auth-login",
-    "codex-review-step",
     "runtime-path"
   ]);
-  const structuralOk = checks.every((item) => item.ok || (!releaseHostContractsVerified() && readyCheckNames.has(item.name)));
-  const ready = structuralOk && releaseHostContractsVerified() && checks.every((item) => item.ok);
+  const structuralOk = checks.every((item) => item.ok || (!contractsVerified && readyCheckNames.has(item.name)));
+  const ready = structuralOk && contractsVerified && checks.every((item) => item.ok);
   const preview = structuralOk && !ready;
   return { ok: ready, ready, preview, structuralOk, checks };
 }

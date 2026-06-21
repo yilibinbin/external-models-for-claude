@@ -6476,6 +6476,25 @@ def test_codex_github_actions_validator_rejects_extra_workflow_permissions():
     assert payload["structuralOk"] is False
 
 
+def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection():
+    script = (
+        "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
+        "const base = g.renderWorkflow({ref:'v0.2.0'});"
+        "const auth = base.replace('      # Codex auth steps omitted until release-host CLI/auth contract is verified.', '      # Codex auth steps omitted until release-host CLI/auth contract is verified.\\n      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}');"
+        "const review = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Injected Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs\" review --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4');"
+        "process.stdout.write(JSON.stringify({auth:g.validateWorkflow(auth), review:g.validateWorkflow(review)}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["auth"]["structuralOk"] is False
+    assert payload["review"]["structuralOk"] is False
+    auth_check = next(check for check in payload["auth"]["checks"] if check["name"] == "codex-auth-login")
+    review_check = next(check for check in payload["review"]["checks"] if check["name"] == "codex-review-step")
+    assert auth_check["ok"] is False
+    assert review_check["ok"] is False
+
+
 def test_codex_github_actions_validate_command_allows_preview_structural_workflow():
     result = run_node(
         PLUGIN / "scripts" / "codex-companion.mjs",
@@ -6614,6 +6633,31 @@ def test_codex_release_check_ci_simulate_fails_invalid_workflow_validator_checks
     assert payload["ok"] is False
     assert checks["ci-workflow-validation"]["ok"] is False
     assert "minimal-contents-permission" in json.dumps(checks["ci-workflow-validation"]["detail"])
+
+
+def test_codex_release_check_ci_simulate_rejects_preview_review_injection(tmp_path):
+    repo = copy_repo(tmp_path)
+    template = repo / "plugins" / "codex" / "templates" / "github-actions" / "codex-review.yml"
+    template.write_text(
+        read_text(template).replace(
+            "{{CODEX_REVIEW_STEP}}",
+            '      - name: Injected Codex review\n'
+            '        run: node "$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs" review --base "$BASE_SHA" --json\n'
+            "{{CODEX_REVIEW_STEP}}",
+        ),
+        encoding="utf8",
+    )
+    result = run_node(
+        repo / "plugins" / "codex" / "scripts" / "codex-companion.mjs",
+        ["release-check", "--ci-simulate", "--json"],
+        cwd=repo,
+        timeout=20,
+    )
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    checks = checks_by_name(payload)
+    assert checks["ci-workflow-validation"]["ok"] is False
+    assert "codex-review-step" in json.dumps(checks["ci-workflow-validation"]["detail"])
 
 
 def test_codex_release_check_ci_simulate_auth_contract_is_advisory_without_require_flag():
