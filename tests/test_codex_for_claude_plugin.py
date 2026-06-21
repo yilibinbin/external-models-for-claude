@@ -6632,7 +6632,8 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
         "const reviewUngated = base.replace('      - name: Preview Codex review\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'', '      - name: Preview Codex review');"
         "const installUngated = base.replace('      - name: Install Codex for Claude plugin\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'', '      - name: Install Codex for Claude plugin');"
         "const extraUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Extra ungated shell\\n        shell: bash\\n        run: echo unsafe\\n      - uses: actions/upload-artifact@v4');"
-        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated)}));"
+        "const unsafeDetector = base.replace(/      - name: Detect fork safety[\\s\\S]*?      - uses: actions\\/setup-node@v4/, '      - name: Detect fork safety\\n        id: fork-safety\\n        shell: bash\\n        run: |\\n          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          # Codex review skipped because pull request head repository is not this repository.\\n          # {\"status\":\"skipped\",\"reason\":\"external-head-repository\"}\\n      - uses: actions/setup-node@v4');"
+        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), unsafeDetector:g.validateWorkflow(unsafeDetector)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6640,12 +6641,15 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     review_check = next(check for check in payload["reviewUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     install_check = next(check for check in payload["installUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     extra_check = next(check for check in payload["extraUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
+    detector_check = next(check for check in payload["unsafeDetector"]["checks"] if check["name"] == "fork-safe-step-gates")
     assert review_check["ok"] is False
     assert install_check["ok"] is False
     assert extra_check["ok"] is False
+    assert detector_check["ok"] is False
     assert payload["reviewUngated"]["structuralOk"] is False
     assert payload["installUngated"]["structuralOk"] is False
     assert payload["extraUngated"]["structuralOk"] is False
+    assert payload["unsafeDetector"]["structuralOk"] is False
 
 
 def test_codex_github_actions_validate_command_allows_preview_structural_workflow():

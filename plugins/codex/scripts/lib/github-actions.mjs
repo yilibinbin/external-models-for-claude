@@ -178,6 +178,24 @@ function hasReviewArtifactUpload(text) {
   );
 }
 
+function hasActiveForkSafetyDetector(text) {
+  const block = activeBlockStartingWith(text, "- name: Detect fork safety")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return (
+    block.includes("- name: Detect fork safety") &&
+    block.includes("id: fork-safety") &&
+    block.includes("shell: bash") &&
+    block.includes('if [ "$IS_FORK" = "true" ] || [ "$HEAD_REPO" != "$BASE_REPO" ]; then') &&
+    block.includes('echo "safe_to_review=false" >> "$GITHUB_OUTPUT"') &&
+    block.includes('echo "Codex review skipped because pull request head repository is not this repository." > codex-for-claude-review.md') &&
+    block.includes('printf \'%s\\n\' \'{"status":"skipped","reason":"external-head-repository"}\' > codex-for-claude-review.json') &&
+    block.includes("else") &&
+    block.includes('echo "safe_to_review=true" >> "$GITHUB_OUTPUT"') &&
+    block.includes("fi")
+  );
+}
+
 function hasForkSafeStepGates(text, contractsVerified) {
   const requiredSteps = [
     "- uses: actions/setup-node@v4",
@@ -200,7 +218,7 @@ function hasForkSafeStepGates(text, contractsVerified) {
     const hasExecutableSurface = firstLine.startsWith("- uses:") || block.some((line) => line.trim().startsWith("run:"));
     return !hasExecutableSurface || allowedUngatedSteps.has(firstLine) || block.some((line) => line.trim() === FORK_SAFE_IF);
   });
-  return requiredStepsGated && executableStepsGated;
+  return hasActiveForkSafetyDetector(text) && requiredStepsGated && executableStepsGated;
 }
 
 export function validateReleaseRef(value) {
@@ -326,12 +344,7 @@ export function validateWorkflow(text) {
         text.includes("BASE_REPO: ${{ github.repository }}"),
       "fork-env-mapping"
     ),
-    result(
-      hasForkSafeStepGates(text, contractsVerified) &&
-        text.includes("Codex review skipped because pull request head repository is not this repository") &&
-        text.includes('{"status":"skipped","reason":"external-head-repository"}'),
-      "fork-safe-step-gates"
-    ),
+    result(hasForkSafeStepGates(text, contractsVerified), "fork-safe-step-gates"),
     result(
       /CODEX_CLI_NPM_VERSION: "[0-9]+\.[0-9]+\.[0-9]+"/.test(text) &&
         CODEX_CLI_NPM_VERSION !== "REPLACE_WITH_RELEASE_HOST_CODEX_CLI_VERSION" &&
