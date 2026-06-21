@@ -2088,7 +2088,7 @@ def test_codex_cancel_after_session_end_does_not_write_cancelled_sidecar(tmp_pat
     )
 
     assert result.returncode != 0
-    assert "ended before job cancel-ended-session could be cancelled" in result.stderr
+    assert 'No job found for "cancel-ended-session"' in result.stderr
     assert payload["jobs"] == []
     assert payload["jobFileExists"] is False
     assert "cancel secret" not in payload["jobFileText"]
@@ -3356,6 +3356,107 @@ def test_codex_save_state_replacement_filters_ended_session_jobs_from_status(tmp
     assert status["running"] == []
     assert status["latestFinished"] is None
     assert status["recent"] == []
+
+
+def test_codex_save_state_replacement_filters_ended_session_jobs_using_previous_metadata(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    payload = run_node_script(
+        """
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobLogFile,
+          saveState,
+          updateState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const previous = {
+          id: 'save-state-previous-session-ended-job',
+          status: 'running',
+          phase: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-save-state-previous-ended',
+          logFile: resolveJobLogFile(cwd, 'save-state-previous-session-ended-job'),
+          updatedAt: new Date().toISOString()
+        };
+        saveState(cwd, { jobs: [previous] });
+        writeJobFile(cwd, previous.id, previous);
+        saveState(cwd, {
+          endedSessions: ['session-save-state-previous-ended'],
+          jobs: [{
+            id: previous.id,
+            status: 'running',
+            phase: 'running',
+            workspaceRoot: cwd,
+            updatedAt: new Date().toISOString()
+          }]
+        });
+
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd)
+        }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+
+    assert payload["jobs"] == []
+    assert result.returncode == 0, result.stderr
+    status = json.loads(result.stdout)
+    assert status["running"] == []
+    assert status["latestFinished"] is None
+    assert status["recent"] == []
+
+
+def test_codex_save_state_replacement_removes_tombstoned_active_sidecar_log(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          saveState,
+          updateState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'save-state-tombstoned-active-sidecar',
+          status: 'running',
+          phase: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-save-state-tombstoned-active',
+          request: { secret: 'tombstoned active secret' },
+          logFile: resolveJobLogFile(cwd, 'save-state-tombstoned-active-sidecar'),
+          updatedAt: new Date().toISOString()
+        };
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'TOMBSTONED_ACTIVE_LOG_SECRET\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-save-state-tombstoned-active');
+        });
+        saveState(cwd, { jobs: [] });
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(job.logFile),
+          logFileText: fs.existsSync(job.logFile) ? fs.readFileSync(job.logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["jobFileExists"] is False
+    assert "tombstoned active secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
+    assert "TOMBSTONED_ACTIVE_LOG_SECRET" not in payload["logFileText"]
 
 
 def test_codex_save_state_replacement_removes_sidecar_only_log_path(tmp_path):

@@ -288,7 +288,13 @@ export function saveStateUnlocked(cwd, state, previousJobs = []) {
     ...normalizeEndedSessions(current.endedSessions),
     ...normalizeEndedSessions(state.endedSessions)
   ]);
-  const nextJobs = pruneJobs((state.jobs ?? []).filter((job) => !stateHasEndedSession({ endedSessions }, job?.sessionId)));
+  const previousById = new Map(previousJobs.filter((job) => job?.id).map((job) => [job.id, job]));
+  const nextJobs = pruneJobs(
+    (state.jobs ?? []).filter((job) => {
+      const sessionId = job?.sessionId ?? previousById.get(job?.id)?.sessionId ?? null;
+      return !stateHasEndedSession({ endedSessions }, sessionId);
+    })
+  );
   const nextState = {
     version: STATE_VERSION,
     config: {
@@ -322,6 +328,12 @@ export function removePrunedJobFiles(cwd, previousJobs, nextJobs) {
       try {
         const storedJob = readJobFile(jobFile);
         storedLogFile = storedJob?.logFile ?? null;
+        if (stateHasEndedSession(currentState, storedJob?.sessionId ?? job.sessionId)) {
+          removeJobFile(jobFile);
+          removeFileIfExists(storedLogFile);
+          removeFileIfExists(job.logFile);
+          return;
+        }
         if (storedJob?.status === "queued" || storedJob?.status === "running") {
           return;
         }
