@@ -41,10 +41,6 @@ function activeWorkflowLines(text) {
   return text.split(/\r?\n/).filter((line) => !line.trim().startsWith("#"));
 }
 
-function activeWorkflowText(text) {
-  return activeWorkflowLines(text).join("\n");
-}
-
 function leadingSpaces(line) {
   return line.match(/^ */)?.[0].length ?? 0;
 }
@@ -104,15 +100,21 @@ function hasAnsiQuotedShellFragment(text) {
 }
 
 function hasImmutableMarketplaceInstall(text) {
-  const activeText = activeWorkflowText(text);
-  const activeCommandText = normalizedCommandText(activeText);
-  const mutableCheckout = /(?:^|[\s;&|])git\s+-C\s+\$marketplace_dir\s+checkout\b(?!\s+FETCH_HEAD\b)/.test(activeCommandText);
+  const block = activeBlockStartingWith(text, "- name: Install Codex for Claude plugin");
+  const lines = block.map((line) => line.trim()).filter(Boolean);
+  const blockText = block.join("\n");
+  const expectedGitCommands = [
+    'git init "$marketplace_dir"',
+    'git -C "$marketplace_dir" remote add origin https://github.com/yilibinbin/external-models-for-claude',
+    'git -C "$marketplace_dir" fetch --depth 1 origin "refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF"',
+    'git -C "$marketplace_dir" checkout FETCH_HEAD'
+  ];
+  const gitLines = lines.filter((line) => /(?:^|[\s;&|])(?:\S*\/)?git\b/.test(normalizedCommandText(line)));
   return (
-    !mutableCheckout &&
-    activeText.includes("claude plugin marketplace add \"$marketplace_dir\" --scope user") &&
-    activeText.includes("claude plugin install codex@external-models-for-claude --scope user") &&
-    activeText.includes('git -C "$marketplace_dir" fetch --depth 1 origin "refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF"') &&
-    activeText.includes('git -C "$marketplace_dir" checkout FETCH_HEAD')
+    gitLines.length === expectedGitCommands.length &&
+    expectedGitCommands.every((command, index) => gitLines[index] === command) &&
+    blockText.includes("claude plugin marketplace add \"$marketplace_dir\" --scope user") &&
+    blockText.includes("claude plugin install codex@external-models-for-claude --scope user")
   );
 }
 

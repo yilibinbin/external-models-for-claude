@@ -6513,23 +6513,31 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
         "const base = g.renderWorkflow({ref:'v0.2.0'});"
         "const mutableFetch = base.replace('refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF', 'main');"
         "const mutableCheckout = base.replace('git -C \"$marketplace_dir\" checkout FETCH_HEAD', 'git -C \"$marketplace_dir\" checkout FETCH_HEAD\\n          git -C \"$marketplace_dir\" checkout main');"
+        "const mutableCheckoutVariable = base.replace('git -C \"$marketplace_dir\" checkout FETCH_HEAD', 'git -C \"$marketplace_dir\" checkout FETCH_HEAD\\n          git -C \"${marketplace_dir}\" checkout main');"
+        "const extraMutableFetch = base.replace('git -C \"$marketplace_dir\" checkout FETCH_HEAD', 'git -C \"$marketplace_dir\" fetch --depth 1 origin main\\n          git -C \"$marketplace_dir\" checkout FETCH_HEAD');"
         "const noArtifact = base.replace('      - uses: actions/upload-artifact@v4\\n        if: always()\\n        with:\\n          name: codex-for-claude-review\\n          path: codex-for-claude-review.*\\n          retention-days: 5\\n', '');"
         "const commentedArtifact = base.replace('      - uses: actions/upload-artifact@v4', '      # - uses: actions/upload-artifact@v4');"
-        "process.stdout.write(JSON.stringify({mutableFetch:g.validateWorkflow(mutableFetch), mutableCheckout:g.validateWorkflow(mutableCheckout), noArtifact:g.validateWorkflow(noArtifact), commentedArtifact:g.validateWorkflow(commentedArtifact)}));"
+        "process.stdout.write(JSON.stringify({mutableFetch:g.validateWorkflow(mutableFetch), mutableCheckout:g.validateWorkflow(mutableCheckout), mutableCheckoutVariable:g.validateWorkflow(mutableCheckoutVariable), extraMutableFetch:g.validateWorkflow(extraMutableFetch), noArtifact:g.validateWorkflow(noArtifact), commentedArtifact:g.validateWorkflow(commentedArtifact)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     install_check = next(check for check in payload["mutableFetch"]["checks"] if check["name"] == "marketplace-install")
     checkout_check = next(check for check in payload["mutableCheckout"]["checks"] if check["name"] == "marketplace-install")
+    checkout_variable_check = next(check for check in payload["mutableCheckoutVariable"]["checks"] if check["name"] == "marketplace-install")
+    extra_fetch_check = next(check for check in payload["extraMutableFetch"]["checks"] if check["name"] == "marketplace-install")
     artifact_check = next(check for check in payload["noArtifact"]["checks"] if check["name"] == "review-artifact-upload")
     commented_artifact_check = next(check for check in payload["commentedArtifact"]["checks"] if check["name"] == "review-artifact-upload")
     assert install_check["ok"] is False
     assert checkout_check["ok"] is False
+    assert checkout_variable_check["ok"] is False
+    assert extra_fetch_check["ok"] is False
     assert artifact_check["ok"] is False
     assert commented_artifact_check["ok"] is False
     assert payload["mutableFetch"]["structuralOk"] is False
     assert payload["mutableCheckout"]["structuralOk"] is False
+    assert payload["mutableCheckoutVariable"]["structuralOk"] is False
+    assert payload["extraMutableFetch"]["structuralOk"] is False
     assert payload["noArtifact"]["structuralOk"] is False
     assert payload["commentedArtifact"]["structuralOk"] is False
 
