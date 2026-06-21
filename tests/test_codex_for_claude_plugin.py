@@ -6481,18 +6481,26 @@ def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection
         "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
         "const base = g.renderWorkflow({ref:'v0.2.0'});"
         "const auth = base.replace('      # Codex auth steps omitted until release-host CLI/auth contract is verified.', '      # Codex auth steps omitted until release-host CLI/auth contract is verified.\\n      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}');"
+        "const authAlt = base.replace('      # Codex auth steps omitted until release-host CLI/auth contract is verified.', '      # Codex auth steps omitted until release-host CLI/auth contract is verified.\\n      run: echo \"$TOKEN\" | codex login --with-api-key');"
         "const review = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Injected Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs\" review --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4');"
-        "process.stdout.write(JSON.stringify({auth:g.validateWorkflow(auth), review:g.validateWorkflow(review)}));"
+        "const reviewWrapped = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Injected wrapped Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs\" \\\\\\n          review --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4');"
+        "process.stdout.write(JSON.stringify({auth:g.validateWorkflow(auth), authAlt:g.validateWorkflow(authAlt), review:g.validateWorkflow(review), reviewWrapped:g.validateWorkflow(reviewWrapped)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["auth"]["structuralOk"] is False
+    assert payload["authAlt"]["structuralOk"] is False
     assert payload["review"]["structuralOk"] is False
+    assert payload["reviewWrapped"]["structuralOk"] is False
     auth_check = next(check for check in payload["auth"]["checks"] if check["name"] == "codex-auth-login")
+    auth_alt_check = next(check for check in payload["authAlt"]["checks"] if check["name"] == "codex-auth-login")
     review_check = next(check for check in payload["review"]["checks"] if check["name"] == "codex-review-step")
+    review_wrapped_check = next(check for check in payload["reviewWrapped"]["checks"] if check["name"] == "codex-review-step")
     assert auth_check["ok"] is False
+    assert auth_alt_check["ok"] is False
     assert review_check["ok"] is False
+    assert review_wrapped_check["ok"] is False
 
 
 def test_codex_github_actions_validate_command_allows_preview_structural_workflow():

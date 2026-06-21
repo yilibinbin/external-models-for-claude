@@ -39,8 +39,19 @@ function hasMinimalContentsReadPermission(text) {
   return entries.length === 1 && entries[0] === "contents: read";
 }
 
+function normalizedCommandText(text) {
+  return text
+    .replace(/\\\r?\n/g, " ")
+    .replace(/["'`]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function hasRunnableCodexAuthCommand(text) {
+  return /(?:^|[\s;&|])codex\s+login\b[^;&|]*--with-api-key\b/.test(normalizedCommandText(text));
+}
+
 function hasRunnableCodexReviewCommand(text) {
-  return /\bcodex-companion\.mjs"?\s+review\b/.test(text);
+  return /(?:^|[\s;&|])(?:node\s+)?\S*codex-companion\.mjs\s+review\b/.test(normalizedCommandText(text));
 }
 
 export function validateReleaseRef(value) {
@@ -140,7 +151,8 @@ export function validateWorkflow(text) {
   const previewAuthSafe =
     !text.includes("OPENAI_API_KEY") &&
     !text.includes(CODEX_CLI_AUTH_HELP_COMMAND) &&
-    !text.includes(CODEX_CLI_AUTH_LOGIN_COMMAND);
+    !text.includes(CODEX_CLI_AUTH_LOGIN_COMMAND) &&
+    !hasRunnableCodexAuthCommand(text);
   const previewReviewSafe = !hasRunnableCodexReviewCommand(text);
   const checks = [
     result(text.includes("pull_request:"), "has-pull-request-trigger"),
