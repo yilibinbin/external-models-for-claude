@@ -11,6 +11,8 @@ export const RELEASE_HOST_CONTRACTS_VERIFIED = false;
 export const CODEX_CLI_AUTH_HELP_COMMAND = "codex login --help 2>&1 | grep -qF -- '--with-api-key'";
 export const CODEX_CLI_AUTH_LOGIN_COMMAND = "printenv OPENAI_API_KEY | codex login --with-api-key";
 const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)), "..");
+const FORK_SAFE_IF = "if: steps.fork-safety.outputs.safe_to_review == 'true'";
+const PLUGIN_ROOT_RESOLVER_SUBSTITUTION = 'CLAUDE_PLUGIN_ROOT="$(claude plugin list --json | node -e \'';
 
 function result(ok, name, detail = "") {
   return { ok: Boolean(ok), name, detail };
@@ -60,6 +62,17 @@ function activeBlockStartingWith(text, trimmedStart) {
     block.push(line);
   }
   return block;
+}
+
+function blockIncludesLine(text, trimmedStart, requiredLine) {
+  return activeBlockStartingWith(text, trimmedStart).some((line) => line.trim() === requiredLine);
+}
+
+function hasUnexpectedCommandSubstitution(text) {
+  return activeWorkflowLines(text).some((line) => {
+    const trimmed = line.trim();
+    return trimmed.includes("$(") && trimmed !== PLUGIN_ROOT_RESOLVER_SUBSTITUTION;
+  });
 }
 
 function hasMinimalContentsReadPermission(text) {
@@ -128,6 +141,20 @@ function hasReviewArtifactUpload(text) {
     block.includes("name: codex-for-claude-review") &&
     block.includes("path: codex-for-claude-review.*")
   );
+}
+
+function hasForkSafeStepGates(text, contractsVerified) {
+  const requiredSteps = [
+    "- uses: actions/setup-node@v4",
+    "- name: Install Claude Code",
+    "- name: Install Codex CLI",
+    "- name: Install Codex for Claude plugin",
+    "- name: Resolve installed plugin root",
+    contractsVerified ? "- name: Verify Codex API-key login support" : null,
+    contractsVerified ? "- name: Authenticate Codex" : null,
+    contractsVerified ? "- name: Run Codex review" : "- name: Preview Codex review"
+  ].filter(Boolean);
+  return requiredSteps.every((step) => blockIncludesLine(text, step, FORK_SAFE_IF));
 }
 
 export function validateReleaseRef(value) {
@@ -229,8 +256,12 @@ export function validateWorkflow(text) {
     !text.includes(CODEX_CLI_AUTH_HELP_COMMAND) &&
     !text.includes(CODEX_CLI_AUTH_LOGIN_COMMAND) &&
     !hasRunnableCodexAuthCommand(text) &&
-    !hasAnsiQuotedShellFragment(text);
-  const previewReviewSafe = !hasRunnableCodexReviewCommand(text) && !hasAnsiQuotedShellFragment(text);
+    !hasAnsiQuotedShellFragment(text) &&
+    !hasUnexpectedCommandSubstitution(text);
+  const previewReviewSafe =
+    !hasRunnableCodexReviewCommand(text) &&
+    !hasAnsiQuotedShellFragment(text) &&
+    !hasUnexpectedCommandSubstitution(text);
   const checks = [
     result(hasPullRequestOnlyTrigger(text), "has-pull-request-trigger"),
     result(!text.includes("pull_request_target"), "no-pull-request-target"),
@@ -250,7 +281,7 @@ export function validateWorkflow(text) {
       "fork-env-mapping"
     ),
     result(
-      text.includes("steps.fork-safety.outputs.safe_to_review == 'true'") &&
+      hasForkSafeStepGates(text, contractsVerified) &&
         text.includes("Codex review skipped because pull request head repository is not this repository") &&
         text.includes('{"status":"skipped","reason":"external-head-repository"}'),
       "fork-safe-step-gates"

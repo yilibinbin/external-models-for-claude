@@ -6557,7 +6557,8 @@ def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection
         "const reviewSplitAction = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Injected split-action Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs\" re\\\\\\nview --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4');"
         "const reviewAnsi = base.replace('      - uses: actions/upload-artifact@v4', () => `      - name: Injected ansi Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.$'mjs'\" re$'view' --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4`);"
         "const reviewAnsiEscaped = base.replace('      - uses: actions/upload-artifact@v4', () => `      - name: Injected escaped ansi Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.$'m\\\\x6as'\" re$'v\\\\x69ew' --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4`);"
-        "process.stdout.write(JSON.stringify({auth:g.validateWorkflow(auth), authAlt:g.validateWorkflow(authAlt), authWrapped:g.validateWorkflow(authWrapped), authAnsi:g.validateWorkflow(authAnsi), authAnsiEscaped:g.validateWorkflow(authAnsiEscaped), review:g.validateWorkflow(review), reviewWrapped:g.validateWorkflow(reviewWrapped), reviewSplitPath:g.validateWorkflow(reviewSplitPath), reviewSplitAction:g.validateWorkflow(reviewSplitAction), reviewAnsi:g.validateWorkflow(reviewAnsi), reviewAnsiEscaped:g.validateWorkflow(reviewAnsiEscaped)}));"
+        "const reviewSubstitution = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Injected substitution Codex review\\n        run: node \"$CLAUDE_PLUGIN_ROOT/scripts/$(printf codex-companion.mjs)\" $(printf review) --base \"$BASE_SHA\" --json\\n      - uses: actions/upload-artifact@v4');"
+        "process.stdout.write(JSON.stringify({auth:g.validateWorkflow(auth), authAlt:g.validateWorkflow(authAlt), authWrapped:g.validateWorkflow(authWrapped), authAnsi:g.validateWorkflow(authAnsi), authAnsiEscaped:g.validateWorkflow(authAnsiEscaped), review:g.validateWorkflow(review), reviewWrapped:g.validateWorkflow(reviewWrapped), reviewSplitPath:g.validateWorkflow(reviewSplitPath), reviewSplitAction:g.validateWorkflow(reviewSplitAction), reviewAnsi:g.validateWorkflow(reviewAnsi), reviewAnsiEscaped:g.validateWorkflow(reviewAnsiEscaped), reviewSubstitution:g.validateWorkflow(reviewSubstitution)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6573,6 +6574,7 @@ def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection
     assert payload["reviewSplitAction"]["structuralOk"] is False
     assert payload["reviewAnsi"]["structuralOk"] is False
     assert payload["reviewAnsiEscaped"]["structuralOk"] is False
+    assert payload["reviewSubstitution"]["structuralOk"] is False
     auth_check = next(check for check in payload["auth"]["checks"] if check["name"] == "codex-auth-login")
     auth_alt_check = next(check for check in payload["authAlt"]["checks"] if check["name"] == "codex-auth-login")
     auth_wrapped_check = next(check for check in payload["authWrapped"]["checks"] if check["name"] == "codex-auth-login")
@@ -6584,6 +6586,7 @@ def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection
     review_split_action_check = next(check for check in payload["reviewSplitAction"]["checks"] if check["name"] == "codex-review-step")
     review_ansi_check = next(check for check in payload["reviewAnsi"]["checks"] if check["name"] == "codex-review-step")
     review_ansi_escaped_check = next(check for check in payload["reviewAnsiEscaped"]["checks"] if check["name"] == "codex-review-step")
+    review_substitution_check = next(check for check in payload["reviewSubstitution"]["checks"] if check["name"] == "codex-review-step")
     assert auth_check["ok"] is False
     assert auth_alt_check["ok"] is False
     assert auth_wrapped_check["ok"] is False
@@ -6595,6 +6598,26 @@ def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection
     assert review_split_action_check["ok"] is False
     assert review_ansi_check["ok"] is False
     assert review_ansi_escaped_check["ok"] is False
+    assert review_substitution_check["ok"] is False
+
+
+def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
+    script = (
+        "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
+        "const base = g.renderWorkflow({ref:'v0.2.0'});"
+        "const reviewUngated = base.replace('      - name: Preview Codex review\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'', '      - name: Preview Codex review');"
+        "const installUngated = base.replace('      - name: Install Codex for Claude plugin\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'', '      - name: Install Codex for Claude plugin');"
+        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated)}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    review_check = next(check for check in payload["reviewUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
+    install_check = next(check for check in payload["installUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
+    assert review_check["ok"] is False
+    assert install_check["ok"] is False
+    assert payload["reviewUngated"]["structuralOk"] is False
+    assert payload["installUngated"]["structuralOk"] is False
 
 
 def test_codex_github_actions_validate_command_allows_preview_structural_workflow():
