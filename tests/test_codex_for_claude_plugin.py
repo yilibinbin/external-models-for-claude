@@ -2251,6 +2251,74 @@ def test_codex_cancel_rejects_when_session_ends_before_cancel_sidecar_write(tmp_
     assert payload["logFileExists"] is False
 
 
+def test_codex_cancel_rejects_when_sidecar_disappears_after_resolution(tmp_path):
+    env = governor_env(tmp_path)
+    script = """
+        import fs from 'node:fs';
+
+        const cwd = process.argv[1];
+        const state = await import('./plugins/codex/scripts/lib/state.mjs');
+        const companion = await import('./plugins/codex/scripts/codex-companion.mjs');
+        const job = {
+          id: 'cancel-sidecar-disappears',
+          status: 'running',
+          kind: 'task',
+          kindLabel: 'rescue',
+          jobClass: 'task',
+          title: 'Cancel sidecar disappears',
+          workspaceRoot: cwd,
+          sessionId: 'session-cancel-sidecar-disappears',
+          pid: 99999999,
+          logFile: state.resolveJobLogFile(cwd, 'cancel-sidecar-disappears'),
+          request: { secret: 'cancel sidecar disappears secret' },
+          updatedAt: new Date().toISOString()
+        };
+        state.upsertJob(cwd, job);
+        state.writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'cancel sidecar disappears log\\n', 'utf8');
+
+        const originalExistsSync = fs.existsSync;
+        let injected = false;
+        fs.existsSync = function patchedExistsSync(filePath) {
+          const result = originalExistsSync.call(this, filePath);
+          if (!injected && result && String(filePath).endsWith('/cancel-sidecar-disappears.json')) {
+            injected = true;
+            state.updateState(cwd, (current) => {
+              state.markSessionEnded(current, 'session-cancel-sidecar-disappears');
+              current.jobs = current.jobs.filter((item) => item.id !== job.id);
+            });
+            fs.rmSync(filePath, { force: true });
+            fs.rmSync(job.logFile, { force: true });
+          }
+          return result;
+        };
+
+        let errorMessage = '';
+        try {
+          await companion.__testHooks.handleCancel(['cancel-sidecar-disappears', '--cwd', cwd, '--json']);
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        } finally {
+          fs.existsSync = originalExistsSync;
+        }
+        const jobFile = state.resolveJobFile(cwd, job.id);
+        console.log(JSON.stringify({
+          injected,
+          errorMessage,
+          jobs: state.listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile)
+        }));
+    """
+    payload = run_node_script(script, env=env, args=[str(tmp_path)])
+
+    assert payload["injected"] is True
+    assert "ended before job cancel-sidecar-disappears could be cancelled" in payload["errorMessage"]
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+
+
 def test_codex_task_worker_preserves_stored_job_bindings_before_claim():
     body = js_function_body(read_text(PLUGIN / "scripts" / "codex-companion.mjs"), "handleTaskWorker")
     assert body.index("const storedJob") < body.index("const request")
@@ -5739,6 +5807,64 @@ def test_codex_status_removes_stale_shared_row_when_sidecar_is_freshly_tombstone
     assert "PRIVATE_STALE_SHARED_SUMMARY" not in text
     assert "PRIVATE_STALE_SHARED_REQUEST" not in text
     assert "PRIVATE_STALE_SHARED_LOG" not in text
+
+
+def test_codex_status_rechecks_tombstone_after_progress_log_read(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobLogFile,
+          updateState,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'status-progress-read-race',
+          status: 'running',
+          phase: 'running',
+          kind: 'task',
+          title: 'Status progress read race',
+          workspaceRoot: cwd,
+          sessionId: 'session-status-progress-read-race',
+          logFile: resolveJobLogFile(cwd, 'status-progress-read-race'),
+          updatedAt: new Date().toISOString()
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, '[2000-01-01T00:00:00.000Z] PRIVATE_PROGRESS_READ_RACE\\n', 'utf8');
+
+        const originalReadFileSync = fs.readFileSync;
+        let injected = false;
+        fs.readFileSync = function patchedReadFileSync(filePath, ...args) {
+          const result = originalReadFileSync.call(this, filePath, ...args);
+          if (!injected && String(filePath) === job.logFile) {
+            injected = true;
+            updateState(cwd, (state) => {
+              markSessionEnded(state, 'session-status-progress-read-race');
+              state.jobs = state.jobs.filter((item) => item.id !== job.id);
+            });
+          }
+          return result;
+        };
+
+        const { buildStatusSnapshot } = await import('./plugins/codex/scripts/lib/job-control.mjs');
+        const snapshot = buildStatusSnapshot(cwd, { all: true });
+        fs.readFileSync = originalReadFileSync;
+        console.log(JSON.stringify({ injected, snapshot }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    text = json.dumps(payload["snapshot"])
+    assert payload["injected"] is True
+    assert "PRIVATE_PROGRESS_READ_RACE" not in text
+    for job in payload["snapshot"]["running"]:
+        if job["id"] == "status-progress-read-race":
+            assert job["progressPreview"] == []
 
 
 def test_codex_single_status_filters_current_session_unless_all(tmp_path):

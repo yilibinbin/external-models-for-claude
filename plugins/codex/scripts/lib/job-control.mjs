@@ -80,8 +80,17 @@ export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_
     return [];
   }
 
-  const lines = fs
-    .readFileSync(logFile, "utf8")
+  let logText = "";
+  try {
+    logText = fs.readFileSync(logFile, "utf8");
+  } catch {
+    return [];
+  }
+  if (options.workspaceRoot && options.sessionId && hasEndedSessionFresh(options.workspaceRoot, options.sessionId)) {
+    return [];
+  }
+
+  const lines = logText
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter(Boolean)

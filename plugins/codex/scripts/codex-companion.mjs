@@ -1236,14 +1236,22 @@ async function handleCancel(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
-
   if (hasEndedSession(workspaceRoot, job.sessionId)) {
     removeJobSidecar(workspaceRoot, job);
     throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
   }
+  let existing = {};
+  try {
+    existing = readStoredJob(workspaceRoot, job.id) ?? {};
+  } catch (error) {
+    if (hasEndedSession(workspaceRoot, job.sessionId) || error?.code === "ENOENT") {
+      removeJobSidecar(workspaceRoot, job);
+      throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
+    }
+    throw error;
+  }
+  const threadId = existing.threadId ?? job.threadId ?? null;
+  const turnId = existing.turnId ?? job.turnId ?? null;
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (hasEndedSession(workspaceRoot, job.sessionId)) {
