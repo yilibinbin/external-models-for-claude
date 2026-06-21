@@ -132,9 +132,19 @@ function removeFileIfExists(filePath) {
 function uniqueJobsById(jobs) {
   const byId = new Map();
   for (const job of jobs) {
-    if (job?.id && !byId.has(job.id)) {
-      byId.set(job.id, job);
+    if (!job?.id) {
+      continue;
     }
+    if (!byId.has(job.id)) {
+      byId.set(job.id, job);
+      continue;
+    }
+    const existing = byId.get(job.id);
+    byId.set(job.id, {
+      ...existing,
+      sessionId: existing.sessionId ?? job.sessionId,
+      logFile: existing.logFile ?? job.logFile
+    });
   }
   return [...byId.values()];
 }

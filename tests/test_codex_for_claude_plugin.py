@@ -3411,6 +3411,72 @@ def test_codex_save_state_replacement_filters_ended_session_jobs_using_previous_
     assert status["recent"] == []
 
 
+def test_codex_save_state_replacement_uses_sidecar_session_when_shared_metadata_omits_it(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          listJobs,
+          resolveJobFile,
+          resolveJobLogFile,
+          saveState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const id = 'save-state-sidecar-session-ended-job';
+        const logFile = resolveJobLogFile(cwd, id);
+        const sharedWithoutSession = {
+          id,
+          status: 'running',
+          phase: 'running',
+          workspaceRoot: cwd,
+          updatedAt: new Date().toISOString()
+        };
+        const sidecarWithSession = {
+          ...sharedWithoutSession,
+          sessionId: 'session-save-state-sidecar-ended',
+          request: { secret: 'sidecar session secret' },
+          logFile
+        };
+        saveState(cwd, { jobs: [sharedWithoutSession] });
+        writeJobFile(cwd, id, sidecarWithSession);
+        fs.writeFileSync(logFile, 'SIDECAR_SESSION_LOG_SECRET\\n', 'utf8');
+        saveState(cwd, {
+          endedSessions: ['session-save-state-sidecar-ended'],
+          jobs: [{
+            ...sharedWithoutSession,
+            updatedAt: new Date().toISOString()
+          }]
+        });
+        const jobFile = resolveJobFile(cwd, id);
+
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(logFile),
+          logFileText: fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+        }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert "sidecar session secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
+    assert "SIDECAR_SESSION_LOG_SECRET" not in payload["logFileText"]
+    assert result.returncode == 0, result.stderr
+    status = json.loads(result.stdout)
+    assert status["running"] == []
+    assert status["latestFinished"] is None
+    assert status["recent"] == []
+
+
 def test_codex_save_state_replacement_removes_tombstoned_active_sidecar_log(tmp_path):
     payload = run_node_script(
         """
