@@ -199,8 +199,13 @@ function blockMatchesExpected(block, expected) {
   return normalized.length === expected.length && expected.every((line, index) => normalized[index] === line);
 }
 
+function matchingForkSafetyDetectorCount(text) {
+  const expected = expectedForkSafetyDetectorBlock();
+  return activeStepBlocks(text).filter((block) => blockMatchesExpected(block, expected)).length;
+}
+
 function hasActiveForkSafetyDetector(text) {
-  return blockMatchesExpected(activeBlockStartingWith(text, "- name: Detect fork safety"), expectedForkSafetyDetectorBlock());
+  return matchingForkSafetyDetectorCount(text) === 1;
 }
 
 function hasForkSafeStepGates(text, contractsVerified) {
