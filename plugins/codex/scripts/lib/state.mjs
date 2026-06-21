@@ -129,6 +129,16 @@ function removeFileIfExists(filePath) {
   }
 }
 
+function uniqueJobsById(jobs) {
+  const byId = new Map();
+  for (const job of jobs) {
+    if (job?.id && !byId.has(job.id)) {
+      byId.set(job.id, job);
+    }
+  }
+  return [...byId.values()];
+}
+
 function sleepSync(ms) {
   const shared = new Int32Array(new SharedArrayBuffer(4));
   Atomics.wait(shared, 0, 0, ms);
@@ -293,7 +303,7 @@ export function removePrunedJobFiles(cwd, previousJobs, nextJobs) {
 export function saveState(cwd, state) {
   let previousJobs = [];
   const nextState = withStateLock(cwd, () => {
-    previousJobs = loadState(cwd).jobs.slice();
+    previousJobs = uniqueJobsById([...loadState(cwd).jobs, ...listJobSidecars(cwd)]);
     return saveStateUnlocked(cwd, state, previousJobs);
   });
   removePrunedJobFiles(cwd, previousJobs, nextState.jobs);
@@ -375,8 +385,22 @@ export function writeJobFile(cwd, jobId, payload) {
   return withJobFileLock(cwd, jobId, () => {
     const jobFile = resolveJobFile(cwd, jobId);
     if (hasEndedSession(cwd, payload?.sessionId)) {
+      const logFiles = new Set();
+      if (payload?.logFile) {
+        logFiles.add(payload.logFile);
+      }
+      try {
+        const storedJob = readJobFile(jobFile);
+        if (storedJob?.logFile) {
+          logFiles.add(storedJob.logFile);
+        }
+      } catch {
+        // Missing or corrupt sidecars are still safe to delete best-effort.
+      }
       removeJobFile(jobFile);
-      removeFileIfExists(payload?.logFile);
+      for (const logFile of logFiles) {
+        removeFileIfExists(logFile);
+      }
       return null;
     }
     return writeAtomicJson(jobFile, payload);

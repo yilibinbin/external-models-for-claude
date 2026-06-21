@@ -2761,13 +2761,71 @@ def test_codex_state_write_job_file_rejects_ended_session_sidecars(tmp_path):
     }
 
 
+def test_codex_state_write_job_file_rejects_ended_session_and_removes_existing_log(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const oldLog = resolveJobLogFile(cwd, 'write-ended-session-old-log');
+        const newLog = resolveJobLogFile(cwd, 'write-ended-session-new-log');
+        const oldJob = {
+          id: 'write-ended-session-log-mismatch',
+          status: 'running',
+          sessionId: 'session-write-ended-log-mismatch',
+          workspaceRoot: cwd,
+          request: { secret: 'old write secret' },
+          logFile: oldLog
+        };
+        const newJob = {
+          ...oldJob,
+          request: { secret: 'new write secret' },
+          logFile: newLog
+        };
+        writeJobFile(cwd, oldJob.id, oldJob);
+        fs.writeFileSync(oldLog, 'OLD_SIDECAR_SECRET\\n', 'utf8');
+        fs.writeFileSync(newLog, 'NEW_PAYLOAD_SECRET\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-write-ended-log-mismatch');
+        });
+        const writeResult = writeJobFile(cwd, newJob.id, newJob);
+        const jobFile = resolveJobFile(cwd, oldJob.id);
+
+        console.log(JSON.stringify({
+          writeResult,
+          jobFileExists: fs.existsSync(jobFile),
+          oldLogExists: fs.existsSync(oldLog),
+          newLogExists: fs.existsSync(newLog),
+          oldLogText: fs.existsSync(oldLog) ? fs.readFileSync(oldLog, 'utf8') : '',
+          newLogText: fs.existsSync(newLog) ? fs.readFileSync(newLog, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["writeResult"] is None
+    assert payload["jobFileExists"] is False
+    assert payload["oldLogExists"] is False
+    assert payload["newLogExists"] is False
+    assert "OLD_SIDECAR_SECRET" not in payload["oldLogText"]
+    assert "NEW_PAYLOAD_SECRET" not in payload["newLogText"]
+
+
 def test_codex_state_uses_required_slice_contracts():
     source = read_text(PLUGIN / "scripts" / "lib" / "state.mjs")
     save_state = js_function_body(source, "saveState")
     update_state = js_function_body(source, "updateState")
     assert "let previousJobs = []" in save_state
-    assert "previousJobs = loadState(cwd).jobs.slice()" in save_state
-    assert save_state.index("previousJobs = loadState(cwd).jobs.slice()") < save_state.index("saveStateUnlocked(cwd, state, previousJobs)")
+    assert "previousJobs = uniqueJobsById([...loadState(cwd).jobs, ...listJobSidecars(cwd)])" in save_state
+    assert save_state.index("previousJobs = uniqueJobsById") < save_state.index("saveStateUnlocked(cwd, state, previousJobs)")
+    assert "function uniqueJobsById" in source
     assert "const current = loadState(cwd)" in update_state
     assert "const previousJobs = current.jobs.slice()" in update_state
     assert "mutator(current)" in update_state
@@ -2796,7 +2854,7 @@ def test_codex_state_pruned_job_files_are_removed_under_job_file_lock():
     assert re.search(
         r"let previousJobs = \[\];\s*"
         r"const nextState = withStateLock\(cwd, \(\) => \{\s*"
-        r"previousJobs = loadState\(cwd\)\.jobs\.slice\(\);\s*"
+        r"previousJobs = uniqueJobsById\(\[\.\.\.loadState\(cwd\)\.jobs, \.\.\.listJobSidecars\(cwd\)\]\);\s*"
         r"return saveStateUnlocked\(cwd, state, previousJobs\);\s*"
         r"\}\);\s*"
         r"removePrunedJobFiles\(cwd, previousJobs, nextState\.jobs\);",
@@ -2948,6 +3006,44 @@ def test_codex_save_state_replacement_removes_sidecar_only_log_path(tmp_path):
     assert "terminal secret log" not in payload["logFileText"]
 
 
+def test_codex_save_state_replacement_removes_orphan_terminal_sidecars(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          resolveJobFile,
+          resolveJobLogFile,
+          saveState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'save-state-orphan-terminal',
+          status: 'completed',
+          workspaceRoot: cwd,
+          logFile: resolveJobLogFile(cwd, 'save-state-orphan-terminal'),
+          updatedAt: new Date().toISOString()
+        };
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'secret terminal log\\n', 'utf8');
+        saveState(cwd, { jobs: [] });
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile),
+          logFileText: fs.existsSync(job.logFile) ? fs.readFileSync(job.logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+    assert "secret terminal log" not in payload["logFileText"]
+
+
 def test_codex_state_skips_pruned_file_delete_when_job_reappears(tmp_path):
     payload = run_node_script(
         """
@@ -3055,7 +3151,6 @@ def test_codex_state_prune_delete_does_not_race_child_upsert(tmp_path):
         const publishedSignal = `${jobFile}.published`;
         writeJobFile(cwd, job.id, { ...job, progress: 'old job file' });
         fs.writeFileSync(logFile, 'old log\\n', 'utf8');
-        saveState(cwd, { jobs: [] });
 
         let injected = false;
         let childStatus = null;
