@@ -6536,7 +6536,8 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
         "const previewLine = `          printf '%s\\\\n' '{\"status\":\"preview\",\"reason\":\"release-host-cli-auth-contract-unverified\"}' > codex-for-claude-review.json`;"
         "const artifactBlock = '      - uses: actions/upload-artifact@v4\\n        if: always()\\n        with:\\n          name: codex-for-claude-review\\n          path: codex-for-claude-review.*\\n          retention-days: 5\\n';"
         "const artifactSpoof = base.replace(previewLine, `${previewLine}\\n          - uses: actions/upload-artifact@v4\\n            if: always()\\n            name: codex-for-claude-review\\n            path: codex-for-claude-review.*`).replace(artifactBlock, '');"
-        "process.stdout.write(JSON.stringify({mutableFetch:g.validateWorkflow(mutableFetch), mutableCheckout:g.validateWorkflow(mutableCheckout), mutableCheckoutVariable:g.validateWorkflow(mutableCheckoutVariable), extraMutableFetch:g.validateWorkflow(extraMutableFetch), noArtifact:g.validateWorkflow(noArtifact), commentedArtifact:g.validateWorkflow(commentedArtifact), artifactSpoof:g.validateWorkflow(artifactSpoof)}));"
+        "const scriptBodyStepsArtifactSpoof = base.replace(previewLine, `${previewLine}\\n          steps:\\n            - uses: actions/upload-artifact@v4\\n              if: always()\\n              with:\\n                name: codex-for-claude-review\\n                path: codex-for-claude-review.*`).replace(artifactBlock, '');"
+        "process.stdout.write(JSON.stringify({mutableFetch:g.validateWorkflow(mutableFetch), mutableCheckout:g.validateWorkflow(mutableCheckout), mutableCheckoutVariable:g.validateWorkflow(mutableCheckoutVariable), extraMutableFetch:g.validateWorkflow(extraMutableFetch), noArtifact:g.validateWorkflow(noArtifact), commentedArtifact:g.validateWorkflow(commentedArtifact), artifactSpoof:g.validateWorkflow(artifactSpoof), scriptBodyStepsArtifactSpoof:g.validateWorkflow(scriptBodyStepsArtifactSpoof)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6548,6 +6549,7 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
     artifact_check = next(check for check in payload["noArtifact"]["checks"] if check["name"] == "review-artifact-upload")
     commented_artifact_check = next(check for check in payload["commentedArtifact"]["checks"] if check["name"] == "review-artifact-upload")
     spoofed_artifact_check = next(check for check in payload["artifactSpoof"]["checks"] if check["name"] == "review-artifact-upload")
+    script_body_steps_artifact_check = next(check for check in payload["scriptBodyStepsArtifactSpoof"]["checks"] if check["name"] == "review-artifact-upload")
     assert install_check["ok"] is False
     assert checkout_check["ok"] is False
     assert checkout_variable_check["ok"] is False
@@ -6555,6 +6557,7 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
     assert artifact_check["ok"] is False
     assert commented_artifact_check["ok"] is False
     assert spoofed_artifact_check["ok"] is False
+    assert script_body_steps_artifact_check["ok"] is False
     assert payload["mutableFetch"]["structuralOk"] is False
     assert payload["mutableCheckout"]["structuralOk"] is False
     assert payload["mutableCheckoutVariable"]["structuralOk"] is False
@@ -6562,6 +6565,7 @@ def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload()
     assert payload["noArtifact"]["structuralOk"] is False
     assert payload["commentedArtifact"]["structuralOk"] is False
     assert payload["artifactSpoof"]["structuralOk"] is False
+    assert payload["scriptBodyStepsArtifactSpoof"]["structuralOk"] is False
 
 
 def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection():
@@ -6647,7 +6651,8 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
         "const duplicateDetector = base.replace('      - uses: actions/setup-node@v4', '      - name: Detect fork safety\\n        shell: bash\\n        run: echo unsafe-from-fork\\n      - uses: actions/setup-node@v4');"
         "const detectorBlock = base.match(/      - name: Detect fork safety[\\s\\S]*?      - uses: actions\\/setup-node@v4/)[0].replace('      - uses: actions/setup-node@v4', '');"
         "const duplicateExactDetector = base.replace('      - uses: actions/setup-node@v4', `${detectorBlock}      - uses: actions/setup-node@v4`);"
-        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), disguisedUngated:g.validateWorkflow(disguisedUngated), extraJob:g.validateWorkflow(extraJob), quotedExtraJob:g.validateWorkflow(quotedExtraJob), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi), duplicateDetector:g.validateWorkflow(duplicateDetector), duplicateExactDetector:g.validateWorkflow(duplicateExactDetector)}));"
+        "const scriptBodyStepsDetector = base.replace(detectorBlock, '').replace('          printf \\'%s\\\\n\\' \\'{\"status\":\"preview\",\"reason\":\"release-host-cli-auth-contract-unverified\"}\\' > codex-for-claude-review.json', `          printf '%s\\\\n' '{\"status\":\"preview\",\"reason\":\"release-host-cli-auth-contract-unverified\"}' > codex-for-claude-review.json\\n          steps:\\n${detectorBlock.replaceAll('      ', '            ')}`);"
+        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), disguisedUngated:g.validateWorkflow(disguisedUngated), extraJob:g.validateWorkflow(extraJob), quotedExtraJob:g.validateWorkflow(quotedExtraJob), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi), duplicateDetector:g.validateWorkflow(duplicateDetector), duplicateExactDetector:g.validateWorkflow(duplicateExactDetector), scriptBodyStepsDetector:g.validateWorkflow(scriptBodyStepsDetector)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6663,6 +6668,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     detector_after_fi_check = next(check for check in payload["unsafeDetectorAfterFi"]["checks"] if check["name"] == "fork-safe-step-gates")
     duplicate_detector_check = next(check for check in payload["duplicateDetector"]["checks"] if check["name"] == "fork-safe-step-gates")
     duplicate_exact_detector_check = next(check for check in payload["duplicateExactDetector"]["checks"] if check["name"] == "fork-safe-step-gates")
+    script_body_steps_detector_check = next(check for check in payload["scriptBodyStepsDetector"]["checks"] if check["name"] == "fork-safe-step-gates")
     assert review_check["ok"] is False
     assert install_check["ok"] is False
     assert extra_check["ok"] is False
@@ -6674,6 +6680,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     assert detector_after_fi_check["ok"] is False
     assert duplicate_detector_check["ok"] is False
     assert duplicate_exact_detector_check["ok"] is False
+    assert script_body_steps_detector_check["ok"] is False
     assert payload["reviewUngated"]["structuralOk"] is False
     assert payload["installUngated"]["structuralOk"] is False
     assert payload["extraUngated"]["structuralOk"] is False
@@ -6685,6 +6692,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     assert payload["unsafeDetectorAfterFi"]["structuralOk"] is False
     assert payload["duplicateDetector"]["structuralOk"] is False
     assert payload["duplicateExactDetector"]["structuralOk"] is False
+    assert payload["scriptBodyStepsDetector"]["structuralOk"] is False
 
 
 def test_codex_github_actions_validate_command_allows_preview_structural_workflow():

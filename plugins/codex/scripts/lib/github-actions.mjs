@@ -73,7 +73,7 @@ function activeStepBlocks(text) {
   const lines = activeWorkflowLines(text);
   const blocks = [];
   for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index].trim() !== "steps:") {
+    if (lines[index].trim() !== "steps:" || leadingSpaces(lines[index]) !== 4) {
       continue;
     }
     const stepsIndent = leadingSpaces(lines[index]);
