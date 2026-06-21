@@ -178,11 +178,8 @@ function hasReviewArtifactUpload(text) {
   );
 }
 
-function hasActiveForkSafetyDetector(text) {
-  const block = activeBlockStartingWith(text, "- name: Detect fork safety")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const expected = [
+function expectedForkSafetyDetectorBlock() {
+  return [
     "- name: Detect fork safety",
     "id: fork-safety",
     "shell: bash",
@@ -195,7 +192,15 @@ function hasActiveForkSafetyDetector(text) {
     'echo "safe_to_review=true" >> "$GITHUB_OUTPUT"',
     "fi"
   ];
-  return block.length === expected.length && expected.every((line, index) => block[index] === line);
+}
+
+function blockMatchesExpected(block, expected) {
+  const normalized = block.map((line) => line.trim()).filter(Boolean);
+  return normalized.length === expected.length && expected.every((line, index) => normalized[index] === line);
+}
+
+function hasActiveForkSafetyDetector(text) {
+  return blockMatchesExpected(activeBlockStartingWith(text, "- name: Detect fork safety"), expectedForkSafetyDetectorBlock());
 }
 
 function hasForkSafeStepGates(text, contractsVerified) {
@@ -212,16 +217,21 @@ function hasForkSafeStepGates(text, contractsVerified) {
   const requiredStepsGated = requiredSteps.every((step) => blockIncludesLine(text, step, FORK_SAFE_IF));
   const allowedUngatedSteps = new Set([
     "- uses: actions/checkout@v4",
-    "- name: Detect fork safety",
     "- uses: actions/upload-artifact@v4"
   ]);
+  const expectedDetector = expectedForkSafetyDetectorBlock();
   const executableStepsGated = activeStepBlocks(text).every((block) => {
     const firstLine = block[0]?.trim() ?? "";
     const hasExecutableSurface =
       firstLine.startsWith("- uses:") ||
       firstLine.startsWith("- run:") ||
       block.some((line) => line.trim().startsWith("run:"));
-    return !hasExecutableSurface || allowedUngatedSteps.has(firstLine) || block.some((line) => line.trim() === FORK_SAFE_IF);
+    return (
+      !hasExecutableSurface ||
+      allowedUngatedSteps.has(firstLine) ||
+      blockMatchesExpected(block, expectedDetector) ||
+      block.some((line) => line.trim() === FORK_SAFE_IF)
+    );
   });
   return hasActiveForkSafetyDetector(text) && requiredStepsGated && executableStepsGated;
 }

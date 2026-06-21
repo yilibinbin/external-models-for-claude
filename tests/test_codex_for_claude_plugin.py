@@ -6635,7 +6635,8 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
         "const shorthandUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - run: echo unsafe\\n      - uses: actions/upload-artifact@v4');"
         "const unsafeDetector = base.replace(/      - name: Detect fork safety[\\s\\S]*?      - uses: actions\\/setup-node@v4/, '      - name: Detect fork safety\\n        id: fork-safety\\n        shell: bash\\n        run: |\\n          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          # Codex review skipped because pull request head repository is not this repository.\\n          # {\"status\":\"skipped\",\"reason\":\"external-head-repository\"}\\n      - uses: actions/setup-node@v4');"
         "const unsafeDetectorAfterFi = base.replace('          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          fi', '          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"\\n          fi\\n          echo \"safe_to_review=true\" >> \"$GITHUB_OUTPUT\"');"
-        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi)}));"
+        "const duplicateDetector = base.replace('      - uses: actions/setup-node@v4', '      - name: Detect fork safety\\n        shell: bash\\n        run: echo unsafe-from-fork\\n      - uses: actions/setup-node@v4');"
+        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi), duplicateDetector:g.validateWorkflow(duplicateDetector)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6646,18 +6647,21 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     shorthand_check = next(check for check in payload["shorthandUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     detector_check = next(check for check in payload["unsafeDetector"]["checks"] if check["name"] == "fork-safe-step-gates")
     detector_after_fi_check = next(check for check in payload["unsafeDetectorAfterFi"]["checks"] if check["name"] == "fork-safe-step-gates")
+    duplicate_detector_check = next(check for check in payload["duplicateDetector"]["checks"] if check["name"] == "fork-safe-step-gates")
     assert review_check["ok"] is False
     assert install_check["ok"] is False
     assert extra_check["ok"] is False
     assert shorthand_check["ok"] is False
     assert detector_check["ok"] is False
     assert detector_after_fi_check["ok"] is False
+    assert duplicate_detector_check["ok"] is False
     assert payload["reviewUngated"]["structuralOk"] is False
     assert payload["installUngated"]["structuralOk"] is False
     assert payload["extraUngated"]["structuralOk"] is False
     assert payload["shorthandUngated"]["structuralOk"] is False
     assert payload["unsafeDetector"]["structuralOk"] is False
     assert payload["unsafeDetectorAfterFi"]["structuralOk"] is False
+    assert payload["duplicateDetector"]["structuralOk"] is False
 
 
 def test_codex_github_actions_validate_command_allows_preview_structural_workflow():
