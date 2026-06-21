@@ -24,6 +24,7 @@ export const EXPECTED_COMMANDS = [
   "cancel.md",
   "doctor.md",
   "github-actions.md",
+  "multi-review.md",
   "rescue.md",
   "result.md",
   "review.md",

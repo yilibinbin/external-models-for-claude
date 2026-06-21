@@ -6782,6 +6782,170 @@ def test_codex_github_actions_json_flag_is_validate_only(tmp_path):
     assert json.loads(validate.stdout)["structuralOk"] is True
 
 
+def test_codex_role_packs_define_default_roles():
+    script = (
+        "const r = await import('./plugins/codex/scripts/lib/role-packs.mjs');"
+        "process.stdout.write(JSON.stringify(r.resolveRoles({rolePack:'default'})));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    roles = json.loads(result.stdout)
+    assert [role["id"] for role in roles] == ["correctness", "security", "tests", "release", "adversarial"]
+
+
+def test_codex_role_packs_keep_security_guards_for_future_file_packs():
+    source = read_text(PLUGIN / "scripts" / "lib" / "role-packs.mjs")
+    assert "FORBIDDEN_FIELDS" in source
+    assert "MAX_PACK_BYTES" in source
+    assert "MAX_NESTING_DEPTH" in source
+    assert "NAME_PATTERN" in source
+    for forbidden in ["tools", "command", "hooks", "env", "provider", "max_effort"]:
+        assert forbidden in source
+
+
+def test_codex_quality_policy_is_available_before_multi_review_wiring():
+    script = (
+        "const q = await import('./plugins/codex/scripts/lib/quality-policy.mjs');"
+        "process.stdout.write(JSON.stringify([q.resolveQuality('fast'), q.resolveQuality('standard'), q.resolveQuality('max')]));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    fast, standard, maxq = json.loads(result.stdout)
+    assert fast["effort"] == "low"
+    assert standard["effort"] == "medium"
+    assert maxq["effort"] == "high"
+    assert maxq["nativeReviewEffect"] == "metadata-only"
+
+
+def test_codex_multi_review_command_exists_and_is_argument_safe():
+    text = read_text(PLUGIN / "commands" / "multi-review.md")
+    assert "disable-model-invocation" not in text
+    assert "allowed-tools: Bash(node:*)" in text
+    assert "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" in text
+    assert "multi-review" in text
+
+
+def test_codex_multi_review_uses_role_prompt_tracking_and_leases():
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    assert 'loadPromptTemplate(ROOT_DIR, "multi-review-role")' in companion
+    assert 'acquireResourceLease("model-call"' in companion
+    assert "commandLease.release?.();" in companion
+    assert "executeTaskRun({" in companion
+    assert "runForegroundCommand(" in companion
+    assert "resolveQuality(options.quality" in companion
+    assert "roleJobId" not in companion
+    assert "jobId: job.id" in companion
+    assert "renderReviewContextForPrompt(context)" in companion
+    assert "const status = Number.isFinite(Number(result.exitStatus)) ? Number(result.exitStatus) : 0" in companion
+    render_start = companion.index("function renderReviewContextForPrompt")
+    prompt_start = companion.index("function buildMultiReviewRolePrompt")
+    assert render_start < prompt_start
+    render_region = companion[render_start:prompt_start]
+    assert "context.content" in render_region
+    assert "context.mode ?? context.target?.mode" in render_region
+    assert "context.details" not in render_region
+    prompt_region = companion[prompt_start: companion.index("async function handleMultiReview", prompt_start)]
+    assert "context.content" not in prompt_region
+    assert "context.details" not in prompt_region
+    execute_body = js_function_body(companion, "executeTaskRun")
+    assert "withResourceLease(" not in execute_body
+    assert "writeJobFile(" not in execute_body
+    assert "upsertJob(" not in execute_body
+    assert "effort: request.effort" in execute_body
+    turn_index = execute_body.index("runAppServerTurn(")
+    assert "effort: request.effort" in execute_body[turn_index:]
+    assert "if (request.resumeLast)" in execute_body
+    assert "await resolveLatestTrackedTaskThread(workspaceRoot" in execute_body
+    assert "excludeJobId: request.jobId" in execute_body
+    assert "No previous Codex task thread was found" in execute_body
+    assert "resumeThreadId = latestThread.id" in execute_body
+    assert "defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : \"\"" in execute_body
+    assert ": null" in execute_body
+    assert "persistThread: request.persistThread !== false" in execute_body
+    assert "persistThread: true" not in execute_body
+    assert "request.persistThread === false ? null : (resumeThreadId ? null : buildPersistentTaskThreadName" in execute_body
+    multi_start = companion.index("async function handleMultiReview")
+    multi_body = companion[multi_start: companion.index("async function main", multi_start)]
+    assert "executeTaskRun({" in multi_body
+    assert "const model = normalizeRequestedModel(options.model)" in multi_body
+    assert "model," in multi_body
+    assert "effort: quality.effort" in multi_body
+    assert "model: options.model" not in multi_body
+    assert "resumeLast: false" in multi_body
+    assert "persistThread: false" in multi_body
+    assert multi_start < companion.index("async function main")
+
+
+def test_codex_multi_review_role_prompt_renders_real_context():
+    script = """
+      const c = await import('./plugins/codex/scripts/codex-companion.mjs');
+      const prompt = c.buildMultiReviewRolePrompt(
+        {
+          target: {label: 'working tree'},
+          mode: 'working-tree',
+          repoRoot: '<repo>',
+          branch: 'main',
+          summary: 'Reviewing 1 staged file.',
+          inputMode: 'inline-diff',
+          collectionGuidance: 'Use the inline diff as primary evidence.',
+          fileCount: 1,
+          diffBytes: 42,
+          changedFiles: ['src/demo.js'],
+          content: 'diff --git a/src/demo.js b/src/demo.js'
+        },
+        {title: 'Correctness', focus: 'Find behavior bugs.'}
+      );
+      process.stdout.write(prompt);
+    """
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "Reviewing 1 staged file." in result.stdout
+    assert "Input mode: inline-diff" in result.stdout
+    assert "Target mode: working-tree" in result.stdout
+    assert "Use the inline diff as primary evidence." in result.stdout
+    assert "diff --git a/src/demo.js b/src/demo.js" in result.stdout
+    assert "undefined" not in result.stdout
+
+
+def test_codex_multi_review_rejects_unsupported_flags():
+    result = run_node(PLUGIN / "scripts" / "codex-companion.mjs", ["multi-review", "--bad"], timeout=10)
+    assert result.returncode == 1
+    assert "Unsupported option" in result.stderr
+
+
+def test_codex_multi_review_capacity_zero_returns_capacity_blocked(tmp_path):
+    result = subprocess.run(
+        [NODE, str(PLUGIN / "scripts" / "codex-companion.mjs"), "multi-review", "--json"],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR": str(tmp_path / "locks"),
+            "CODEX_FOR_CLAUDE_GLOBAL_MAX_MODEL_CALLS": "0",
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 75
+    assert "capacity_blocked" in result.stderr + result.stdout
+    assert str(tmp_path) not in result.stderr + result.stdout
+
+
+def test_codex_multi_review_capacity_lease_precedes_git_and_context_collection():
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    body = js_function_body(companion, "handleMultiReview")
+    lease_start = body.index('const commandLease = acquireResourceLease("model-call"')
+    finally_index = body.index("finally {", lease_start)
+    lease_region = body[lease_start:finally_index]
+    assert lease_region.index('acquireResourceLease("model-call"') < lease_region.index("try {")
+    assert lease_region.index("try {") < lease_region.index("resolveReviewTarget(cwd")
+    assert lease_region.index("resolveReviewTarget(cwd") < lease_region.index("createCompanionJob({")
+    assert lease_region.index("createCompanionJob({") < lease_region.index("runForegroundCommand(")
+    assert lease_region.index("runForegroundCommand(") < lease_region.index("collectReviewContext(cwd")
+
+
 def test_codex_release_check_import_is_side_effect_free_after_github_actions_import():
     script = "await import('./plugins/codex/scripts/lib/release-check.mjs');"
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)

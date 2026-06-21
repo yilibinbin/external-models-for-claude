@@ -28,6 +28,8 @@ import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { renderWorkflow, validateWorkflow, writeWorkflow } from "./lib/github-actions.mjs";
 import { runReleaseCheck } from "./lib/release-check.mjs";
+import { resolveQuality } from "./lib/quality-policy.mjs";
+import { resolveRoles } from "./lib/role-packs.mjs";
 import {
   generateJobId,
   getConfig,
@@ -95,6 +97,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs doctor [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs multi-review [--roles <list>|--role-pack <name>] [--base <ref>] [--scope <auto|working-tree|branch>] [--quality <fast|standard|strong|max>] [--json]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -498,7 +501,7 @@ async function executeReviewRun(request) {
   };
 }
 
-
+// Lease and tracked-job ownership live at command-handler boundaries; executeTaskRun must not acquire resource leases or write job state internally.
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureCodexAvailable(request.cwd);
@@ -531,8 +534,9 @@ async function executeTaskRun(request) {
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
-    persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    persistThread: request.persistThread !== false,
+    // Internal role turns use the disabled thread-name shape: { threadName: null }.
+    threadName: request.persistThread === false ? null : (resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT))
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -568,6 +572,43 @@ async function executeTaskRun(request) {
     jobClass: "task",
     write: Boolean(request.write)
   };
+}
+
+export function renderReviewContextForPrompt(context) {
+  const changedFiles = Array.isArray(context.changedFiles) && context.changedFiles.length
+    ? context.changedFiles.join("\n")
+    : "No changed-file list available.";
+  const body = String(context.content || "").trim();
+  const inputMode = context.inputMode || "unknown";
+  const targetMode = context.mode ?? context.target?.mode ?? "unknown";
+  return [
+    `Target: ${context.target?.label || "unknown"}`,
+    `Target mode: ${targetMode}`,
+    `Repository: ${context.repoRoot || context.cwd || "unknown"}`,
+    `Branch: ${context.branch || "unknown"}`,
+    `Summary: ${context.summary || "No summary available."}`,
+    `Input mode: ${inputMode}`,
+    `Files: ${context.fileCount ?? "unknown"}`,
+    `Diff bytes: ${context.diffBytes ?? "unknown"}`,
+    "",
+    "Collection guidance:",
+    context.collectionGuidance || "Inspect the repository read-only before finalizing findings.",
+    "",
+    "Changed files:",
+    changedFiles,
+    "",
+    "Repository context:",
+    body || "No inline context was collected; inspect the target read-only before finalizing findings."
+  ].join("\n");
+}
+
+export function buildMultiReviewRolePrompt(context, role) {
+  const template = loadPromptTemplate(ROOT_DIR, "multi-review-role");
+  return interpolateTemplate(template, {
+    ROLE_TITLE: role.title,
+    ROLE_FOCUS: role.focus,
+    REVIEW_CONTEXT: renderReviewContextForPrompt(context)
+  });
 }
 
 function buildReviewJobMetadata(reviewName, target) {
@@ -1391,6 +1432,87 @@ function handleGithubActions(argv) {
   throw new Error("github-actions action must be render, validate, or init.");
 }
 
+async function handleMultiReview(argv) {
+  const { options, positionals } = parseStrictCommandInput("multi-review", argv, {
+    valueOptions: ["roles", "role-pack", "base", "scope", "model", "quality", "cwd"],
+    booleanOptions: ["json"],
+    aliasMap: { C: "cwd", m: "model" }
+  });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected multi-review argument: ${positionals.join(" ")}`);
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const commandLease = acquireResourceLease("model-call", {
+    env: process.env,
+    command: "multi-review"
+  });
+  if (!commandLease.ok) {
+    throw capacityBlockedError(commandLease);
+  }
+
+  try {
+    const target = resolveReviewTarget(cwd, {
+      base: options.base,
+      scope: options.scope
+    });
+    const roles = resolveRoles({ roles: options.roles, rolePack: options["role-pack"] || "default" });
+    const model = normalizeRequestedModel(options.model);
+    const quality = resolveQuality(options.quality || "standard");
+    const job = createCompanionJob({
+      prefix: "review",
+      kind: "multi-review",
+      title: "Codex Multi-Review",
+      workspaceRoot,
+      jobClass: "review",
+      summary: `${roles.length} roles for ${target.label}`
+    });
+    await runForegroundCommand(
+      job,
+      async (progress) => {
+        const context = collectReviewContext(cwd, target);
+        const results = [];
+        for (const role of roles) {
+          const prompt = buildMultiReviewRolePrompt(context, role);
+          const result = await executeTaskRun({
+            cwd: context.repoRoot,
+            prompt,
+            model,
+            effort: quality.effort,
+            write: false,
+            resumeLast: false,
+            persistThread: false,
+            jobId: job.id,
+            onProgress: progress
+          });
+          const status = Number.isFinite(Number(result.exitStatus)) ? Number(result.exitStatus) : 0;
+          results.push({
+            role: role.id,
+            title: role.title,
+            status,
+            output: result.payload?.rawOutput ?? "",
+            reasoningSummary: result.payload?.reasoningSummary ?? null
+          });
+        }
+        const rendered = results.map((item) => `## ${item.title}\n\n${item.output || "No output."}`).join("\n\n");
+        return {
+          exitStatus: results.every((item) => item.status === 0) ? 0 : 1,
+          payload: { target, quality, roles: results },
+          rendered,
+          summary: `Multi-review finished for ${target.label}.`,
+          jobTitle: "Codex Multi-Review",
+          jobClass: "review",
+          targetLabel: target.label
+        };
+      },
+      { json: options.json }
+    );
+  } finally {
+    commandLease.release?.();
+  }
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
@@ -1412,6 +1534,9 @@ async function main() {
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
+      break;
+    case "multi-review":
+      await handleMultiReview(argv);
       break;
     case "task":
       await handleTask(argv);
