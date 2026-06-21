@@ -3243,6 +3243,74 @@ def test_codex_session_lifecycle_cleanup_removes_active_sidecars(tmp_path):
     assert payload["logFileExists"] is False
 
 
+def test_codex_session_lifecycle_cleanup_removes_state_and_sidecar_log_paths(tmp_path):
+    payload = run_node_script(
+        f"""
+        import fs from 'node:fs';
+        import {{ spawnSync }} from 'node:child_process';
+        import {{
+          listJobs,
+          resolveJobFile,
+          resolveJobLogFile,
+          upsertJob,
+          writeJobFile
+        }} from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const hook = {json.dumps(str(PLUGIN / "scripts" / "session-lifecycle-hook.mjs"))};
+        const oldLog = resolveJobLogFile(cwd, 'session-mismatch-old');
+        const actualLog = resolveJobLogFile(cwd, 'session-mismatch-actual');
+        const sharedJob = {{
+          id: 'session-mismatched-log-cleanup',
+          status: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-mismatched-log',
+          pid: 99999999,
+          request: {{ secret: 'state secret' }},
+          logFile: oldLog,
+          updatedAt: new Date().toISOString()
+        }};
+        const sidecarJob = {{
+          ...sharedJob,
+          request: {{ secret: 'sidecar secret' }},
+          logFile: actualLog
+        }};
+        upsertJob(cwd, sharedJob);
+        writeJobFile(cwd, sharedJob.id, sidecarJob);
+        fs.writeFileSync(oldLog, 'OLD_SECRET_LOG\\\\n', 'utf8');
+        fs.writeFileSync(actualLog, 'SIDE_SECRET_LOG\\\\n', 'utf8');
+
+        const result = spawnSync(
+          process.execPath,
+          [hook, 'SessionEnd'],
+          {{
+            cwd,
+            input: JSON.stringify({{ cwd, session_id: 'session-mismatched-log' }}),
+            encoding: 'utf8'
+          }}
+        );
+
+        console.log(JSON.stringify({{
+          status: result.status,
+          stderr: result.stderr,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(resolveJobFile(cwd, sharedJob.id)),
+          oldLogExists: fs.existsSync(oldLog),
+          sidecarLogExists: fs.existsSync(actualLog),
+          sidecarLogText: fs.existsSync(actualLog) ? fs.readFileSync(actualLog, 'utf8') : ''
+        }}));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["status"] == 0, payload["stderr"]
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["oldLogExists"] is False
+    assert payload["sidecarLogExists"] is False
+    assert "SIDE_SECRET_LOG" not in payload["sidecarLogText"]
+
+
 def test_codex_session_lifecycle_cleanup_removes_jobs_added_after_snapshot(tmp_path):
     payload = run_node_script(
         f"""

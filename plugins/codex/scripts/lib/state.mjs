@@ -431,15 +431,22 @@ export function mutateJobFile(cwd, jobId, mutate) {
 export function removeJobSidecar(cwd, job) {
   return withJobFileLock(cwd, job.id, () => {
     const jobFile = resolveJobFile(cwd, job.id);
-    let logFile = job.logFile ?? null;
+    const logFiles = new Set();
+    if (job.logFile) {
+      logFiles.add(job.logFile);
+    }
     try {
       const storedJob = readJobFile(jobFile);
-      logFile = logFile ?? storedJob.logFile ?? null;
+      if (storedJob?.logFile) {
+        logFiles.add(storedJob.logFile);
+      }
     } catch {
       // Missing or corrupt sidecars are still safe to delete best-effort.
     }
     removeJobFile(jobFile);
-    removeFileIfExists(logFile);
+    for (const logFile of logFiles) {
+      removeFileIfExists(logFile);
+    }
   });
 }
 
