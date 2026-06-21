@@ -26,6 +26,7 @@ import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "
 import { doctorReport } from "./lib/doctor.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { renderWorkflow, validateWorkflow, writeWorkflow } from "./lib/github-actions.mjs";
 import { runReleaseCheck } from "./lib/release-check.mjs";
 import {
   generateJobId,
@@ -97,7 +98,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs release-check [--json]",
+      "  node scripts/codex-companion.mjs github-actions <render|validate|init> [--ref <tag>] [--force] [--json]",
+      "  node scripts/codex-companion.mjs release-check [--ci-simulate] [--require-codex-cli] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
   );
@@ -1325,13 +1327,16 @@ function renderReleaseCheckDetail(detail) {
 
 function handleReleaseCheck(argv) {
   const { options, positionals } = parseStrictCommandInput("release-check", argv, {
-    booleanOptions: ["json"]
+    booleanOptions: ["json", "ci-simulate", "require-codex-cli"]
   });
   if (positionals.length > 0) {
     throw new Error(`Unexpected release-check argument: ${positionals.join(" ")}`);
   }
 
-  const report = runReleaseCheck(process.cwd());
+  const report = runReleaseCheck(process.cwd(), {
+    ciSimulate: Boolean(options["ci-simulate"]),
+    requireCodexCli: Boolean(options["require-codex-cli"])
+  });
 
   if (options.json) {
     outputResult(report, true);
@@ -1345,6 +1350,42 @@ function handleReleaseCheck(argv) {
   if (!report.ok) {
     process.exitCode = 1;
   }
+}
+
+function renderGithubActionsValidation(payload) {
+  return `${payload.checks.map((item) => `${item.ok ? "PASS" : "FAIL"} ${item.name}`).join("\n")}\n`;
+}
+
+function handleGithubActions(argv) {
+  const { action = "render", options, positionals } = parseStrictCommandInput("github-actions", argv, {
+    actions: ["render", "validate", "init"],
+    valueOptions: ["ref"],
+    booleanOptions: ["force", "json"]
+  });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected github-actions argument: ${positionals.join(" ")}`);
+  }
+
+  const rendered = renderWorkflow({ ref: options.ref });
+  if (action === "render") {
+    process.stdout.write(rendered);
+    return;
+  }
+
+  if (action === "validate") {
+    const payload = validateWorkflow(rendered);
+    outputResult(options.json ? payload : renderGithubActionsValidation(payload), options.json);
+    process.exitCode = payload.ok || (payload.preview && payload.structuralOk) ? 0 : 1;
+    return;
+  }
+
+  if (action === "init") {
+    const target = writeWorkflow(process.cwd(), rendered, { force: Boolean(options.force) });
+    process.stdout.write(`Wrote ${target}\n`);
+    return;
+  }
+
+  throw new Error("github-actions action must be render, validate, or init.");
 }
 
 async function main() {
@@ -1380,6 +1421,9 @@ async function main() {
       break;
     case "result":
       handleResult(argv);
+      break;
+    case "github-actions":
+      handleGithubActions(argv);
       break;
     case "release-check":
       handleReleaseCheck(argv);

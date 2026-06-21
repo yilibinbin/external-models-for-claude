@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 
+import pytest
+
 from plugin_versions import CODEX_VERSION as FALLBACK_CODEX_VERSION
 from plugin_versions import MARKETPLACE_VERSION as FALLBACK_MARKETPLACE_VERSION
 
@@ -146,6 +148,22 @@ def run_companion(args, cwd=ROOT, env=None):
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def run_node(script, args=None, env=None, timeout=30, cwd=ROOT):
+    command_env = os.environ.copy()
+    if env:
+        command_env.update(env)
+    return subprocess.run(
+        [NODE, str(script), *(args or [])],
+        cwd=cwd,
+        env=command_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
         check=False,
     )
 
@@ -920,7 +938,7 @@ def test_codex_new_commands_use_strict_command_parser():
     assert 'from "./args.mjs"' in command_policy
     assert "function normalizeArgv" not in companion
 
-    for name in ["handleSetup", "handleDoctor", "handleReleaseCheck"]:
+    for name in ["handleSetup", "handleDoctor", "handleReleaseCheck", "handleGithubActions"]:
         body = js_function_body(companion, name)
         assert "parseStrictCommandInput" in body
         assert "parseCommandInput" not in body
@@ -1000,6 +1018,18 @@ def test_codex_setup_command_does_not_interpolate_raw_arguments():
         'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --disable-review-gate'
         in text
     )
+
+
+def test_codex_github_actions_command_does_not_interpolate_raw_arguments():
+    text = read_text(PLUGIN / "commands" / "github-actions.md")
+
+    assert "disable-model-invocation" not in text
+    assert "$ARGUMENTS" in text
+    for block in fenced_bash_blocks(text):
+        assert "$ARGUMENTS" not in block
+    assert 'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" github-actions render' in text
+    assert 'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" github-actions validate' in text
+    assert 'node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" github-actions init' in text
 
 
 def test_codex_install_consistency_parses_claude_plugin_list_schema():
@@ -6277,6 +6307,321 @@ def test_codex_status_liveness_ignores_mismatched_or_malformed_job_files(tmp_pat
     malformed = next(item for item in payload["running"] if item["id"] == "malformed-liveness")
     assert malformed["liveness"]["state"] == "lost"
     assert malformed["liveness"]["reason"] == "heartbeat-lost"
+
+
+def test_codex_github_actions_template_is_fork_safe(tmp_path):
+    result = run_node(PLUGIN / "scripts" / "codex-companion.mjs", ["github-actions", "render", "--ref", "v0.2.0"], timeout=10)
+    assert result.returncode == 0, result.stderr
+    text = result.stdout
+    assert "pull_request:" in text
+    assert "pull_request_target" not in text
+    assert "contents: read" in text
+    assert "claude plugin marketplace add \"$marketplace_dir\" --scope user" in text
+    assert "claude plugin install codex@external-models-for-claude --scope user" in text
+    assert "claude plugin list --json" in text
+    assert "installPath" in text
+    assert "plugin.path" in text
+    assert "plugin.root" in text
+    assert "HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}" in text
+    assert "BASE_REPO: ${{ github.repository }}" in text
+    assert "steps.fork-safety.outputs.safe_to_review == 'true'" in text
+    assert "Codex review skipped because pull request head repository is not this repository" in text
+    assert '{"status":"skipped","reason":"external-head-repository"}' in text
+    if "REPLACE_WITH_RELEASE_HOST_CODEX_CLI_VERSION" in text or "REPLACE_WITH_RELEASE_HOST_CLAUDE_CODE_VERSION" in text:
+        assert "Codex auth steps omitted until release-host CLI/auth contract is verified." in text
+        assert "Codex review execution omitted until release-host CLI/auth contract is verified." in text
+        assert "OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}" not in text
+        assert "$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs\" review --json" not in text
+    else:
+        assert "OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}" in text
+        assert "codex login --with-api-key" in text
+        assert "$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs" in text
+        assert "codex-for-claude-review.stderr" in text
+        assert '"status": "failed"' in text
+    if "REPLACE_WITH_RELEASE_HOST_CODEX_CLI_VERSION" not in text:
+        assert re.search(r'CODEX_CLI_NPM_VERSION: "[0-9]+\.[0-9]+\.[0-9]+"', text)
+    if "REPLACE_WITH_RELEASE_HOST_CLAUDE_CODE_VERSION" not in text:
+        assert re.search(r'CLAUDE_CODE_NPM_VERSION: "[0-9]+\.[0-9]+\.[0-9]+"', text)
+    assert 'npm install -g "@openai/codex@$CODEX_CLI_NPM_VERSION"' in text
+    assert 'npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_NPM_VERSION"' in text
+    assert "CODEX_API_KEY" not in text
+    assert "--dangerously-skip-permissions" not in text
+    assert_no_machine_paths(text)
+    match = re.search(r"// codex-plugin-root-resolver-begin\n(?P<script>.*?)\n\s*// codex-plugin-root-resolver-end", text, re.S)
+    assert match, "embedded plugin-root resolver script not found between sentinel markers"
+    resolver = tmp_path / "resolver.cjs"
+    resolver.write_text(match.group("script"), encoding="utf8")
+    check = subprocess.run([NODE, "--check", str(resolver)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert check.returncode == 0, check.stderr
+    samples = [
+        [{"id": "codex@external-models-for-claude", "installPath": "/tmp/install-path"}],
+        [{"name": "codex", "path": "/tmp/path-field"}],
+        [{"id": "codex@external-models-for-claude", "root": "/tmp/root-field"}],
+    ]
+    for sample in samples:
+        run = subprocess.run([NODE, str(resolver)], input=json.dumps(sample), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        assert run.returncode == 0, run.stderr
+        assert run.stdout.startswith("/tmp/")
+
+
+def test_codex_github_actions_root_resolver_matches_install_consistency_precedence(tmp_path):
+    result = run_node(PLUGIN / "scripts" / "codex-companion.mjs", ["github-actions", "render", "--ref", "v0.2.0"], timeout=10)
+    assert result.returncode == 0, result.stderr
+    match = re.search(r"// codex-plugin-root-resolver-begin\n(?P<script>.*?)\n\s*// codex-plugin-root-resolver-end", result.stdout, re.S)
+    assert match, "embedded plugin-root resolver script not found between sentinel markers"
+    resolver = tmp_path / "resolver.cjs"
+    resolver.write_text(match.group("script"), encoding="utf8")
+    install_script = (
+        "import fs from 'node:fs';"
+        "const i = await import('./plugins/codex/scripts/lib/install-consistency.mjs');"
+        "const entry = i.installedCodexEntry(JSON.parse(fs.readFileSync(0, 'utf8')));"
+        "process.stdout.write(entry?.installPath || '');"
+    )
+    samples = [
+        [{"id": "codex@external-models-for-claude", "installPath": "/tmp/install-path"}],
+        [{"name": "codex", "path": "/tmp/path-field"}],
+        [{"id": "codex@external-models-for-claude", "root": "/tmp/root-field"}],
+        {"plugins": [{"name": "other", "installPath": "/tmp/other"}, {"name": "codex", "path": "/tmp/codex"}]},
+    ]
+    for sample in samples:
+        raw = json.dumps(sample)
+        embedded = subprocess.run([NODE, str(resolver)], input=raw, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        install = subprocess.run([NODE, "--input-type=module", "-e", install_script], input=raw, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        assert embedded.returncode == 0, embedded.stderr
+        assert install.returncode == 0, install.stderr
+        assert embedded.stdout == install.stdout
+
+
+def test_codex_github_actions_root_resolver_rootless_entry_fails_ci(tmp_path):
+    result = run_node(PLUGIN / "scripts" / "codex-companion.mjs", ["github-actions", "render", "--ref", "v0.2.0"], timeout=10)
+    assert result.returncode == 0, result.stderr
+    match = re.search(r"// codex-plugin-root-resolver-begin\n(?P<script>.*?)\n\s*// codex-plugin-root-resolver-end", result.stdout, re.S)
+    assert match, "embedded plugin-root resolver script not found between sentinel markers"
+    resolver = tmp_path / "resolver.cjs"
+    resolver.write_text(match.group("script"), encoding="utf8")
+    raw = json.dumps([{"id": "codex@external-models-for-claude", "name": "codex"}])
+    embedded = subprocess.run([NODE, str(resolver)], input=raw, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert embedded.returncode == 1
+    assert "Could not resolve" in embedded.stderr
+
+
+def test_codex_github_actions_contract_constants_drive_rendered_workflow():
+    script = (
+        "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
+        "const text = g.renderWorkflow({ref:'v0.2.0'});"
+        "process.stdout.write(JSON.stringify({releaseHostVerified:g.RELEASE_HOST_CONTRACTS_VERIFIED, codexVersion:g.CODEX_CLI_NPM_VERSION, claudeVersion:g.CLAUDE_CODE_NPM_VERSION, codexVersionIncluded:text.includes(`CODEX_CLI_NPM_VERSION: \"${g.CODEX_CLI_NPM_VERSION}\"`), claudeVersionIncluded:text.includes(`CLAUDE_CODE_NPM_VERSION: \"${g.CLAUDE_CODE_NPM_VERSION}\"`), helpIncluded:text.includes(g.CODEX_CLI_AUTH_HELP_COMMAND), loginIncluded:text.includes(g.CODEX_CLI_AUTH_LOGIN_COMMAND), validation:g.validateWorkflow(text)}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    if not payload["releaseHostVerified"]:
+        pytest.skip("ready workflow assertions require RELEASE_HOST_CONTRACTS_VERIFIED=true from a saved release-host artifact")
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", payload["codexVersion"])
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", payload["claudeVersion"])
+    assert payload["codexVersionIncluded"] is True
+    assert payload["claudeVersionIncluded"] is True
+    assert payload["helpIncluded"] is True
+    assert payload["loginIncluded"] is True
+    assert payload["validation"]["ok"] is True
+
+
+def test_codex_github_actions_version_sentinels_are_replaced_together():
+    script = (
+        "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
+        "process.stdout.write(JSON.stringify({paired:g.versionSentinelsPaired(), marker:g.RELEASE_HOST_CONTRACTS_VERIFIED, verified:g.releaseHostContractsVerified(), codex:g.CODEX_CLI_NPM_VERSION, claude:g.CLAUDE_CODE_NPM_VERSION, validation:g.validateWorkflow(g.renderWorkflow({ref:'v0.2.0'}))}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["paired"] is True
+    assert payload["verified"] is (
+        payload["marker"] is True
+        and not payload["codex"].startswith("REPLACE_WITH_")
+        and not payload["claude"].startswith("REPLACE_WITH_")
+    )
+    paired_check = next(check for check in payload["validation"]["checks"] if check["name"] == "cli-version-sentinels-paired")
+    assert paired_check["ok"] is True
+
+
+def test_codex_github_actions_rejects_unresolved_cli_version_sentinel():
+    script = (
+        "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
+        "process.stdout.write(JSON.stringify({version:g.CODEX_CLI_NPM_VERSION, validation:g.validateWorkflow(g.renderWorkflow({ref:'v0.2.0'}))}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    if payload["version"] == "REPLACE_WITH_RELEASE_HOST_CODEX_CLI_VERSION":
+        assert payload["validation"]["ok"] is False
+        assert any(check["name"] == "codex-cli-version-pinned" and check["ok"] is False for check in payload["validation"]["checks"])
+
+
+def test_codex_github_actions_validate_command_allows_preview_structural_workflow():
+    result = run_node(
+        PLUGIN / "scripts" / "codex-companion.mjs",
+        ["github-actions", "validate", "--ref", "v0.2.0", "--json"],
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["structuralOk"] is True
+    if payload["preview"]:
+        assert payload["ready"] is False
+        assert payload["ok"] is False
+
+
+def test_codex_release_check_import_is_side_effect_free_after_github_actions_import():
+    script = "await import('./plugins/codex/scripts/lib/release-check.mjs');"
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_codex_github_actions_module_has_no_top_level_side_effects():
+    source = read_text(PLUGIN / "scripts" / "lib" / "github-actions.mjs")
+    first_function = min(index for index in [
+        source.index("export function renderWorkflow"),
+        source.index("export function validateWorkflow"),
+    ] if index >= 0)
+    top_level_region = source[:first_function]
+    for forbidden in ["fs.readFileSync(", "spawnSync(", "console.", "process.stdout", "process.stderr", "await "]:
+        assert forbidden not in top_level_region
+    assert "const PLUGIN_ROOT" in top_level_region
+
+
+def test_codex_github_actions_plugin_root_resolves_template_from_installed_cache_layout(tmp_path):
+    installed = tmp_path / "cache" / "external-models-for-claude" / "codex" / "1.1.0-fh.1"
+    shutil.copytree(PLUGIN, installed)
+    module_url = (installed / "scripts" / "lib" / "github-actions.mjs").as_uri()
+    script = (
+        "const moduleUrl = process.argv[1];"
+        "const g = await import(moduleUrl);"
+        "const text = g.renderWorkflow({ref:'v0.2.0'});"
+        "process.stdout.write(JSON.stringify({hasTemplate:text.includes('name: Codex for Claude Review'), hasRootResolver:text.includes('codex-plugin-root-resolver-begin'), validation:g.validateWorkflow(text)}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script, module_url], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["hasTemplate"] is True
+    assert payload["hasRootResolver"] is True
+    assert any(check["name"] == "plugin-root-resolved" and check["ok"] is True for check in payload["validation"]["checks"])
+
+
+def test_codex_github_actions_rendered_yaml_parses_when_parser_available():
+    ruby = shutil.which("ruby")
+    if not ruby:
+        pytest.skip("ruby YAML parser unavailable")
+    result = run_node(PLUGIN / "scripts" / "codex-companion.mjs", ["github-actions", "render", "--ref", "v0.2.0"], timeout=10)
+    assert result.returncode == 0, result.stderr
+    for placeholder in ["{{RELEASE_REF}}", "{{CODEX_CLI_NPM_VERSION}}", "{{CLAUDE_CODE_NPM_VERSION}}", "{{CODEX_AUTH_STEPS}}", "{{CODEX_REVIEW_STEP}}"]:
+        assert placeholder not in result.stdout
+    parse = subprocess.run(
+        [ruby, "-e", "require 'yaml'; YAML.safe_load(STDIN.read, permitted_classes: [], aliases: false)"],
+        input=result.stdout,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert parse.returncode == 0, parse.stderr
+
+
+def test_codex_github_actions_rendered_yaml_has_basic_structure_without_ruby():
+    result = run_node(PLUGIN / "scripts" / "codex-companion.mjs", ["github-actions", "render", "--ref", "v0.2.0"], timeout=10)
+    assert result.returncode == 0, result.stderr
+    text = result.stdout
+    for placeholder in ["{{RELEASE_REF}}", "{{CODEX_CLI_NPM_VERSION}}", "{{CLAUDE_CODE_NPM_VERSION}}", "{{CODEX_AUTH_STEPS}}", "{{CODEX_REVIEW_STEP}}"]:
+        assert placeholder not in text
+    assert "jobs:\n  codex-review:" in text
+    assert "\n    steps:\n" in text
+    assert text.count("- name:") >= 6
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        assert indent % 2 == 0, line
+
+
+def test_codex_github_actions_rejects_mutable_ref():
+    result = run_node(PLUGIN / "scripts" / "codex-companion.mjs", ["github-actions", "render", "--ref", "main"], timeout=10)
+    assert result.returncode == 1
+    assert "immutable version tag" in result.stderr
+
+
+def test_codex_github_actions_rejects_unsupported_flags():
+    result = run_node(PLUGIN / "scripts" / "codex-companion.mjs", ["github-actions", "render", "--bad"], timeout=10)
+    assert result.returncode == 1
+    assert "Unsupported option" in result.stderr
+
+
+def test_codex_release_check_ci_simulate_validates_workflow():
+    result = run_node(PLUGIN / "scripts" / "codex-companion.mjs", ["release-check", "--ci-simulate", "--json"], timeout=20)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    names = {check["name"] for check in payload["checks"]}
+    assert {
+        "ci-workflow-fork-safe",
+        "ci-workflow-codex-auth-login",
+        "ci-workflow-codex-cli-version-pinned",
+        "ci-workflow-claude-code-version-pinned",
+        "ci-workflow-plugin-root-resolved",
+        "ci-claude-code-version-contract",
+        "ci-codex-cli-version-contract",
+        "ci-codex-cli-auth-contract",
+    } <= names
+    version_contract = next(check for check in payload["checks"] if check["name"] == "ci-codex-cli-version-contract")
+    assert "verified" in version_contract["detail"] or "not verified" in version_contract["detail"]
+
+
+def test_codex_release_check_ci_simulate_auth_contract_is_advisory_without_require_flag():
+    result = run_node(
+        PLUGIN / "scripts" / "codex-companion.mjs",
+        ["release-check", "--ci-simulate", "--json"],
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    contract = next(check for check in payload["checks"] if check["name"] == "ci-codex-cli-auth-contract")
+    assert contract["ok"] is True
+    assert "not verified" in contract["detail"]
+    assert "--require-codex-cli" in contract["detail"]
+    source = read_text(PLUGIN / "scripts" / "lib" / "release-check.mjs")
+    body = js_function_body(source, "runReleaseCheck")
+    require_region = body[body.index("if (requireCodexCli)"):]
+    pre_require_region = body[:body.index("if (requireCodexCli)")]
+    assert "spawnSync(" not in pre_require_region
+    assert "spawnSync(" in require_region
+
+
+def test_codex_release_check_require_flag_rejects_unresolved_version_sentinels():
+    script = (
+        "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
+        "process.stdout.write(JSON.stringify({codex:g.CODEX_CLI_NPM_VERSION, claude:g.CLAUDE_CODE_NPM_VERSION}));"
+    )
+    constants = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert constants.returncode == 0, constants.stderr
+    versions = json.loads(constants.stdout)
+    if not (versions["codex"].startswith("REPLACE_WITH_") or versions["claude"].startswith("REPLACE_WITH_")):
+        pytest.skip("release-host version sentinels were already replaced")
+    result = run_node(
+        PLUGIN / "scripts" / "codex-companion.mjs",
+        ["release-check", "--ci-simulate", "--require-codex-cli", "--json"],
+        timeout=20,
+    )
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    details = {check["name"]: check["detail"] for check in payload["checks"]}
+    assert "sentinel not replaced" in details["ci-claude-code-version-contract"] or "sentinel not replaced" in details["ci-codex-cli-version-contract"]
+
+
+def test_codex_release_check_has_concrete_preview_command_surface():
+    source = read_text(PLUGIN / "scripts" / "lib" / "release-check.mjs")
+    assert "const EXPECTED_COMMANDS" in source
+    assert "const PREVIEW_COMMANDS" in source
+    assert "const READY_COMMANDS" in source
+    assert "ready-command-surface" in source
+    assert 'new Set(["github-actions.md"])' in source
 
 
 def test_codex_companion_import_is_side_effect_free():

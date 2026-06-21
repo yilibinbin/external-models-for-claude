@@ -1,0 +1,81 @@
+name: Codex for Claude Review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  codex-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CODEX_FOR_CLAUDE_RELEASE_REF: "{{RELEASE_REF}}"
+      CODEX_CLI_NPM_VERSION: "{{CODEX_CLI_NPM_VERSION}}"
+      CLAUDE_CODE_NPM_VERSION: "{{CLAUDE_CODE_NPM_VERSION}}"
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      BASE_REPO: ${{ github.repository }}
+      IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect fork safety
+        id: fork-safety
+        shell: bash
+        run: |
+          if [ "$IS_FORK" = "true" ] || [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            echo "safe_to_review=false" >> "$GITHUB_OUTPUT"
+            echo "Codex review skipped because pull request head repository is not this repository." > codex-for-claude-review.md
+            printf '%s\n' '{"status":"skipped","reason":"external-head-repository"}' > codex-for-claude-review.json
+          else
+            echo "safe_to_review=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.fork-safety.outputs.safe_to_review == 'true'
+        with:
+          node-version: "20"
+      - name: Install Claude Code
+        if: steps.fork-safety.outputs.safe_to_review == 'true'
+        run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_NPM_VERSION"
+      - name: Install Codex CLI
+        if: steps.fork-safety.outputs.safe_to_review == 'true'
+        run: npm install -g "@openai/codex@$CODEX_CLI_NPM_VERSION"
+{{CODEX_AUTH_STEPS}}
+      - name: Install Codex for Claude plugin
+        if: steps.fork-safety.outputs.safe_to_review == 'true'
+        run: |
+          marketplace_dir="$RUNNER_TEMP/external-models-for-claude"
+          git init "$marketplace_dir"
+          git -C "$marketplace_dir" remote add origin https://github.com/yilibinbin/external-models-for-claude
+          git -C "$marketplace_dir" fetch --depth 1 origin "refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF"
+          git -C "$marketplace_dir" checkout FETCH_HEAD
+          claude plugin marketplace add "$marketplace_dir" --scope user
+          claude plugin install codex@external-models-for-claude --scope user
+      - name: Resolve installed plugin root
+        if: steps.fork-safety.outputs.safe_to_review == 'true'
+        run: |
+          CLAUDE_PLUGIN_ROOT="$(claude plugin list --json | node -e '
+          // codex-plugin-root-resolver-begin
+          const fs = require("fs");
+          const data = JSON.parse(fs.readFileSync(0, "utf8"));
+          const plugins = Array.isArray(data) ? data : data.plugins || [];
+          const plugin = plugins.find((item) => item.name === "codex" || item.id === "codex@external-models-for-claude");
+          const root = plugin && (plugin.installPath || plugin.path || plugin.root);
+          if (!root) {
+            console.error("Could not resolve codex@external-models-for-claude install root from claude plugin list --json.");
+            process.exit(1);
+          }
+          process.stdout.write(root);
+          // codex-plugin-root-resolver-end
+          ')"
+          echo "CLAUDE_PLUGIN_ROOT=$CLAUDE_PLUGIN_ROOT" >> "$GITHUB_ENV"
+{{CODEX_REVIEW_STEP}}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: codex-for-claude-review
+          path: codex-for-claude-review.*
+          retention-days: 5

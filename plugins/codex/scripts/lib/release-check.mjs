@@ -1,6 +1,13 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import {
+  CLAUDE_CODE_NPM_VERSION,
+  CODEX_CLI_NPM_VERSION,
+  renderWorkflow,
+  validateWorkflow
+} from "./github-actions.mjs";
 import { hasMachinePath, MACHINE_PATH_PATTERN_SOURCE } from "./path-hygiene.mjs";
 
 export const MARKETPLACE_VERSION = "0.2.0";
@@ -14,13 +21,14 @@ export const EXPECTED_COMMANDS = [
   "adversarial-review.md",
   "cancel.md",
   "doctor.md",
+  "github-actions.md",
   "rescue.md",
   "result.md",
   "review.md",
   "setup.md",
   "status.md"
 ];
-export const PREVIEW_COMMANDS = new Set([]);
+export const PREVIEW_COMMANDS = new Set(["github-actions.md"]);
 export const READY_COMMANDS = EXPECTED_COMMANDS.filter((name) => !PREVIEW_COMMANDS.has(name));
 export const DEFAULT_EXPECT_MARKETPLACE_ENTRY_VERSION = false;
 
@@ -359,8 +367,8 @@ function validateHookShape(hooks) {
   };
 }
 
-export function runReleaseCheck(start = process.cwd(), options = {}) {
-  void options;
+export function runReleaseCheck(start = null, options = {}) {
+  start = start ?? process.cwd();
   const root = findRepoRoot(start);
   const marketplace = readJson(path.join(root, ".claude-plugin", "marketplace.json"));
   const manifest = readJson(path.join(root, CODEX_PLUGIN_DIR, ".claude-plugin", "plugin.json"));
@@ -437,6 +445,93 @@ export function runReleaseCheck(start = process.cwd(), options = {}) {
     check("docs-install", docs.every((doc) => doc.ok), docs),
     check("no-machine-paths", machinePathFindings.length === 0, machinePathFindings)
   ];
+
+  if (options.ciSimulate) {
+    const workflow = renderWorkflow({ ref: "v0.2.0" });
+    const workflowChecks = validateWorkflow(workflow).checks;
+    const requireCodexCli = Boolean(options.requireCodexCli);
+    let claudeVersionOk = false;
+    let codexVersionOk = false;
+    let codexAuthHelpOk = false;
+    let claudeVersionDetail = "not verified; rerun with --require-codex-cli on the release host";
+    let codexVersionDetail = "not verified; rerun with --require-codex-cli on the release host";
+    let codexAuthDetail = "not verified; rerun with --require-codex-cli on the release host";
+
+    if (requireCodexCli) {
+      const claudeSentinel = CLAUDE_CODE_NPM_VERSION === "REPLACE_WITH_RELEASE_HOST_CLAUDE_CODE_VERSION";
+      const codexSentinel = CODEX_CLI_NPM_VERSION === "REPLACE_WITH_RELEASE_HOST_CODEX_CLI_VERSION";
+      if (claudeSentinel) {
+        claudeVersionDetail = "sentinel not replaced: CLAUDE_CODE_NPM_VERSION";
+      } else {
+        const claudeVersionProbe = spawnSync(
+          "npm",
+          ["view", `@anthropic-ai/claude-code@${CLAUDE_CODE_NPM_VERSION}`, "version"],
+          { encoding: "utf8", timeout: 5000 }
+        );
+        claudeVersionOk =
+          claudeVersionProbe.status === 0 &&
+          String(claudeVersionProbe.stdout || "").trim() === CLAUDE_CODE_NPM_VERSION;
+        claudeVersionDetail = claudeVersionOk
+          ? `verified npm @anthropic-ai/claude-code@${CLAUDE_CODE_NPM_VERSION}`
+          : "required Claude Code npm version contract missing";
+      }
+      if (codexSentinel) {
+        codexVersionDetail = "sentinel not replaced: CODEX_CLI_NPM_VERSION";
+        codexAuthDetail = "skipped because CODEX_CLI_NPM_VERSION sentinel was not replaced";
+      } else {
+        const codexVersionProbe = spawnSync(
+          "npm",
+          ["view", `@openai/codex@${CODEX_CLI_NPM_VERSION}`, "version"],
+          { encoding: "utf8", timeout: 5000 }
+        );
+        codexVersionOk =
+          codexVersionProbe.status === 0 &&
+          String(codexVersionProbe.stdout || "").trim() === CODEX_CLI_NPM_VERSION;
+        const codexLoginHelp = spawnSync("codex", ["login", "--help"], {
+          encoding: "utf8",
+          timeout: 5000
+        });
+        const codexAvailable = !codexLoginHelp.error || codexLoginHelp.error.code !== "ENOENT";
+        codexAuthHelpOk =
+          codexAvailable &&
+          codexLoginHelp.status === 0 &&
+          `${codexLoginHelp.stdout}\n${codexLoginHelp.stderr}`.includes("--with-api-key");
+        codexVersionDetail = codexVersionOk
+          ? `verified npm @openai/codex@${CODEX_CLI_NPM_VERSION}`
+          : "required Codex CLI npm version contract missing";
+        codexAuthDetail = codexAuthHelpOk
+          ? "verified local codex login --with-api-key"
+          : "required Codex CLI auth contract missing";
+      }
+    }
+
+    const workflowCheckOk = (name) => workflowChecks.some((item) => item.name === name && item.ok);
+    const workflowReadyContract =
+      CODEX_CLI_NPM_VERSION !== "REPLACE_WITH_RELEASE_HOST_CODEX_CLI_VERSION" &&
+      CLAUDE_CODE_NPM_VERSION !== "REPLACE_WITH_RELEASE_HOST_CLAUDE_CODE_VERSION";
+    checks.push(
+      check("ci-workflow-fork-safe", workflowCheckOk("fork-safe-step-gates")),
+      check(
+        "ci-workflow-codex-auth-login",
+        !workflowReadyContract || workflowCheckOk("codex-auth-login"),
+        workflowReadyContract ? "" : "preview: auth step omitted until release-host verification"
+      ),
+      check(
+        "ci-workflow-codex-cli-version-pinned",
+        !workflowReadyContract || workflowCheckOk("codex-cli-version-pinned"),
+        workflowReadyContract ? "" : "preview: Codex CLI version sentinel not replaced"
+      ),
+      check(
+        "ci-workflow-claude-code-version-pinned",
+        !workflowReadyContract || workflowCheckOk("claude-code-version-pinned"),
+        workflowReadyContract ? "" : "preview: Claude Code version sentinel not replaced"
+      ),
+      check("ci-workflow-plugin-root-resolved", workflowCheckOk("plugin-root-resolved")),
+      check("ci-claude-code-version-contract", !requireCodexCli || claudeVersionOk, claudeVersionDetail),
+      check("ci-codex-cli-version-contract", !requireCodexCli || codexVersionOk, codexVersionDetail),
+      check("ci-codex-cli-auth-contract", !requireCodexCli || codexAuthHelpOk, codexAuthDetail)
+    );
+  }
 
   return {
     ok: checks.every((item) => item.ok),
