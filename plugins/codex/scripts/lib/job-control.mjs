@@ -8,6 +8,7 @@ import {
   listJobs,
   loadState,
   readJobFile,
+  removeJobSidecar,
   resolveJobFile,
   stateHasEndedSession
 } from "./state.mjs";
@@ -318,6 +319,7 @@ function listStatusJobs(workspaceRoot) {
       continue;
     }
     if (stateHasEndedSession(state, job.sessionId) || hasEndedSessionFresh(workspaceRoot, job.sessionId)) {
+      byId.delete(job.id);
       continue;
     }
     const existing = byId.get(job.id);
@@ -326,7 +328,7 @@ function listStatusJobs(workspaceRoot) {
     }
     byId.set(job.id, mergeStatusJobWithSidecar(existing, job));
   }
-  return [...byId.values()];
+  return [...byId.values()].filter((job) => !hasEndedSessionFresh(workspaceRoot, job.sessionId));
 }
 
 export function buildStatusSnapshot(workspaceRoot, options = {}) {
@@ -399,7 +401,13 @@ export function resolveResultJob(cwd, reference) {
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const state = loadState(workspaceRoot);
-  const jobs = sortJobsNewestFirst(listJobsWithSidecars(workspaceRoot).filter((job) => !stateHasEndedSession(state, job.sessionId)));
+  const jobs = sortJobsNewestFirst(listJobsWithSidecars(workspaceRoot).filter((job) => {
+    if (stateHasEndedSession(state, job.sessionId) || hasEndedSessionFresh(workspaceRoot, job.sessionId)) {
+      removeJobSidecar(workspaceRoot, job);
+      return false;
+    }
+    return true;
+  }));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {

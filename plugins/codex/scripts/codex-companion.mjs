@@ -1246,6 +1246,10 @@ async function handleCancel(argv) {
   }
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  if (hasEndedSession(workspaceRoot, job.sessionId)) {
+    removeJobSidecar(workspaceRoot, job);
+    throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
+  }
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,

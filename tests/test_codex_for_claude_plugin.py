@@ -2140,9 +2140,34 @@ def test_codex_cancel_ignores_tombstoned_sidecar_only_active_job(tmp_path):
         cwd=tmp_path,
         env=env,
     )
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          resolveJobFile,
+          resolveJobLogFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const jobFile = resolveJobFile(cwd, 'cancel-tombstoned-sidecar-only');
+        const logFile = resolveJobLogFile(cwd, 'cancel-tombstoned-sidecar-only');
+        console.log(JSON.stringify({
+          jobFileExists: fs.existsSync(jobFile),
+          jobFileText: fs.existsSync(jobFile) ? fs.readFileSync(jobFile, 'utf8') : '',
+          logFileExists: fs.existsSync(logFile),
+          logFileText: fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+        }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
 
     assert result.returncode != 0
     assert 'No job found for "cancel-tombstoned-sidecar-only"' in result.stderr
+    assert payload["jobFileExists"] is False
+    assert "cancel tombstoned secret" not in payload["jobFileText"]
+    assert payload["logFileExists"] is False
+    assert "cancel tombstoned log" not in payload["logFileText"]
 
 
 def test_codex_cancel_rejects_when_session_ends_before_cancel_sidecar_write(tmp_path):
@@ -5384,6 +5409,15 @@ def test_codex_companion_publishes_background_and_cancel_state_before_job_file_w
     assert cancel.index("upsertJob(workspaceRoot") < cancel.index("writeJobFile(workspaceRoot, job.id")
     assert "if (!upsertJob(workspaceRoot" in cancel
     assert "sessionId: job.sessionId" in cancel
+    assert cancel.count("hasEndedSession(workspaceRoot, job.sessionId)") >= 2
+    assert cancel.index("const interrupt = await interruptAppServerTurn") < cancel.index(
+        "hasEndedSession(workspaceRoot, job.sessionId)",
+        cancel.index("const interrupt = await interruptAppServerTurn"),
+    )
+    assert cancel.index(
+        "hasEndedSession(workspaceRoot, job.sessionId)",
+        cancel.index("const interrupt = await interruptAppServerTurn"),
+    ) < cancel.index("terminateProcessTree(job.pid")
     assert "const cancelledJobFile = writeJobFile(workspaceRoot, job.id" in cancel
     assert "if (!cancelledJobFile)" in cancel
     assert "const runningJobFile = writeJobFile(job.workspaceRoot, job.id, runningRecord)" in run_tracked
@@ -5643,6 +5677,68 @@ def test_codex_status_rechecks_tombstone_while_merging_sidecars(tmp_path):
     assert all(job["id"] != "status-sidecar-merge-race" for job in payload["snapshot"]["running"])
     assert "PRIVATE_MERGE_RACE_REQUEST" not in text
     assert "PRIVATE_MERGE_RACE_LOG" not in text
+
+
+def test_codex_status_removes_stale_shared_row_when_sidecar_is_freshly_tombstoned(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobLogFile,
+          resolveJobsDir,
+          updateState,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'status-stale-shared-sidecar-race',
+          status: 'running',
+          phase: 'running',
+          kind: 'task',
+          title: 'PRIVATE_STALE_SHARED_TITLE',
+          summary: 'PRIVATE_STALE_SHARED_SUMMARY',
+          workspaceRoot: cwd,
+          sessionId: 'session-status-stale-shared-race',
+          request: { secret: 'PRIVATE_STALE_SHARED_REQUEST' },
+          logFile: resolveJobLogFile(cwd, 'status-stale-shared-sidecar-race'),
+          updatedAt: new Date().toISOString()
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, '[2000-01-01T00:00:00.000Z] PRIVATE_STALE_SHARED_LOG\\n', 'utf8');
+
+        const jobsDir = resolveJobsDir(cwd);
+        const originalReaddirSync = fs.readdirSync;
+        let injected = false;
+        fs.readdirSync = function patchedReaddirSync(dirPath, ...args) {
+          if (!injected && String(dirPath) === jobsDir) {
+            injected = true;
+            updateState(cwd, (state) => {
+              markSessionEnded(state, 'session-status-stale-shared-race');
+              state.jobs = state.jobs.filter((item) => item.id !== job.id);
+            });
+          }
+          return originalReaddirSync.call(this, dirPath, ...args);
+        };
+
+        const { buildStatusSnapshot } = await import('./plugins/codex/scripts/lib/job-control.mjs');
+        const snapshot = buildStatusSnapshot(cwd, { all: true });
+        fs.readdirSync = originalReaddirSync;
+        console.log(JSON.stringify({ injected, snapshot }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    text = json.dumps(payload["snapshot"])
+    assert payload["injected"] is True
+    assert all(job["id"] != "status-stale-shared-sidecar-race" for job in payload["snapshot"]["running"])
+    assert "PRIVATE_STALE_SHARED_TITLE" not in text
+    assert "PRIVATE_STALE_SHARED_SUMMARY" not in text
+    assert "PRIVATE_STALE_SHARED_REQUEST" not in text
+    assert "PRIVATE_STALE_SHARED_LOG" not in text
 
 
 def test_codex_single_status_filters_current_session_unless_all(tmp_path):
