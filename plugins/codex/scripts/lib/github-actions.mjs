@@ -50,6 +50,9 @@ function hasPullRequestOnlyTrigger(text) {
 function normalizedCommandText(text) {
   return text
     .replace(/\\\r?\n/g, "")
+    .replace(/\$'((?:\\.|[^'])*)'/g, "$1")
+    .replace(/\$"((?:\\.|[^"])*)"/g, "$1")
+    .replace(/\\([^\r\n])/g, "$1")
     .replace(/["'`]/g, "")
     .replace(/\s+/g, " ");
 }

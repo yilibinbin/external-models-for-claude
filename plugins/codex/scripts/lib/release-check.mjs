@@ -447,7 +447,7 @@ export function runReleaseCheck(start = null, options = {}) {
     check("no-machine-paths", machinePathFindings.length === 0, machinePathFindings)
   ];
 
-  if (options.ciSimulate) {
+  if (options.ciSimulate || options.requireCodexCli) {
     const workflow = renderWorkflow({ ref: "v0.2.0" });
     const workflowValidation = validateWorkflow(workflow);
     const workflowChecks = workflowValidation.checks;
