@@ -6713,6 +6713,42 @@ def test_codex_github_actions_validate_command_allows_preview_structural_workflo
         assert payload["ok"] is False
 
 
+def test_codex_github_actions_init_writes_and_respects_force(tmp_path):
+    result = run_node(
+        PLUGIN / "scripts" / "codex-companion.mjs",
+        ["github-actions", "init", "--ref", "v0.2.0"],
+        cwd=tmp_path,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    workflow = tmp_path / ".github" / "workflows" / "codex-for-claude-review.yml"
+    assert workflow.exists()
+    text = read_text(workflow)
+    assert "name: Codex for Claude Review" in text
+    assert 'CODEX_FOR_CLAUDE_RELEASE_REF: "v0.2.0"' in text
+    assert str(workflow) in result.stdout
+
+    workflow.write_text("custom workflow\n", encoding="utf8")
+    rejected = run_node(
+        PLUGIN / "scripts" / "codex-companion.mjs",
+        ["github-actions", "init", "--ref", "v0.2.0"],
+        cwd=tmp_path,
+        timeout=10,
+    )
+    assert rejected.returncode == 1
+    assert "already exists" in rejected.stderr
+    assert read_text(workflow) == "custom workflow\n"
+
+    forced = run_node(
+        PLUGIN / "scripts" / "codex-companion.mjs",
+        ["github-actions", "init", "--ref", "v0.2.0", "--force"],
+        cwd=tmp_path,
+        timeout=10,
+    )
+    assert forced.returncode == 0, forced.stderr
+    assert "name: Codex for Claude Review" in read_text(workflow)
+
+
 def test_codex_release_check_import_is_side_effect_free_after_github_actions_import():
     script = "await import('./plugins/codex/scripts/lib/release-check.mjs');"
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
