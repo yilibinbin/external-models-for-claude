@@ -41,13 +41,13 @@ function hasMinimalContentsReadPermission(text) {
 
 function normalizedCommandText(text) {
   return text
-    .replace(/\\\r?\n/g, " ")
+    .replace(/\\\r?\n/g, "")
     .replace(/["'`]/g, "")
     .replace(/\s+/g, " ");
 }
 
 function hasRunnableCodexAuthCommand(text) {
-  return /(?:^|[\s;&|])codex\s+login\b[^;&|]*--with-api-key\b/.test(normalizedCommandText(text));
+  return /(?:^|[\s;&|])(?:\S*\/)?codex\s+login\b[^;&|]*--with-api-key\b/.test(normalizedCommandText(text));
 }
 
 function hasRunnableCodexReviewCommand(text) {
