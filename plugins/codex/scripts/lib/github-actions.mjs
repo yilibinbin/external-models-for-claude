@@ -16,6 +16,29 @@ function result(ok, name, detail = "") {
   return { ok: Boolean(ok), name, detail };
 }
 
+function topLevelBlockLines(text, header) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((line) => line === header);
+  if (start < 0) {
+    return [];
+  }
+  const block = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() && !line.startsWith(" ")) {
+      break;
+    }
+    block.push(line);
+  }
+  return block;
+}
+
+function hasMinimalContentsReadPermission(text) {
+  const entries = topLevelBlockLines(text, "permissions:")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  return entries.length === 1 && entries[0] === "contents: read";
+}
+
 export function validateReleaseRef(value) {
   const ref = String(value ?? "v0.2.0").trim();
   const lower = ref.toLowerCase();
@@ -94,7 +117,7 @@ export function renderCodexReviewStep() {
     "        shell: bash",
     "        run: |",
     "          set +e",
-    "          node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs\" review --json > codex-for-claude-review.json 2> codex-for-claude-review.stderr",
+    "          node \"$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs\" review --base \"$BASE_SHA\" --json > codex-for-claude-review.json 2> codex-for-claude-review.stderr",
     "          status=$?",
     "          if [ \"$status\" -ne 0 ]; then",
     "            node -e '",
@@ -112,7 +135,7 @@ export function validateWorkflow(text) {
   const checks = [
     result(text.includes("pull_request:"), "has-pull-request-trigger"),
     result(!text.includes("pull_request_target"), "no-pull-request-target"),
-    result(text.includes("contents: read"), "minimal-contents-permission"),
+    result(hasMinimalContentsReadPermission(text), "minimal-contents-permission"),
     result(text.includes("claude plugin marketplace add \"$marketplace_dir\" --scope user"), "marketplace-install"),
     result(text.includes("claude plugin install codex@external-models-for-claude --scope user"), "plugin-install"),
     result(
@@ -156,7 +179,8 @@ export function validateWorkflow(text) {
     ),
     result(
       releaseHostContractsVerified()
-        ? text.includes("$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs")
+        ? text.includes("$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs") &&
+            text.includes('review --base "$BASE_SHA" --json')
         : text.includes("Codex review execution omitted until release-host CLI/auth contract is verified."),
       "codex-review-step"
     ),

@@ -6456,6 +6456,26 @@ def test_codex_github_actions_rejects_unresolved_cli_version_sentinel():
         assert any(check["name"] == "codex-cli-version-pinned" and check["ok"] is False for check in payload["validation"]["checks"])
 
 
+def test_codex_github_actions_ready_review_uses_pr_base_sha():
+    source = read_text(PLUGIN / "scripts" / "lib" / "github-actions.mjs")
+    assert 'review --base "$BASE_SHA" --json' in source
+    assert 'review --json > codex-for-claude-review.json' not in source
+
+
+def test_codex_github_actions_validator_rejects_extra_workflow_permissions():
+    script = (
+        "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
+        "const text = g.renderWorkflow({ref:'v0.2.0'}).replace('permissions:\\n  contents: read', 'permissions:\\n  contents: read\\n  pull-requests: write');"
+        "process.stdout.write(JSON.stringify(g.validateWorkflow(text)));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    permission_check = next(check for check in payload["checks"] if check["name"] == "minimal-contents-permission")
+    assert permission_check["ok"] is False
+    assert payload["structuralOk"] is False
+
+
 def test_codex_github_actions_validate_command_allows_preview_structural_workflow():
     result = run_node(
         PLUGIN / "scripts" / "codex-companion.mjs",
@@ -6561,6 +6581,7 @@ def test_codex_release_check_ci_simulate_validates_workflow():
     payload = json.loads(result.stdout)
     names = {check["name"] for check in payload["checks"]}
     assert {
+        "ci-workflow-validation",
         "ci-workflow-fork-safe",
         "ci-workflow-codex-auth-login",
         "ci-workflow-codex-cli-version-pinned",
@@ -6572,6 +6593,27 @@ def test_codex_release_check_ci_simulate_validates_workflow():
     } <= names
     version_contract = next(check for check in payload["checks"] if check["name"] == "ci-codex-cli-version-contract")
     assert "verified" in version_contract["detail"] or "not verified" in version_contract["detail"]
+
+
+def test_codex_release_check_ci_simulate_fails_invalid_workflow_validator_checks(tmp_path):
+    repo = copy_repo(tmp_path)
+    template = repo / "plugins" / "codex" / "templates" / "github-actions" / "codex-review.yml"
+    template.write_text(
+        read_text(template).replace("permissions:\n  contents: read", "permissions:\n  contents: read\n  pull-requests: write"),
+        encoding="utf8",
+    )
+    result = run_node(
+        repo / "plugins" / "codex" / "scripts" / "codex-companion.mjs",
+        ["release-check", "--ci-simulate", "--json"],
+        cwd=repo,
+        timeout=20,
+    )
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    checks = checks_by_name(payload)
+    assert payload["ok"] is False
+    assert checks["ci-workflow-validation"]["ok"] is False
+    assert "minimal-contents-permission" in json.dumps(checks["ci-workflow-validation"]["detail"])
 
 
 def test_codex_release_check_ci_simulate_auth_contract_is_advisory_without_require_flag():

@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   CLAUDE_CODE_NPM_VERSION,
   CODEX_CLI_NPM_VERSION,
+  releaseHostContractsVerified,
   renderWorkflow,
   validateWorkflow
 } from "./github-actions.mjs";
@@ -448,7 +449,8 @@ export function runReleaseCheck(start = null, options = {}) {
 
   if (options.ciSimulate) {
     const workflow = renderWorkflow({ ref: "v0.2.0" });
-    const workflowChecks = validateWorkflow(workflow).checks;
+    const workflowValidation = validateWorkflow(workflow);
+    const workflowChecks = workflowValidation.checks;
     const requireCodexCli = Boolean(options.requireCodexCli);
     let claudeVersionOk = false;
     let codexVersionOk = false;
@@ -506,10 +508,14 @@ export function runReleaseCheck(start = null, options = {}) {
     }
 
     const workflowCheckOk = (name) => workflowChecks.some((item) => item.name === name && item.ok);
-    const workflowReadyContract =
-      CODEX_CLI_NPM_VERSION !== "REPLACE_WITH_RELEASE_HOST_CODEX_CLI_VERSION" &&
-      CLAUDE_CODE_NPM_VERSION !== "REPLACE_WITH_RELEASE_HOST_CLAUDE_CODE_VERSION";
+    const workflowReadyContract = releaseHostContractsVerified();
+    const failedWorkflowChecks = workflowChecks.filter((item) => !item.ok);
     checks.push(
+      check(
+        "ci-workflow-validation",
+        requireCodexCli ? workflowValidation.ready : workflowValidation.structuralOk,
+        failedWorkflowChecks
+      ),
       check("ci-workflow-fork-safe", workflowCheckOk("fork-safe-step-gates")),
       check(
         "ci-workflow-codex-auth-login",
