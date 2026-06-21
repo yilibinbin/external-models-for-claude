@@ -623,6 +623,7 @@ function createTrackedProgress(job, options = {}) {
     progress: createProgressReporter({
       stderr: Boolean(options.stderr),
       logFile,
+      job,
       onEvent: createJobProgressUpdater(job.workspaceRoot, job.id)
     })
   };

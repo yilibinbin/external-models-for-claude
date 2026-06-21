@@ -3669,6 +3669,82 @@ def test_codex_progress_log_only_after_session_end_does_not_recreate_log(tmp_pat
     assert "SECRET_AFTER_SESSION_END" not in payload["logFileText"]
 
 
+def test_codex_progress_reporter_does_not_log_after_session_end_between_gate_and_append(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          createJobProgressUpdater,
+          createProgressReporter
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          removeJobSidecar,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'progress-gate-append-race',
+          status: 'running',
+          kind: 'task',
+          title: 'Progress gate append race',
+          workspaceRoot: cwd,
+          sessionId: 'session-progress-gate-append',
+          phase: 'starting',
+          pid: process.pid,
+          logFile: resolveJobLogFile(cwd, 'progress-gate-append-race'),
+          updatedAt: new Date().toISOString()
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'progress log\\n', 'utf8');
+        const update = createJobProgressUpdater(cwd, job.id);
+        update({ phase: 'investigating' });
+        const reporter = createProgressReporter({
+          logFile: job.logFile,
+          job,
+          onEvent: (event) => {
+            const accepted = update(event);
+            if (accepted !== false) {
+              updateState(cwd, (state) => {
+                markSessionEnded(state, 'session-progress-gate-append');
+                state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-progress-gate-append');
+              });
+              removeJobSidecar(cwd, job);
+            }
+            return accepted;
+          }
+        });
+        reporter({
+          phase: 'investigating',
+          message: 'late same phase',
+          logTitle: 'Late progress',
+          logBody: 'SECRET_AFTER_SESSION_END'
+        });
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile),
+          logFileText: fs.existsSync(job.logFile) ? fs.readFileSync(job.logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+    assert "SECRET_AFTER_SESSION_END" not in payload["logFileText"]
+
+
 def test_codex_run_tracked_job_completion_after_session_end_does_not_republish_result(tmp_path):
     payload = run_node_script(
         """
@@ -4182,6 +4258,44 @@ def test_codex_status_liveness_reads_per_job_heartbeat(tmp_path):
     job = next(item for item in payload["running"] if item["id"] == "per-job-liveness")
     assert job["liveness"]["state"] == "healthy"
     assert job["liveness"]["reason"] == "heartbeat-current"
+
+
+def test_codex_status_text_includes_liveness_for_list_and_single_job(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    run_node_script(
+        """
+        import { JOB_LOST_AFTER_MS } from './plugins/codex/scripts/lib/job-lifecycle.mjs';
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const oldMs = Date.now() - JOB_LOST_AFTER_MS - 1000;
+        const old = new Date(oldMs).toISOString();
+        const job = {
+          id: 'text-live-state',
+          status: 'running',
+          phase: 'running',
+          kind: 'task',
+          title: 'Text live state',
+          workspaceRoot: cwd,
+          updatedAt: old,
+          heartbeatAtMs: oldMs,
+          heartbeat: old,
+          pid: null
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    list_result = run_companion(["status", "--cwd", str(tmp_path), "--all"], cwd=tmp_path, env=env)
+    assert list_result.returncode == 0, list_result.stderr
+    assert "| Job | Kind | Status | Phase | Liveness |" in list_result.stdout
+    assert "lost (heartbeat-lost)" in list_result.stdout
+
+    single_result = run_companion(["status", "text-live-state", "--cwd", str(tmp_path)], cwd=tmp_path, env=env)
+    assert single_result.returncode == 0, single_result.stderr
+    assert "Liveness: lost (heartbeat-lost)" in single_result.stdout
 
 
 def test_codex_status_liveness_ignores_mismatched_or_malformed_job_files(tmp_path):

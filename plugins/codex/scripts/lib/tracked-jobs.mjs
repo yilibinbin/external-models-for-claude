@@ -69,8 +69,8 @@ function removeFileIfExists(filePath) {
   }
 }
 
-function appendLogBlockIfJobCurrent(job, logFile, title, body) {
-  if (!logFile || !body || !job?.workspaceRoot || !job?.id) {
+function withCurrentJobLog(job, logFile, callback, options = {}) {
+  if (!logFile || !job?.workspaceRoot || !job?.id) {
     return false;
   }
 
@@ -89,6 +89,9 @@ function appendLogBlockIfJobCurrent(job, logFile, title, body) {
     if (storedJob?.id !== job.id) {
       return false;
     }
+    if (!options.allowTerminal && isTerminalJob(storedJob)) {
+      return false;
+    }
     if (hasEndedSession(job.workspaceRoot, storedJob.sessionId ?? job.sessionId)) {
       removeFileIfExists(jobFile);
       removeFileIfExists(logFile);
@@ -97,9 +100,23 @@ function appendLogBlockIfJobCurrent(job, logFile, title, body) {
     if (!fs.existsSync(logFile)) {
       return false;
     }
-    appendLogBlock(logFile, title, body);
+    callback();
     return true;
   });
+}
+
+function appendProgressLogIfJobCurrent(job, logFile, event) {
+  return withCurrentJobLog(job, logFile, () => {
+    appendLogLine(logFile, event.message);
+    appendLogBlock(logFile, event.logTitle, event.logBody);
+  });
+}
+
+function appendLogBlockIfJobCurrent(job, logFile, title, body) {
+  if (!body) {
+    return false;
+  }
+  return withCurrentJobLog(job, logFile, () => appendLogBlock(logFile, title, body), { allowTerminal: true });
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
@@ -287,7 +304,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   };
 }
 
-export function createProgressReporter({ stderr = false, logFile = null, onEvent = null } = {}) {
+export function createProgressReporter({ stderr = false, logFile = null, onEvent = null, job = null } = {}) {
   if (!stderr && !logFile && !onEvent) {
     return null;
   }
@@ -298,12 +315,19 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     if (shouldLog === false) {
       return;
     }
+    if (job?.workspaceRoot && job?.id && logFile) {
+      if (!appendProgressLogIfJobCurrent(job, logFile, event)) {
+        return;
+      }
+    }
     const stderrMessage = event.stderrMessage ?? event.message;
     if (stderr && stderrMessage) {
       process.stderr.write(`[codex] ${stderrMessage}\n`);
     }
-    appendLogLine(logFile, event.message);
-    appendLogBlock(logFile, event.logTitle, event.logBody);
+    if (!job?.workspaceRoot || !job?.id) {
+      appendLogLine(logFile, event.message);
+      appendLogBlock(logFile, event.logTitle, event.logBody);
+    }
   };
 }
 
