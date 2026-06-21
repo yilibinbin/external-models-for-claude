@@ -3314,12 +3314,13 @@ def test_codex_progress_upsert_prune_completes_before_job_file_mutation():
     body = js_function_body(source, "createJobProgressUpdater")
     assert "function sharedProgressJobPatch(job)" in source
     assert "pruneJobFiles: false" in js_function_body(source, "removeOrphanProgressPatch")
-    assert "sharedProgressJobPatch(terminalJob)" in js_function_body(source, "removeOrphanProgressPatch")
+    assert "sharedProgressJobPatch(restoreJob)" in js_function_body(source, "removeOrphanProgressPatch")
+    assert "fallbackTerminalJob" in js_function_body(source, "removeOrphanProgressPatch")
     assert "request," in js_function_body(source, "sharedProgressJobPatch")
     assert "result," in js_function_body(source, "sharedProgressJobPatch")
     assert body.index("upsertJob(workspaceRoot, patch)") < body.index("mutateJobFile(workspaceRoot, jobId")
     assert body.index("mutateJobFile(workspaceRoot, jobId") < body.index("upsertJob(workspaceRoot, sharedProgressJobPatch(updated))")
-    assert "removeOrphanProgressPatch(workspaceRoot, jobId, terminalJob)" in body
+    assert "removeOrphanProgressPatch(workspaceRoot, jobId, terminalJob, originalSharedJob)" in body
     assert "if (!updated)" in body
 
 
@@ -3555,6 +3556,119 @@ def test_codex_progress_update_preserves_shared_terminal_job(tmp_path):
     assert job["turnId"] == "turn-final"
 
 
+def test_codex_progress_update_preserves_shared_terminal_job_without_sidecar(tmp_path):
+    payload = run_node_script(
+        """
+        import {
+          createJobProgressUpdater
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          upsertJob
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'progress-shared-terminal-no-sidecar',
+          status: 'completed',
+          phase: 'done',
+          workspaceRoot: cwd,
+          threadId: 'thread-final',
+          turnId: 'turn-final',
+          completedAt: new Date().toISOString(),
+          updatedAt: '2026-01-01T00:00:00.000Z'
+        };
+        upsertJob(cwd, job);
+        const update = createJobProgressUpdater(cwd, job.id);
+        update({ phase: 'running', threadId: 'thread-late-progress' });
+
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert len(payload["jobs"]) == 1
+    job = payload["jobs"][0]
+    assert job["status"] == "completed"
+    assert job["phase"] == "done"
+    assert job["threadId"] == "thread-final"
+    assert job["turnId"] == "turn-final"
+
+
+def test_codex_progress_log_only_after_session_end_does_not_recreate_log(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          createJobProgressUpdater,
+          createProgressReporter
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          removeJobSidecar,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState,
+          upsertJob,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'progress-log-ended-session',
+          status: 'running',
+          kind: 'task',
+          title: 'Progress log ended session',
+          workspaceRoot: cwd,
+          sessionId: 'session-progress-log-ended',
+          phase: 'starting',
+          pid: process.pid,
+          request: { secret: 'progress log secret' },
+          logFile: resolveJobLogFile(cwd, 'progress-log-ended-session'),
+          updatedAt: new Date().toISOString()
+        };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, 'progress log\\n', 'utf8');
+        const update = createJobProgressUpdater(cwd, job.id);
+        update({ phase: 'investigating' });
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-progress-log-ended');
+          state.jobs = state.jobs.filter((item) => item.sessionId !== 'session-progress-log-ended');
+        });
+        removeJobSidecar(cwd, job);
+
+        const reporter = createProgressReporter({
+          logFile: job.logFile,
+          onEvent: update
+        });
+        reporter({
+          phase: 'investigating',
+          message: 'late same phase',
+          logTitle: 'Late progress',
+          logBody: 'SECRET_AFTER_SESSION_END'
+        });
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile),
+          logFileText: fs.existsSync(job.logFile) ? fs.readFileSync(job.logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+    assert "SECRET_AFTER_SESSION_END" not in payload["logFileText"]
+
+
 def test_codex_run_tracked_job_completion_after_session_end_does_not_republish_result(tmp_path):
     payload = run_node_script(
         """
@@ -3693,11 +3807,94 @@ def test_codex_run_tracked_job_does_not_recreate_log_when_terminal_write_rejecte
     assert "terminal log rendered secret" not in payload["logFileText"]
 
 
+def test_codex_run_tracked_job_does_not_start_runner_when_running_write_rejected(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+
+        const cwd = process.argv[1];
+        const originalRenameSync = fs.renameSync;
+        let injected = false;
+        fs.renameSync = function patchedRenameSync(from, to) {
+          originalRenameSync.call(this, from, to);
+          if (injected || !String(to).endsWith('/state.json')) {
+            return;
+          }
+          try {
+            const state = JSON.parse(fs.readFileSync(to, 'utf8'));
+            const hasRunning = state.jobs?.some((job) => job.id === 'running-write-race' && job.status === 'running');
+            if (!hasRunning) {
+              return;
+            }
+            injected = true;
+            state.endedSessions = [...(state.endedSessions || []), 'session-running-write-race'];
+            state.jobs = state.jobs.filter((job) => job.id !== 'running-write-race');
+            fs.writeFileSync(to, `${JSON.stringify(state, null, 2)}\\n`, 'utf8');
+          } catch {
+            // Non-state files or transient partial reads are irrelevant for this test.
+          }
+        };
+
+        const tracked = await import('./plugins/codex/scripts/lib/tracked-jobs.mjs');
+        const state = await import('./plugins/codex/scripts/lib/state.mjs');
+        let runnerStarted = false;
+        let errorMessage = '';
+        const job = {
+          id: 'running-write-race',
+          status: 'queued',
+          kind: 'task',
+          title: 'Running write race',
+          workspaceRoot: cwd,
+          sessionId: 'session-running-write-race',
+          phase: 'queued',
+          pid: null,
+          logFile: state.resolveJobLogFile(cwd, 'running-write-race')
+        };
+        try {
+          await tracked.runTrackedJob(
+            job,
+            async () => {
+              runnerStarted = true;
+              return {
+                exitStatus: 0,
+                threadId: 'thread-running-write-race',
+                turnId: 'turn-running-write-race',
+                summary: 'should not run',
+                payload: {},
+                rendered: 'should not render'
+              };
+            },
+            { logFile: job.logFile }
+          );
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
+        const jobFile = state.resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          runnerStarted,
+          errorMessage,
+          jobs: state.listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile)
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["runnerStarted"] is False
+    assert "ended before job running-write-race could run" in payload["errorMessage"]
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+
+
 def test_codex_companion_publishes_background_and_cancel_state_before_job_file_writes():
     source = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
     failure = js_function_body(source, "recordBackgroundLaunchFailure")
     enqueue = js_function_body(source, "enqueueBackgroundTask")
     cancel = js_function_body(source, "handleCancel")
+    run_tracked = js_function_body(read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs"), "runTrackedJob")
 
     assert failure.index("upsertJob(job.workspaceRoot") < failure.index("writeJobFile(job.workspaceRoot, job.id, failedRecord)")
     assert "if (!upsertJob(job.workspaceRoot" in failure
@@ -3707,6 +3904,10 @@ def test_codex_companion_publishes_background_and_cancel_state_before_job_file_w
     assert cancel.index("upsertJob(workspaceRoot") < cancel.index("writeJobFile(workspaceRoot, job.id")
     assert "if (!upsertJob(workspaceRoot" in cancel
     assert "sessionId: job.sessionId" in cancel
+    assert "const runningJobFile = writeJobFile(job.workspaceRoot, job.id, runningRecord)" in run_tracked
+    assert "if (!runningJobFile)" in run_tracked
+    assert "const failedJobFile = writeJobFile(job.workspaceRoot, job.id, failedRecord)" in run_tracked
+    assert "if (!failedJobFile)" in run_tracked
 
 
 def test_codex_status_json_includes_liveness(tmp_path):
@@ -3738,6 +3939,56 @@ def test_codex_status_json_includes_liveness(tmp_path):
     job = next(item for item in payload["running"] if item["id"] == "json-liveness")
     assert job["liveness"]["state"] == "healthy"
     assert job["liveness"]["reason"] == "heartbeat-current"
+
+
+def test_codex_single_status_filters_current_session_unless_all(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    env["CODEX_COMPANION_SESSION_ID"] = "session-a"
+    run_node_script(
+        """
+        import { upsertJob, writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const sameSession = {
+          id: 'same-session-job',
+          status: 'running',
+          phase: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-a',
+          updatedAt: new Date().toISOString(),
+          pid: null
+        };
+        const foreignSession = {
+          id: 'foreign-session-job',
+          status: 'running',
+          phase: 'running',
+          workspaceRoot: cwd,
+          sessionId: 'session-b',
+          updatedAt: new Date().toISOString(),
+          pid: null
+        };
+        upsertJob(cwd, sameSession);
+        writeJobFile(cwd, sameSession.id, sameSession);
+        upsertJob(cwd, foreignSession);
+        writeJobFile(cwd, foreignSession.id, foreignSession);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    scoped = run_companion(["status", "foreign-session-job", "--cwd", str(tmp_path), "--json"], cwd=tmp_path, env=env)
+    assert scoped.returncode == 1
+    assert "No job found" in scoped.stderr
+
+    all_sessions = run_companion(
+        ["status", "foreign-session-job", "--cwd", str(tmp_path), "--json", "--all"],
+        cwd=tmp_path,
+        env=env,
+    )
+    assert all_sessions.returncode == 0, all_sessions.stderr
+    payload = json.loads(all_sessions.stdout)
+    assert payload["job"]["id"] == "foreign-session-job"
+    assert payload["job"]["sessionId"] == "session-b"
 
 
 def test_codex_status_liveness_reads_per_job_heartbeat(tmp_path):

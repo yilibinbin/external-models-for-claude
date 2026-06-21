@@ -358,11 +358,11 @@ async function waitForSingleJobSnapshot(workspaceRoot, reference, options = {}) 
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
-  let snapshot = buildSingleJobSnapshot(workspaceRoot, reference);
+  let snapshot = buildSingleJobSnapshot(workspaceRoot, reference, options);
 
   while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
-    snapshot = buildSingleJobSnapshot(workspaceRoot, reference);
+    snapshot = buildSingleJobSnapshot(workspaceRoot, reference, options);
   }
 
   return {
@@ -1133,9 +1133,10 @@ async function handleStatus(argv) {
     const snapshot = options.wait
       ? await waitForSingleJobSnapshot(workspaceRoot, reference, {
           timeoutMs: options["timeout-ms"],
-          pollIntervalMs: options["poll-interval-ms"]
+          pollIntervalMs: options["poll-interval-ms"],
+          all: options.all
         })
-      : buildSingleJobSnapshot(workspaceRoot, reference);
+      : buildSingleJobSnapshot(workspaceRoot, reference, { all: options.all });
     outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
     return;
   }

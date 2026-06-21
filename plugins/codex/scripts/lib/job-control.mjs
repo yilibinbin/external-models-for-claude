@@ -262,7 +262,8 @@ export function buildStatusSnapshot(workspaceRoot, options = {}) {
 }
 
 export function buildSingleJobSnapshot(workspaceRoot, reference, options = {}) {
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const allJobs = listJobs(workspaceRoot);
+  const jobs = sortJobsNewestFirst(options.all ? allJobs : filterJobsForCurrentSession(allJobs, options));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);

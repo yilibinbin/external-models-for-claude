@@ -4,6 +4,7 @@ import process from "node:process";
 import { JOB_HEARTBEAT_INTERVAL_MS } from "./job-lifecycle.mjs";
 import {
   hasEndedSession,
+  loadState,
   mutateJobFile,
   readJobFile,
   removeJobSidecar,
@@ -16,6 +17,7 @@ import {
 } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 export function nowIso() {
   return new Date().toISOString();
@@ -92,15 +94,44 @@ function sharedProgressJobPatch(job) {
   return shared;
 }
 
-function removeOrphanProgressPatch(workspaceRoot, jobId, terminalJob = null) {
+function isTerminalJob(job) {
+  return TERMINAL_JOB_STATUSES.has(job?.status);
+}
+
+function readSharedJob(workspaceRoot, jobId) {
+  try {
+    return loadState(workspaceRoot).jobs.find((job) => job.id === jobId) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function canAcceptProgressEvent(workspaceRoot, jobId, sharedJob = null) {
+  if (isTerminalJob(sharedJob)) {
+    return false;
+  }
+
+  try {
+    const storedJob = readJobFile(resolveJobFile(workspaceRoot, jobId));
+    if (!storedJob?.id || isTerminalJob(storedJob)) {
+      return false;
+    }
+    return !cleanupTrackedJobIfSessionEnded(storedJob);
+  } catch {
+    return false;
+  }
+}
+
+function removeOrphanProgressPatch(workspaceRoot, jobId, terminalJob = null, fallbackTerminalJob = null) {
   updateState(workspaceRoot, (state) => {
     const existing = state.jobs.find((job) => job.id === jobId);
     if (!existing) {
       return;
     }
-    if (["completed", "failed", "cancelled"].includes(existing.status)) {
-      if (terminalJob?.id === jobId && ["completed", "failed", "cancelled"].includes(terminalJob.status)) {
-        state.jobs = state.jobs.map((job) => (job.id === jobId ? sharedProgressJobPatch(terminalJob) : job));
+    if (isTerminalJob(existing)) {
+      const restoreJob = isTerminalJob(terminalJob) ? terminalJob : fallbackTerminalJob;
+      if (restoreJob?.id === jobId && isTerminalJob(restoreJob)) {
+        state.jobs = state.jobs.map((job) => (job.id === jobId ? sharedProgressJobPatch(restoreJob) : job));
       }
       return;
     }
@@ -169,18 +200,22 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     }
 
     if (!changed) {
-      return;
+      return canAcceptProgressEvent(workspaceRoot, jobId);
     }
 
+    const originalSharedJob = readSharedJob(workspaceRoot, jobId);
+    if (!canAcceptProgressEvent(workspaceRoot, jobId, originalSharedJob)) {
+      return false;
+    }
     if (!upsertJob(workspaceRoot, patch)) {
       removeJobSidecar(workspaceRoot, { id: jobId });
-      return;
+      return false;
     }
     const updated = mutateJobFile(workspaceRoot, jobId, (storedJob) => {
       if (!storedJob?.id) {
         return null;
       }
-      if (["completed", "failed", "cancelled"].includes(storedJob.status)) {
+      if (isTerminalJob(storedJob)) {
         return null;
       }
       return {
@@ -198,15 +233,17 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       } catch {
         // Missing sidecars are handled by removing only the progress patch below.
       }
-      removeOrphanProgressPatch(workspaceRoot, jobId, terminalJob);
-      return;
+      removeOrphanProgressPatch(workspaceRoot, jobId, terminalJob, originalSharedJob);
+      return false;
     }
     if (cleanupTrackedJobIfSessionEnded(updated)) {
-      return;
+      return false;
     }
     if (!upsertJob(workspaceRoot, sharedProgressJobPatch(updated))) {
       removeTrackedJobAfterSessionEnd(updated);
+      return false;
     }
+    return true;
   };
 }
 
@@ -217,13 +254,16 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
 
   return (eventOrMessage) => {
     const event = normalizeProgressEvent(eventOrMessage);
+    const shouldLog = onEvent?.(event);
+    if (shouldLog === false) {
+      return;
+    }
     const stderrMessage = event.stderrMessage ?? event.message;
     if (stderr && stderrMessage) {
       process.stderr.write(`[codex] ${stderrMessage}\n`);
     }
     appendLogLine(logFile, event.message);
     appendLogBlock(logFile, event.logTitle, event.logBody);
-    onEvent?.(event);
   };
 }
 
@@ -281,7 +321,11 @@ export async function runTrackedJob(job, runner, options = {}) {
     removeTrackedJobAfterSessionEnd(runningRecord);
     throw new Error(`Claude session ${runningRecord.sessionId} ended before job ${runningRecord.id} could run.`);
   }
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
+  const runningJobFile = writeJobFile(job.workspaceRoot, job.id, runningRecord);
+  if (!runningJobFile) {
+    removeTrackedJobAfterSessionEnd(runningRecord);
+    throw new Error(`Claude session ${runningRecord.sessionId} ended before job ${runningRecord.id} could run.`);
+  }
   writeHeartbeatIfRunning(runningRecord);
   let heartbeatActive = true;
   let heartbeat = null;
@@ -359,7 +403,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       removeTrackedJobAfterSessionEnd(runningRecord);
       throw error;
     }
-    writeJobFile(job.workspaceRoot, job.id, {
+    const failedRecord = {
       ...existing,
       status: "failed",
       phase: "failed",
@@ -367,7 +411,11 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       completedAt,
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
+    };
+    const failedJobFile = writeJobFile(job.workspaceRoot, job.id, failedRecord);
+    if (!failedJobFile) {
+      removeTrackedJobAfterSessionEnd(failedRecord);
+    }
     throw error;
   } finally {
     heartbeatActive = false;
