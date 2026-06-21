@@ -5438,6 +5438,53 @@ def test_codex_status_includes_pruned_active_sidecar_without_private_payload(tmp
     assert "PRIVATE_LEASE_SECRET" not in text
 
 
+def test_codex_status_omits_tombstoned_sidecar_only_active_job(tmp_path):
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          markSessionEnded,
+          resolveJobLogFile,
+          updateState,
+          writeJobFile
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        process.env.CODEX_FOR_CLAUDE_SKIP_STATE_PRUNE = '1';
+        const job = {
+          id: 'status-tombstoned-sidecar-only',
+          status: 'running',
+          phase: 'running',
+          kind: 'task',
+          title: 'Tombstoned sidecar only',
+          workspaceRoot: cwd,
+          sessionId: 'session-status-tombstoned-sidecar',
+          request: { secret: 'PRIVATE_TOMBSTONED_REQUEST' },
+          logFile: resolveJobLogFile(cwd, 'status-tombstoned-sidecar-only'),
+          updatedAt: new Date().toISOString()
+        };
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(job.logFile, '[2000-01-01T00:00:00.000Z] PRIVATE_TOMBSTONED_LOG\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-status-tombstoned-sidecar');
+          state.jobs = state.jobs.filter((item) => item.id !== job.id);
+        });
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+
+    result = run_companion(["status", "--cwd", str(tmp_path), "--json", "--all"], cwd=tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    text = json.dumps(payload)
+    assert all(job["id"] != "status-tombstoned-sidecar-only" for job in payload["running"])
+    assert "PRIVATE_TOMBSTONED_REQUEST" not in text
+    assert "PRIVATE_TOMBSTONED_LOG" not in text
+
+
 def test_codex_single_status_filters_current_session_unless_all(tmp_path):
     env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
     env["CODEX_COMPANION_SESSION_ID"] = "session-a"

@@ -2,7 +2,7 @@ import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { classifyJobLiveness } from "./job-lifecycle.mjs";
-import { getConfig, listJobSidecars, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobSidecars, listJobs, loadState, readJobFile, resolveJobFile, stateHasEndedSession } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -265,14 +265,20 @@ function sharedJobPatchFromSidecar(job) {
 }
 
 function listStatusJobs(workspaceRoot) {
+  const state = loadState(workspaceRoot);
   const byId = new Map();
-  for (const job of listJobs(workspaceRoot)) {
+  for (const job of state.jobs ?? []) {
     if (job?.id) {
       byId.set(job.id, job);
     }
   }
   for (const job of listJobSidecars(workspaceRoot)) {
-    if (!job?.id || (job.status !== "queued" && job.status !== "running") || byId.has(job.id)) {
+    if (
+      !job?.id
+      || (job.status !== "queued" && job.status !== "running")
+      || byId.has(job.id)
+      || stateHasEndedSession(state, job.sessionId)
+    ) {
       continue;
     }
     byId.set(job.id, sharedJobPatchFromSidecar(job));
