@@ -37,6 +37,35 @@ function countTopLevelKey(text, key) {
   return [...text.matchAll(pattern)].length;
 }
 
+function activeWorkflowLines(text) {
+  return text.split(/\r?\n/).filter((line) => !line.trim().startsWith("#"));
+}
+
+function activeWorkflowText(text) {
+  return activeWorkflowLines(text).join("\n");
+}
+
+function leadingSpaces(line) {
+  return line.match(/^ */)?.[0].length ?? 0;
+}
+
+function activeBlockStartingWith(text, trimmedStart) {
+  const lines = activeWorkflowLines(text);
+  const start = lines.findIndex((line) => line.trim() === trimmedStart);
+  if (start < 0) {
+    return [];
+  }
+  const startIndent = leadingSpaces(lines[start]);
+  const block = [];
+  for (const line of lines.slice(start)) {
+    if (block.length > 0 && line.trim() && leadingSpaces(line) <= startIndent) {
+      break;
+    }
+    block.push(line);
+  }
+  return block;
+}
+
 function hasMinimalContentsReadPermission(text) {
   const hasNestedPermissions = text.split(/\r?\n/).some((line) => /^\s+permissions:\s*(?:.*)?$/.test(line));
   const entries = topLevelBlockLines(text, "permissions:")
@@ -75,20 +104,27 @@ function hasAnsiQuotedShellFragment(text) {
 }
 
 function hasImmutableMarketplaceInstall(text) {
+  const activeText = activeWorkflowText(text);
+  const activeCommandText = normalizedCommandText(activeText);
+  const mutableCheckout = /(?:^|[\s;&|])git\s+-C\s+\$marketplace_dir\s+checkout\b(?!\s+FETCH_HEAD\b)/.test(activeCommandText);
   return (
-    text.includes("claude plugin marketplace add \"$marketplace_dir\" --scope user") &&
-    text.includes("claude plugin install codex@external-models-for-claude --scope user") &&
-    text.includes('git -C "$marketplace_dir" fetch --depth 1 origin "refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF"') &&
-    text.includes('git -C "$marketplace_dir" checkout FETCH_HEAD')
+    !mutableCheckout &&
+    activeText.includes("claude plugin marketplace add \"$marketplace_dir\" --scope user") &&
+    activeText.includes("claude plugin install codex@external-models-for-claude --scope user") &&
+    activeText.includes('git -C "$marketplace_dir" fetch --depth 1 origin "refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF"') &&
+    activeText.includes('git -C "$marketplace_dir" checkout FETCH_HEAD')
   );
 }
 
 function hasReviewArtifactUpload(text) {
+  const block = activeBlockStartingWith(text, "- uses: actions/upload-artifact@v4")
+    .map((line) => line.trim())
+    .filter(Boolean);
   return (
-    text.includes("actions/upload-artifact@v4") &&
-    text.includes("if: always()") &&
-    text.includes("name: codex-for-claude-review") &&
-    text.includes("path: codex-for-claude-review.*")
+    block.includes("- uses: actions/upload-artifact@v4") &&
+    block.includes("if: always()") &&
+    block.includes("name: codex-for-claude-review") &&
+    block.includes("path: codex-for-claude-review.*")
   );
 }
 
