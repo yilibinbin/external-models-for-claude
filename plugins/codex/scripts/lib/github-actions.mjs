@@ -65,6 +65,10 @@ function hasRunnableCodexReviewCommand(text) {
   return /(?:^|[\s;&|])(?:node\s+)?\S*codex-companion\.mjs\s+review\b/.test(normalizedCommandText(text));
 }
 
+function hasAnsiQuotedShellFragment(text) {
+  return /\$['"]/.test(text);
+}
+
 export function validateReleaseRef(value) {
   const ref = String(value ?? "v0.2.0").trim();
   const lower = ref.toLowerCase();
@@ -163,8 +167,9 @@ export function validateWorkflow(text) {
     !text.includes("OPENAI_API_KEY") &&
     !text.includes(CODEX_CLI_AUTH_HELP_COMMAND) &&
     !text.includes(CODEX_CLI_AUTH_LOGIN_COMMAND) &&
-    !hasRunnableCodexAuthCommand(text);
-  const previewReviewSafe = !hasRunnableCodexReviewCommand(text);
+    !hasRunnableCodexAuthCommand(text) &&
+    !hasAnsiQuotedShellFragment(text);
+  const previewReviewSafe = !hasRunnableCodexReviewCommand(text) && !hasAnsiQuotedShellFragment(text);
   const checks = [
     result(hasPullRequestOnlyTrigger(text), "has-pull-request-trigger"),
     result(!text.includes("pull_request_target"), "no-pull-request-target"),
