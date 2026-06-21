@@ -32,19 +32,24 @@ function topLevelBlockLines(text, header) {
   return block;
 }
 
+function countTopLevelKey(text, key) {
+  const pattern = new RegExp(`^${key}:`, "gm");
+  return [...text.matchAll(pattern)].length;
+}
+
 function hasMinimalContentsReadPermission(text) {
-  const hasNestedPermissions = text.split(/\r?\n/).some((line) => /^\s+permissions:\s*(?:#.*)?$/.test(line));
+  const hasNestedPermissions = text.split(/\r?\n/).some((line) => /^\s+permissions:\s*(?:.*)?$/.test(line));
   const entries = topLevelBlockLines(text, "permissions:")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));
-  return !hasNestedPermissions && entries.length === 1 && entries[0] === "contents: read";
+  return countTopLevelKey(text, "permissions") === 1 && !hasNestedPermissions && entries.length === 1 && entries[0] === "contents: read";
 }
 
 function hasPullRequestOnlyTrigger(text) {
   const entries = topLevelBlockLines(text, "on:")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));
-  return entries.length === 1 && entries[0] === "pull_request:";
+  return countTopLevelKey(text, "on") === 1 && entries.length === 1 && entries[0] === "pull_request:";
 }
 
 function normalizedCommandText(text) {
@@ -67,6 +72,24 @@ function hasRunnableCodexReviewCommand(text) {
 
 function hasAnsiQuotedShellFragment(text) {
   return /\$['"]/.test(text);
+}
+
+function hasImmutableMarketplaceInstall(text) {
+  return (
+    text.includes("claude plugin marketplace add \"$marketplace_dir\" --scope user") &&
+    text.includes("claude plugin install codex@external-models-for-claude --scope user") &&
+    text.includes('git -C "$marketplace_dir" fetch --depth 1 origin "refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF"') &&
+    text.includes('git -C "$marketplace_dir" checkout FETCH_HEAD')
+  );
+}
+
+function hasReviewArtifactUpload(text) {
+  return (
+    text.includes("actions/upload-artifact@v4") &&
+    text.includes("if: always()") &&
+    text.includes("name: codex-for-claude-review") &&
+    text.includes("path: codex-for-claude-review.*")
+  );
 }
 
 export function validateReleaseRef(value) {
@@ -174,7 +197,7 @@ export function validateWorkflow(text) {
     result(hasPullRequestOnlyTrigger(text), "has-pull-request-trigger"),
     result(!text.includes("pull_request_target"), "no-pull-request-target"),
     result(hasMinimalContentsReadPermission(text), "minimal-contents-permission"),
-    result(text.includes("claude plugin marketplace add \"$marketplace_dir\" --scope user"), "marketplace-install"),
+    result(hasImmutableMarketplaceInstall(text), "marketplace-install"),
     result(text.includes("claude plugin install codex@external-models-for-claude --scope user"), "plugin-install"),
     result(
       text.includes("claude plugin list --json") &&
@@ -226,6 +249,7 @@ export function validateWorkflow(text) {
     result(!text.includes("CODEX_API_KEY"), "no-unsupported-codex-api-key-env"),
     result(contractsVerified ? text.includes("$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs") : true, "runtime-path"),
     result(!text.includes("--dangerously-skip-permissions"), "no-dangerous-permission-flag"),
+    result(hasReviewArtifactUpload(text), "review-artifact-upload"),
     result(!hasMachinePath(text), "no-local-absolute-paths")
   ];
   const readyCheckNames = new Set([

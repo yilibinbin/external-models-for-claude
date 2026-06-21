@@ -6482,17 +6482,48 @@ def test_codex_github_actions_validator_rejects_extra_triggers_and_job_permissio
         "const base = g.renderWorkflow({ref:'v0.2.0'});"
         "const trigger = base.replace('on:\\n  pull_request:', 'on:\\n  pull_request:\\n  workflow_dispatch:');"
         "const jobPermissions = base.replace('    runs-on: ubuntu-latest', '    runs-on: ubuntu-latest\\n    permissions:\\n      pull-requests: write');"
-        "process.stdout.write(JSON.stringify({trigger:g.validateWorkflow(trigger), jobPermissions:g.validateWorkflow(jobPermissions)}));"
+        "const duplicateTrigger = `${base}\\non:\\n  workflow_dispatch:\\n`;"
+        "const duplicatePermissions = `${base}\\npermissions:\\n  pull-requests: write\\n`;"
+        "const inlineJobPermissions = base.replace('    runs-on: ubuntu-latest', '    runs-on: ubuntu-latest\\n    permissions: write-all');"
+        "process.stdout.write(JSON.stringify({trigger:g.validateWorkflow(trigger), jobPermissions:g.validateWorkflow(jobPermissions), duplicateTrigger:g.validateWorkflow(duplicateTrigger), duplicatePermissions:g.validateWorkflow(duplicatePermissions), inlineJobPermissions:g.validateWorkflow(inlineJobPermissions)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     trigger_check = next(check for check in payload["trigger"]["checks"] if check["name"] == "has-pull-request-trigger")
     permission_check = next(check for check in payload["jobPermissions"]["checks"] if check["name"] == "minimal-contents-permission")
+    duplicate_trigger_check = next(check for check in payload["duplicateTrigger"]["checks"] if check["name"] == "has-pull-request-trigger")
+    duplicate_permission_check = next(check for check in payload["duplicatePermissions"]["checks"] if check["name"] == "minimal-contents-permission")
+    inline_permission_check = next(check for check in payload["inlineJobPermissions"]["checks"] if check["name"] == "minimal-contents-permission")
     assert trigger_check["ok"] is False
     assert permission_check["ok"] is False
+    assert duplicate_trigger_check["ok"] is False
+    assert duplicate_permission_check["ok"] is False
+    assert inline_permission_check["ok"] is False
     assert payload["trigger"]["structuralOk"] is False
     assert payload["jobPermissions"]["structuralOk"] is False
+    assert payload["duplicateTrigger"]["structuralOk"] is False
+    assert payload["duplicatePermissions"]["structuralOk"] is False
+    assert payload["inlineJobPermissions"]["structuralOk"] is False
+
+
+def test_codex_github_actions_validator_requires_tag_fetch_and_artifact_upload():
+    script = (
+        "const g = await import('./plugins/codex/scripts/lib/github-actions.mjs');"
+        "const base = g.renderWorkflow({ref:'v0.2.0'});"
+        "const mutableFetch = base.replace('refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF', 'main');"
+        "const noArtifact = base.replace('      - uses: actions/upload-artifact@v4\\n        if: always()\\n        with:\\n          name: codex-for-claude-review\\n          path: codex-for-claude-review.*\\n          retention-days: 5\\n', '');"
+        "process.stdout.write(JSON.stringify({mutableFetch:g.validateWorkflow(mutableFetch), noArtifact:g.validateWorkflow(noArtifact)}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    install_check = next(check for check in payload["mutableFetch"]["checks"] if check["name"] == "marketplace-install")
+    artifact_check = next(check for check in payload["noArtifact"]["checks"] if check["name"] == "review-artifact-upload")
+    assert install_check["ok"] is False
+    assert artifact_check["ok"] is False
+    assert payload["mutableFetch"]["structuralOk"] is False
+    assert payload["noArtifact"]["structuralOk"] is False
 
 
 def test_codex_github_actions_validator_rejects_preview_auth_or_review_injection():
