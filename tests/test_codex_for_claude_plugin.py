@@ -2577,7 +2577,7 @@ def test_codex_stop_child_disables_heartbeat_and_progress_updates():
     assert run_tracked.index("heartbeatActive = false") < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
     assert run_tracked.index("upsertJob(job.workspaceRoot, {", run_tracked.index("const execution = await runner()")) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", run_tracked.index("const execution = await runner()"))
     assert "const completedJobFile = writeJobFile(job.workspaceRoot, job.id" in run_tracked
-    assert run_tracked.index("if (completedJobFile)") < run_tracked.index("appendLogBlock(")
+    assert run_tracked.index("if (completedJobFile)") < run_tracked.index("appendLogBlockIfJobCurrent(")
     catch_index = run_tracked.index("} catch (error) {")
     assert run_tracked.index("heartbeatActive = false", catch_index) < run_tracked.index("readStoredJobOrNull", catch_index)
     assert run_tracked.index("upsertJob(job.workspaceRoot, {", catch_index) < run_tracked.index("writeJobFile(job.workspaceRoot, job.id", catch_index)
@@ -3807,6 +3807,87 @@ def test_codex_run_tracked_job_does_not_recreate_log_when_terminal_write_rejecte
     assert "terminal log rendered secret" not in payload["logFileText"]
 
 
+def test_codex_run_tracked_job_does_not_recreate_log_after_terminal_sidecar_cleanup(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+
+        const cwd = process.argv[1];
+        const originalRenameSync = fs.renameSync;
+        let injected = false;
+        fs.renameSync = function patchedRenameSync(from, to) {
+          originalRenameSync.call(this, from, to);
+          if (injected || !String(to).endsWith('/terminal-final-output-race.json')) {
+            return;
+          }
+          try {
+            const stored = JSON.parse(fs.readFileSync(to, 'utf8'));
+            if (stored.status !== 'completed') {
+              return;
+            }
+            injected = true;
+            const jobsDir = path.dirname(to);
+            const stateFile = path.join(path.dirname(jobsDir), 'state.json');
+            const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+            state.endedSessions = [...(state.endedSessions || []), 'session-terminal-final-output-race'];
+            state.jobs = state.jobs.filter((job) => job.id !== 'terminal-final-output-race');
+            fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\\n`, 'utf8');
+            fs.rmSync(to, { force: true });
+            fs.rmSync(path.join(jobsDir, 'terminal-final-output-race.log'), { force: true });
+          } catch {
+            // Non-target rename calls are irrelevant for this race injection.
+          }
+        };
+
+        const tracked = await import('./plugins/codex/scripts/lib/tracked-jobs.mjs');
+        const state = await import('./plugins/codex/scripts/lib/state.mjs');
+        const job = {
+          id: 'terminal-final-output-race',
+          status: 'queued',
+          kind: 'task',
+          title: 'Terminal final output race',
+          workspaceRoot: cwd,
+          sessionId: 'session-terminal-final-output-race',
+          phase: 'queued',
+          pid: null,
+          logFile: state.resolveJobLogFile(cwd, 'terminal-final-output-race')
+        };
+        fs.writeFileSync(job.logFile, 'running log\\n', 'utf8');
+        const execution = await tracked.runTrackedJob(
+          job,
+          async () => ({
+            exitStatus: 0,
+            threadId: 'thread-final-output-race',
+            turnId: 'turn-final-output-race',
+            summary: 'terminal final output summary',
+            payload: { secret: 'terminal final output secret' },
+            rendered: 'FINAL_LOG_RENDERED_SECRET'
+          }),
+          { logFile: job.logFile }
+        );
+        const jobFile = state.resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          executionStatus: execution.exitStatus,
+          injected,
+          jobs: state.listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(job.logFile),
+          logFileText: fs.existsSync(job.logFile) ? fs.readFileSync(job.logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["executionStatus"] == 0
+    assert payload["injected"] is True
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+    assert "FINAL_LOG_RENDERED_SECRET" not in payload["logFileText"]
+
+
 def test_codex_run_tracked_job_does_not_start_runner_when_running_write_rejected(tmp_path):
     payload = run_node_script(
         """
@@ -3887,6 +3968,81 @@ def test_codex_run_tracked_job_does_not_start_runner_when_running_write_rejected
     assert payload["jobs"] == []
     assert payload["jobFileExists"] is False
     assert payload["logFileExists"] is False
+
+
+def test_codex_run_tracked_job_prerun_session_end_removes_options_log(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import {
+          runTrackedJob
+        } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import {
+          listJobs,
+          markSessionEnded,
+          resolveJobFile,
+          resolveJobLogFile,
+          updateState
+        } from './plugins/codex/scripts/lib/state.mjs';
+
+        const cwd = process.argv[1];
+        const job = {
+          id: 'prerun-ended-session-options-log',
+          status: 'queued',
+          kind: 'task',
+          title: 'Prerun ended session options log',
+          workspaceRoot: cwd,
+          sessionId: 'session-prerun-ended-options-log',
+          phase: 'queued',
+          pid: null
+        };
+        const logFile = resolveJobLogFile(cwd, job.id);
+        fs.writeFileSync(logFile, 'secret-before-run\\n', 'utf8');
+        updateState(cwd, (state) => {
+          markSessionEnded(state, 'session-prerun-ended-options-log');
+        });
+
+        let runnerStarted = false;
+        let errorMessage = '';
+        try {
+          await runTrackedJob(
+            job,
+            async () => {
+              runnerStarted = true;
+              return {
+                exitStatus: 0,
+                threadId: 'thread-prerun',
+                turnId: 'turn-prerun',
+                summary: 'should not run',
+                payload: {},
+                rendered: 'should not render'
+              };
+            },
+            { logFile }
+          );
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
+        const jobFile = resolveJobFile(cwd, job.id);
+
+        console.log(JSON.stringify({
+          runnerStarted,
+          errorMessage,
+          jobs: listJobs(cwd),
+          jobFileExists: fs.existsSync(jobFile),
+          logFileExists: fs.existsSync(logFile),
+          logFileText: fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+        }));
+        """,
+        args=[str(tmp_path)],
+    )
+
+    assert payload["runnerStarted"] is False
+    assert "ended before job prerun-ended-session-options-log could run" in payload["errorMessage"]
+    assert payload["jobs"] == []
+    assert payload["jobFileExists"] is False
+    assert payload["logFileExists"] is False
+    assert "secret-before-run" not in payload["logFileText"]
 
 
 def test_codex_companion_publishes_background_and_cancel_state_before_job_file_writes():

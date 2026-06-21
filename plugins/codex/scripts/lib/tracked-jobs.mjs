@@ -13,6 +13,7 @@ import {
   stateHasEndedSession,
   updateState,
   upsertJob,
+  withJobFileLock,
   writeJobFile
 } from "./state.mjs";
 
@@ -60,6 +61,45 @@ export function appendLogBlock(logFile, title, body) {
     return;
   }
   fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
+}
+
+function removeFileIfExists(filePath) {
+  if (filePath && fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+  }
+}
+
+function appendLogBlockIfJobCurrent(job, logFile, title, body) {
+  if (!logFile || !body || !job?.workspaceRoot || !job?.id) {
+    return false;
+  }
+
+  return withJobFileLock(job.workspaceRoot, job.id, () => {
+    const jobFile = resolveJobFile(job.workspaceRoot, job.id);
+    if (!fs.existsSync(jobFile)) {
+      return false;
+    }
+
+    let storedJob = null;
+    try {
+      storedJob = readJobFile(jobFile);
+    } catch {
+      return false;
+    }
+    if (storedJob?.id !== job.id) {
+      return false;
+    }
+    if (hasEndedSession(job.workspaceRoot, storedJob.sessionId ?? job.sessionId)) {
+      removeFileIfExists(jobFile);
+      removeFileIfExists(logFile);
+      return false;
+    }
+    if (!fs.existsSync(logFile)) {
+      return false;
+    }
+    appendLogBlock(logFile, title, body);
+    return true;
+  });
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
@@ -305,17 +345,22 @@ export function writeHeartbeatIfRunning(job, nowMs = null, isRunning = null) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
-  if (cleanupTrackedJobIfSessionEnded(job)) {
-    throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could run.`);
+  const effectiveLogFile = options.logFile ?? job.logFile ?? null;
+  const jobWithLog = {
+    ...job,
+    logFile: effectiveLogFile
+  };
+  if (cleanupTrackedJobIfSessionEnded(jobWithLog)) {
+    throw new Error(`Claude session ${jobWithLog.sessionId} ended before job ${jobWithLog.id} could run.`);
   }
 
   const runningRecord = {
-    ...job,
+    ...jobWithLog,
     status: "running",
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
+    logFile: effectiveLogFile
   };
   if (!upsertJob(job.workspaceRoot, runningRecord)) {
     removeTrackedJobAfterSessionEnd(runningRecord);
@@ -376,7 +421,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       rendered: execution.rendered
     });
     if (completedJobFile) {
-      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+      appendLogBlockIfJobCurrent(runningRecord, effectiveLogFile, "Final output", execution.rendered);
     }
     return execution;
   } catch (error) {
