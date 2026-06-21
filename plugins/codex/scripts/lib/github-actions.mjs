@@ -236,6 +236,28 @@ function hasActiveForkSafetyDetector(text) {
   return matchingForkSafetyDetectorCount(text) === 1;
 }
 
+function expectedStepFirstLines(contractsVerified) {
+  return [
+    "- uses: actions/checkout@v4",
+    "- name: Detect fork safety",
+    "- uses: actions/setup-node@v4",
+    "- name: Install Claude Code",
+    "- name: Install Codex CLI",
+    contractsVerified ? "- name: Verify Codex API-key login support" : null,
+    contractsVerified ? "- name: Authenticate Codex" : null,
+    "- name: Install Codex for Claude plugin",
+    "- name: Resolve installed plugin root",
+    contractsVerified ? "- name: Run Codex review" : "- name: Preview Codex review",
+    "- uses: actions/upload-artifact@v4"
+  ].filter(Boolean);
+}
+
+function hasExpectedStepInventory(text, contractsVerified) {
+  const actual = activeStepBlocks(text).map((block) => block[0]?.trim()).filter(Boolean);
+  const expected = expectedStepFirstLines(contractsVerified);
+  return actual.length === expected.length && expected.every((line, index) => actual[index] === line);
+}
+
 function hasForkSafeStepGates(text, contractsVerified) {
   const requiredSteps = [
     "- uses: actions/setup-node@v4",
@@ -266,7 +288,7 @@ function hasForkSafeStepGates(text, contractsVerified) {
       blockHasFieldLine(block, FORK_SAFE_IF)
     );
   });
-  return hasActiveForkSafetyDetector(text) && requiredStepsGated && executableStepsGated;
+  return hasExpectedStepInventory(text, contractsVerified) && hasActiveForkSafetyDetector(text) && requiredStepsGated && executableStepsGated;
 }
 
 export function validateReleaseRef(value) {

@@ -6642,6 +6642,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
         "const reviewUngated = base.replace('      - name: Preview Codex review\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'', '      - name: Preview Codex review');"
         "const installUngated = base.replace('      - name: Install Codex for Claude plugin\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'', '      - name: Install Codex for Claude plugin');"
         "const extraUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Extra ungated shell\\n        shell: bash\\n        run: echo unsafe\\n      - uses: actions/upload-artifact@v4');"
+        "const extraGated = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Extra gated shell\\n        if: steps.fork-safety.outputs.safe_to_review == \\'true\\'\\n        shell: bash\\n        run: echo unexpected\\n      - uses: actions/upload-artifact@v4');"
         "const disguisedUngated = base.replace('      - uses: actions/upload-artifact@v4', '      - name: Extra disguised ungated shell\\n        shell: bash\\n        run: |\\n          if: steps.fork-safety.outputs.safe_to_review == \\'true\\'\\n          echo unsafe\\n      - uses: actions/upload-artifact@v4');"
         "const extraJob = base.replace('          retention-days: 5\\n', '          retention-days: 5\\n  unsafe-extra-job:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - run: echo unsafe\\n');"
         "const quotedExtraJob = `${base}\\n\"jobs\" :\\n  unsafe-extra-job:\\n    uses: attacker/repo/.github/workflows/pwn.yml@main\\n`;"
@@ -6652,7 +6653,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
         "const detectorBlock = base.match(/      - name: Detect fork safety[\\s\\S]*?      - uses: actions\\/setup-node@v4/)[0].replace('      - uses: actions/setup-node@v4', '');"
         "const duplicateExactDetector = base.replace('      - uses: actions/setup-node@v4', `${detectorBlock}      - uses: actions/setup-node@v4`);"
         "const scriptBodyStepsDetector = base.replace(detectorBlock, '').replace('          printf \\'%s\\\\n\\' \\'{\"status\":\"preview\",\"reason\":\"release-host-cli-auth-contract-unverified\"}\\' > codex-for-claude-review.json', `          printf '%s\\\\n' '{\"status\":\"preview\",\"reason\":\"release-host-cli-auth-contract-unverified\"}' > codex-for-claude-review.json\\n          steps:\\n${detectorBlock.replaceAll('      ', '            ')}`);"
-        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), disguisedUngated:g.validateWorkflow(disguisedUngated), extraJob:g.validateWorkflow(extraJob), quotedExtraJob:g.validateWorkflow(quotedExtraJob), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi), duplicateDetector:g.validateWorkflow(duplicateDetector), duplicateExactDetector:g.validateWorkflow(duplicateExactDetector), scriptBodyStepsDetector:g.validateWorkflow(scriptBodyStepsDetector)}));"
+        "process.stdout.write(JSON.stringify({reviewUngated:g.validateWorkflow(reviewUngated), installUngated:g.validateWorkflow(installUngated), extraUngated:g.validateWorkflow(extraUngated), extraGated:g.validateWorkflow(extraGated), disguisedUngated:g.validateWorkflow(disguisedUngated), extraJob:g.validateWorkflow(extraJob), quotedExtraJob:g.validateWorkflow(quotedExtraJob), shorthandUngated:g.validateWorkflow(shorthandUngated), unsafeDetector:g.validateWorkflow(unsafeDetector), unsafeDetectorAfterFi:g.validateWorkflow(unsafeDetectorAfterFi), duplicateDetector:g.validateWorkflow(duplicateDetector), duplicateExactDetector:g.validateWorkflow(duplicateExactDetector), scriptBodyStepsDetector:g.validateWorkflow(scriptBodyStepsDetector)}));"
     )
     result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     assert result.returncode == 0, result.stderr
@@ -6660,6 +6661,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     review_check = next(check for check in payload["reviewUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     install_check = next(check for check in payload["installUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     extra_check = next(check for check in payload["extraUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
+    extra_gated_check = next(check for check in payload["extraGated"]["checks"] if check["name"] == "fork-safe-step-gates")
     disguised_check = next(check for check in payload["disguisedUngated"]["checks"] if check["name"] == "fork-safe-step-gates")
     extra_job_check = next(check for check in payload["extraJob"]["checks"] if check["name"] == "single-codex-review-job")
     quoted_extra_job_check = next(check for check in payload["quotedExtraJob"]["checks"] if check["name"] == "single-codex-review-job")
@@ -6672,6 +6674,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     assert review_check["ok"] is False
     assert install_check["ok"] is False
     assert extra_check["ok"] is False
+    assert extra_gated_check["ok"] is False
     assert disguised_check["ok"] is False
     assert extra_job_check["ok"] is False
     assert quoted_extra_job_check["ok"] is False
@@ -6684,6 +6687,7 @@ def test_codex_github_actions_validator_requires_step_scoped_fork_gates():
     assert payload["reviewUngated"]["structuralOk"] is False
     assert payload["installUngated"]["structuralOk"] is False
     assert payload["extraUngated"]["structuralOk"] is False
+    assert payload["extraGated"]["structuralOk"] is False
     assert payload["disguisedUngated"]["structuralOk"] is False
     assert payload["extraJob"]["structuralOk"] is False
     assert payload["quotedExtraJob"]["structuralOk"] is False
@@ -6922,6 +6926,98 @@ def test_codex_release_check_require_flag_implies_ci_simulate():
     assert "ci-workflow-validation" in names
     details = {check["name"]: check["detail"] for check in payload["checks"]}
     assert "sentinel not replaced" in details["ci-claude-code-version-contract"] or "sentinel not replaced" in details["ci-codex-cli-version-contract"]
+
+
+def test_codex_release_check_require_flag_verifies_stdin_login_contract(tmp_path):
+    repo = copy_repo(tmp_path)
+    github_actions = repo / "plugins" / "codex" / "scripts" / "lib" / "github-actions.mjs"
+    text = read_text(github_actions)
+    text = text.replace(
+        'export const CODEX_CLI_NPM_VERSION = "REPLACE_WITH_RELEASE_HOST_CODEX_CLI_VERSION";',
+        'export const CODEX_CLI_NPM_VERSION = "1.2.3";',
+    ).replace(
+        'export const CLAUDE_CODE_NPM_VERSION = "REPLACE_WITH_RELEASE_HOST_CLAUDE_CODE_VERSION";',
+        'export const CLAUDE_CODE_NPM_VERSION = "4.5.6";',
+    ).replace(
+        "export const RELEASE_HOST_CONTRACTS_VERIFIED = false;",
+        "export const RELEASE_HOST_CONTRACTS_VERIFIED = true;",
+    )
+    github_actions.write_text(text, encoding="utf8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_executable(
+        bin_dir / "npm",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"view\" ] && [ \"$3\" = \"version\" ]; then\n"
+        "  case \"$2\" in\n"
+        "    @openai/codex@1.2.3) printf '1.2.3\\n'; exit 0 ;;\n"
+        "    @anthropic-ai/claude-code@4.5.6) printf '4.5.6\\n'; exit 0 ;;\n"
+        "  esac\n"
+        "fi\n"
+        "printf 'unexpected npm args: %s\\n' \"$*\" >&2\n"
+        "exit 1\n",
+    )
+    write_executable(
+        bin_dir / "codex",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"login\" ] && [ \"$2\" = \"--help\" ]; then\n"
+        "  printf 'Usage: codex login --with-api-key\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = \"login\" ] && [ \"$2\" = \"--with-api-key\" ]; then\n"
+        "  read api_key\n"
+        "  printf 'stdin login rejected: %s\\n' \"$api_key\" >&2\n"
+        "  exit 42\n"
+        "fi\n"
+        "printf 'unexpected codex args: %s\\n' \"$*\" >&2\n"
+        "exit 1\n",
+    )
+    result = run_node(
+        repo / "plugins" / "codex" / "scripts" / "codex-companion.mjs",
+        ["release-check", "--require-codex-cli", "--json"],
+        cwd=repo,
+        env={
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "OPENAI_API_KEY": "fake-release-key",
+        },
+        timeout=20,
+    )
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    checks = checks_by_name(payload)
+    assert checks["ci-codex-cli-version-contract"]["ok"] is True
+    assert checks["ci-codex-cli-auth-contract"]["ok"] is False
+    assert "stdin" in checks["ci-codex-cli-auth-contract"]["detail"]
+    write_executable(
+        bin_dir / "codex",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"login\" ] && [ \"$2\" = \"--help\" ]; then\n"
+        "  printf 'Usage: codex login --with-api-key\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = \"login\" ] && [ \"$2\" = \"--with-api-key\" ]; then\n"
+        "  read api_key\n"
+        "  test \"$api_key\" = \"fake-release-key\"\n"
+        "  exit $?\n"
+        "fi\n"
+        "printf 'unexpected codex args: %s\\n' \"$*\" >&2\n"
+        "exit 1\n",
+    )
+    success = run_node(
+        repo / "plugins" / "codex" / "scripts" / "codex-companion.mjs",
+        ["release-check", "--require-codex-cli", "--json"],
+        cwd=repo,
+        env={
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "OPENAI_API_KEY": "fake-release-key",
+        },
+        timeout=20,
+    )
+    assert success.returncode == 0, success.stderr
+    success_payload = json.loads(success.stdout)
+    success_checks = checks_by_name(success_payload)
+    assert success_checks["ci-codex-cli-auth-contract"]["ok"] is True
+    assert "stdin contract" in success_checks["ci-codex-cli-auth-contract"]["detail"]
 
 
 def test_codex_release_check_has_concrete_preview_command_surface():

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -92,6 +93,41 @@ function sameJson(left, right) {
 
 function check(name, ok, detail = null) {
   return { name, ok: Boolean(ok), detail };
+}
+
+function probeCodexStdinLogin(apiKey) {
+  if (!apiKey) {
+    return {
+      ok: false,
+      detail: "OPENAI_API_KEY is required to verify codex login --with-api-key stdin contract"
+    };
+  }
+  const probeHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-release-auth-"));
+  try {
+    const probe = spawnSync("codex", ["login", "--with-api-key"], {
+      input: `${apiKey}\n`,
+      encoding: "utf8",
+      timeout: 15000,
+      env: {
+        ...process.env,
+        HOME: probeHome,
+        XDG_CONFIG_HOME: path.join(probeHome, ".config"),
+        CODEX_HOME: path.join(probeHome, ".codex")
+      }
+    });
+    if (probe.error) {
+      return { ok: false, detail: `stdin codex login probe failed: ${probe.error.message}` };
+    }
+    if (probe.status !== 0) {
+      return {
+        ok: false,
+        detail: `stdin codex login --with-api-key probe failed with status ${probe.status}`
+      };
+    }
+    return { ok: true, detail: "verified local codex login --with-api-key stdin contract" };
+  } finally {
+    fs.rmSync(probeHome, { recursive: true, force: true });
+  }
 }
 
 function isTextFile(filePath) {
@@ -454,7 +490,7 @@ export function runReleaseCheck(start = null, options = {}) {
     const requireCodexCli = Boolean(options.requireCodexCli);
     let claudeVersionOk = false;
     let codexVersionOk = false;
-    let codexAuthHelpOk = false;
+    let codexAuthOk = false;
     let claudeVersionDetail = "not verified; rerun with --require-codex-cli on the release host";
     let codexVersionDetail = "not verified; rerun with --require-codex-cli on the release host";
     let codexAuthDetail = "not verified; rerun with --require-codex-cli on the release host";
@@ -494,16 +530,18 @@ export function runReleaseCheck(start = null, options = {}) {
           timeout: 5000
         });
         const codexAvailable = !codexLoginHelp.error || codexLoginHelp.error.code !== "ENOENT";
-        codexAuthHelpOk =
+        const codexAuthHelpOk =
           codexAvailable &&
           codexLoginHelp.status === 0 &&
           `${codexLoginHelp.stdout}\n${codexLoginHelp.stderr}`.includes("--with-api-key");
+        const codexAuthProbe = codexAuthHelpOk
+          ? probeCodexStdinLogin(process.env.OPENAI_API_KEY)
+          : { ok: false, detail: "required Codex CLI auth contract missing" };
+        codexAuthOk = codexAuthProbe.ok;
         codexVersionDetail = codexVersionOk
           ? `verified npm @openai/codex@${CODEX_CLI_NPM_VERSION}`
           : "required Codex CLI npm version contract missing";
-        codexAuthDetail = codexAuthHelpOk
-          ? "verified local codex login --with-api-key"
-          : "required Codex CLI auth contract missing";
+        codexAuthDetail = codexAuthProbe.detail;
       }
     }
 
@@ -535,7 +573,7 @@ export function runReleaseCheck(start = null, options = {}) {
       check("ci-workflow-plugin-root-resolved", workflowCheckOk("plugin-root-resolved")),
       check("ci-claude-code-version-contract", !requireCodexCli || claudeVersionOk, claudeVersionDetail),
       check("ci-codex-cli-version-contract", !requireCodexCli || codexVersionOk, codexVersionDetail),
-      check("ci-codex-cli-auth-contract", !requireCodexCli || codexAuthHelpOk, codexAuthDetail)
+      check("ci-codex-cli-auth-contract", !requireCodexCli || codexAuthOk, codexAuthDetail)
     );
   }
 
