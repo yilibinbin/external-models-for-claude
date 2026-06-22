@@ -30,6 +30,7 @@ import { renderWorkflow, validateWorkflow, writeWorkflow } from "./lib/github-ac
 import { runReleaseCheck } from "./lib/release-check.mjs";
 import { resolveQuality } from "./lib/quality-policy.mjs";
 import { resolveRoles } from "./lib/role-packs.mjs";
+import { redactMachinePaths } from "./lib/path-hygiene.mjs";
 import {
   generateJobId,
   getConfig,
@@ -1496,7 +1497,7 @@ async function handleMultiReview(argv) {
               reasoningSummary: result.payload?.reasoningSummary ?? null
             });
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
+            const message = redactMachinePaths(error instanceof Error ? error.message : String(error));
             results.push({
               role: role.id,
               title: role.title,

@@ -1147,11 +1147,32 @@ def test_codex_machine_path_regex_fixture_matches_python_and_release_check():
         assert js_result is expected, text
 
 
+def test_codex_machine_path_redaction_runtime_uses_single_contract():
+    leaked = "bad:/Users/fanghao/private.sock and file:///private/var/folders/demo/socket"
+    script = """
+        import { redactMachinePaths } from './plugins/codex/scripts/lib/path-hygiene.mjs';
+        console.log(redactMachinePaths(process.argv[1]));
+    """
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", script, leaked],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "/Users/fanghao" not in result.stdout
+    assert "/private/var/folders" not in result.stdout
+    assert "<local-path>" in result.stdout
+
+
 def test_codex_machine_path_pattern_source_is_single_contract():
     path_hygiene = read_text(PLUGIN / "scripts" / "lib" / "path-hygiene.mjs")
     assert "MACHINE_PATH_PATTERN_SOURCE" in path_hygiene
     assert "new RegExp(MACHINE_PATH_PATTERN_SOURCE" in path_hygiene
     assert "function hasMachinePath" in path_hygiene
+    assert "function redactMachinePaths" in path_hygiene
 
     if RELEASE_CHECK_MODULE.exists():
         release_check = read_text(RELEASE_CHECK_MODULE)
@@ -6880,8 +6901,10 @@ def test_codex_multi_review_uses_role_prompt_tracking_and_leases():
     assert "resumeLast: false" in multi_body
     assert "persistThread: false" in multi_body
     assert "} catch (error) {" in multi_body
+    assert "redactMachinePaths(error instanceof Error ? error.message : String(error))" in multi_body
     assert "output: `Role failed: ${message}`" in multi_body
     assert "error: message" in multi_body
+    assert multi_body.index("redactMachinePaths(") < multi_body.index("output: `Role failed: ${message}`")
     assert multi_start < companion.index("async function main")
 
 
