@@ -108,28 +108,35 @@ export function classifyStopTaskProcessResult(result) {
   if (result.error?.code === "ETIMEDOUT") {
     return { ok: false, kind: "timeout", reason: "Codex stop review timed out." };
   }
-  const detail = String(result.stderr || result.stdout || result.error?.message || "").trim();
+  const detail = String(result.stderr || result.error?.message || result.stdout || "").trim();
+  const processFailed = result.status !== 0 || Boolean(result.error);
+  const processFailure = () => {
+    if (/auth|login|unauthenticated/i.test(detail)) {
+      return { ok: false, kind: "auth", reason: "Codex is not authenticated." };
+    }
+    return { ok: false, kind: "status", reason: detail || `Codex exited with status ${result.status}.` };
+  };
   let payload;
   try {
     payload = JSON.parse(result.stdout || "{}");
   } catch {
-    if (result.status === 0) {
+    if (!processFailed) {
       return { ok: false, kind: "invalid-json", reason: "Codex stop review returned invalid JSON." };
     }
-    if (/auth|login|unauthenticated/i.test(detail)) {
-      return { ok: false, kind: "auth", reason: "Codex is not authenticated." };
-    }
-    return { ok: false, kind: "status", reason: detail || `Codex exited with status ${result.status}.` };
+    return processFailure();
   }
   const parsed = parseStopReviewOutput(payload?.rawOutput || "");
   if (parsed.ok) {
+    if (parsed.verdict === "BLOCK") {
+      return parsed;
+    }
+    if (processFailed) {
+      return processFailure();
+    }
     return parsed;
   }
-  if (result.status !== 0) {
-    if (/auth|login|unauthenticated/i.test(detail)) {
-      return { ok: false, kind: "auth", reason: "Codex is not authenticated." };
-    }
-    return { ok: false, kind: "status", reason: detail || `Codex exited with status ${result.status}.` };
+  if (processFailed) {
+    return processFailure();
   }
   return parsed;
 }
@@ -213,7 +220,14 @@ function main() {
   activeGateConfig = config;
   const setupNote = buildSetupNote(cwd);
   if (setupNote) {
-    logNote(setupNote);
+    const decision = classifyStopGateResult({ ok: false, kind: "setup", reason: setupNote }, {
+      failOpen: Boolean(config.stopReviewGateFailOpen)
+    });
+    if (decision.decision === "block") {
+      emitHookDecision({ decision: "block", reason: runningTaskNote ? `${runningTaskNote} ${decision.reason}` : decision.reason });
+    } else {
+      logNote(runningTaskNote ? `${runningTaskNote} [codex review-gate] ${decision.reason}` : `[codex review-gate] ${decision.reason}`);
+    }
     return;
   }
 

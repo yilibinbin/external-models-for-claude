@@ -1852,12 +1852,17 @@ def test_codex_stop_gate_parses_verdict_before_nonzero_status_failure():
         """
         import { classifyStopTaskProcessResult } from './plugins/codex/scripts/stop-review-gate-hook.mjs';
         const allow = classifyStopTaskProcessResult({ status: 1, stdout: JSON.stringify({ rawOutput: 'ALLOW: ok' }), stderr: 'exit 1' });
+        const allowWithError = classifyStopTaskProcessResult({ status: 0, error: new Error('spawn failed'), stdout: JSON.stringify({ rawOutput: 'ALLOW: ok' }), stderr: '' });
         const block = classifyStopTaskProcessResult({ status: 1, stdout: JSON.stringify({ rawOutput: 'BLOCK: bug' }), stderr: 'exit 1' });
-        console.log(JSON.stringify({ allow, block }));
+        console.log(JSON.stringify({ allow, allowWithError, block }));
         """
     )
-    assert payload["allow"]["ok"] is True
-    assert payload["allow"]["verdict"] == "ALLOW"
+    assert payload["allow"]["ok"] is False
+    assert payload["allow"]["kind"] == "status"
+    assert payload["allow"]["reason"] == "exit 1"
+    assert payload["allowWithError"]["ok"] is False
+    assert payload["allowWithError"]["kind"] == "status"
+    assert payload["allowWithError"]["reason"] == "spawn failed"
     assert payload["block"]["ok"] is True
     assert payload["block"]["verdict"] == "BLOCK"
     assert payload["block"]["reason"] == "bug"
@@ -1875,6 +1880,25 @@ def test_codex_stop_gate_block_verdict_wins_over_nonzero_status_behavior():
     assert payload["decision"] == "block"
     assert payload["toolFailure"] is False
     assert payload["reason"] == "capacity masked finding"
+
+
+def test_codex_stop_gate_allow_nonzero_is_tool_failure_even_with_fail_open():
+    payload = run_node_script(
+        """
+        import { classifyStopGateResult } from './plugins/codex/scripts/lib/stop-gate-result.mjs';
+        import { classifyStopTaskProcessResult } from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        const review = classifyStopTaskProcessResult({ status: 1, stdout: JSON.stringify({ rawOutput: 'ALLOW: ok' }), stderr: 'wrapper failed' });
+        console.log(JSON.stringify({
+          closed: classifyStopGateResult(review),
+          open: classifyStopGateResult(review, { failOpen: true })
+        }));
+        """
+    )
+    assert payload["closed"]["decision"] == "block"
+    assert payload["closed"]["toolFailure"] is True
+    assert payload["closed"]["reason"] == "wrapper failed"
+    assert payload["open"]["decision"] == "allow"
+    assert payload["open"]["toolFailure"] is True
 
 
 def test_codex_stop_gate_full_hook_blocks_block_verdict(tmp_path):
@@ -1908,6 +1932,63 @@ def test_codex_stop_gate_full_hook_blocks_block_verdict(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"decision": "block", "reason": "found a real issue"}
+
+
+def test_codex_stop_gate_full_hook_blocks_unavailable_codex_by_default(tmp_path):
+    env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(tmp_path / "data"), "PATH": ""}
+    run_node_script(
+        """
+        import { setConfig } from './plugins/codex/scripts/lib/state.mjs';
+        setConfig(process.argv[1], 'stopReviewGate', true);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    result = subprocess.run(
+        [NODE, str(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")],
+        cwd=tmp_path,
+        env=env,
+        input=json.dumps({"cwd": str(tmp_path)}),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "block"
+    assert "Codex is not set up for the review gate" in payload["reason"]
+    assert result.stderr == ""
+
+
+def test_codex_stop_gate_full_hook_allows_unavailable_codex_only_with_fail_open(tmp_path):
+    env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(tmp_path / "data"), "PATH": ""}
+    run_node_script(
+        """
+        import { setConfig } from './plugins/codex/scripts/lib/state.mjs';
+        setConfig(process.argv[1], 'stopReviewGate', true);
+        setConfig(process.argv[1], 'stopReviewGateFailOpen', true);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    result = subprocess.run(
+        [NODE, str(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")],
+        cwd=tmp_path,
+        env=env,
+        input=json.dumps({"cwd": str(tmp_path)}),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert "[codex review-gate] Codex is not set up for the review gate" in result.stderr
 
 
 def test_codex_stop_gate_non_json_block_output_is_tool_failure():
