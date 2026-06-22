@@ -52,6 +52,7 @@ def provider_isolation_text():
     ]
     roots = [
         PLUGIN / "scripts",
+        PLUGIN / "agents",
         PLUGIN / "commands",
         PLUGIN / "skills",
         PLUGIN / "prompts",
@@ -480,6 +481,7 @@ def test_codex_shipped_text_has_no_external_provider_leakage():
 def test_codex_source_does_not_import_sibling_provider_plugins():
     roots = [
         PLUGIN / "scripts",
+        PLUGIN / "agents",
         PLUGIN / "commands",
         PLUGIN / "skills",
         PLUGIN / "prompts",
