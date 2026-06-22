@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 
+from plugin_versions import ANTIGRAVITY_FOR_CLAUDE_VERSION, MARKETPLACE_VERSION
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "antigravity-for-claude"
@@ -104,10 +106,10 @@ def test_claude_marketplace_lists_antigravity_for_claude():
 
     assert marketplace["name"] == "external-models-for-claude"
     assert marketplace["metadata"]["description"]
-    assert marketplace["metadata"]["version"] == "0.2.0"
+    assert marketplace["metadata"]["version"] == MARKETPLACE_VERSION
     plugins = {item["name"]: item for item in marketplace["plugins"]}
     assert plugins["antigravity-for-claude"]["source"] == "./plugins/antigravity-for-claude"
-    assert plugins["antigravity-for-claude"]["version"] == "0.1.0"
+    assert plugins["antigravity-for-claude"]["version"] == ANTIGRAVITY_FOR_CLAUDE_VERSION
     assert plugins["antigravity-for-claude"]["category"] == "Productivity"
     assert {"gemini-for-claude", "antigravity-for-claude"} <= set(plugins)
     assert len(plugins) == len(marketplace["plugins"])
@@ -117,7 +119,7 @@ def test_antigravity_for_claude_manifest_is_claude_native():
     manifest = read_json(PLUGIN / ".claude-plugin" / "plugin.json")
 
     assert manifest["name"] == "antigravity-for-claude"
-    assert manifest["version"] == "0.1.0"
+    assert manifest["version"] == ANTIGRAVITY_FOR_CLAUDE_VERSION
     assert "Antigravity CLI" in manifest["description"]
     assert "explicit Gemini or Claude" in manifest["description"]
     assert "codex" not in manifest["name"].lower()

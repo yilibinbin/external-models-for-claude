@@ -6,7 +6,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { parseArgs, normalizeArgv } from "./lib/args.mjs";
+import { parseStrictCommandInput } from "./lib/command-policy.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -22,13 +23,22 @@ import {
   } from "./lib/codex.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { doctorReport } from "./lib/doctor.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { renderWorkflow, validateWorkflow, writeWorkflow } from "./lib/github-actions.mjs";
+import { runReleaseCheck } from "./lib/release-check.mjs";
+import { resolveQuality } from "./lib/quality-policy.mjs";
+import { resolveRoles } from "./lib/role-packs.mjs";
+import { redactMachinePaths } from "./lib/path-hygiene.mjs";
 import {
   generateJobId,
   getConfig,
+  hasEndedSession,
   listJobs,
+  removeJobSidecar,
   setConfig,
+  updateState,
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
@@ -61,11 +71,22 @@ import {
   renderStatusReport,
   renderTaskResult
 } from "./lib/render.mjs";
+import {
+  withResourceLease,
+  acquireResourceLease,
+  claimResourceLease,
+  transferResourceLease,
+  verifyResourceLease,
+  reapStaleResourceLeases,
+  capacityBlockedMessage
+} from "./lib/resource-governor.mjs";
+import { releaseTerminalJobLeasesForWorkspace } from "./lib/terminal-lease-cleanup.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const STALE_BACKGROUND_HANDOFF_MS = 30000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -74,12 +95,16 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
+      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--enable-review-gate-fail-open|--disable-review-gate-fail-open] [--json]",
+      "  node scripts/codex-companion.mjs doctor [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs multi-review [--roles <list>|--role-pack <name>] [--base <ref>] [--scope <auto|working-tree|branch>] [--quality <fast|standard|strong|max>] [--json]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs github-actions <render|validate|init> [--ref <tag>] [--force]; validate also supports [--json]",
+      "  node scripts/codex-companion.mjs release-check [--ci-simulate] [--require-codex-cli] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
   );
@@ -95,6 +120,13 @@ function outputResult(value, asJson) {
 
 function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
+}
+
+function capacityBlockedError(lease) {
+  const error = new Error(capacityBlockedMessage(lease));
+  error.status = 75;
+  error.code = "ECAPACITY";
+  return error;
 }
 
 function normalizeRequestedModel(model) {
@@ -122,17 +154,6 @@ function normalizeReasoningEffort(effort) {
     );
   }
   return normalized;
-}
-
-function normalizeArgv(argv) {
-  if (argv.length === 1) {
-    const [raw] = argv;
-    if (!raw || !raw.trim()) {
-      return [];
-    }
-    return splitRawArgumentString(raw);
-  }
-  return argv;
 }
 
 function parseCommandInput(argv, config = {}) {
@@ -204,19 +225,33 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    reviewGateFailOpen: Boolean(config.stopReviewGateFailOpen),
     actionsTaken,
     nextSteps
   };
 }
 
 async function handleSetup(argv) {
-  const { options } = parseCommandInput(argv, {
+  const { options, positionals } = parseStrictCommandInput("setup", argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
+    booleanOptions: [
+      "json",
+      "enable-review-gate",
+      "disable-review-gate",
+      "enable-review-gate-fail-open",
+      "disable-review-gate-fail-open"
+    ],
+    aliasMap: { C: "cwd" }
   });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected setup argument: ${positionals.join(" ")}`);
+  }
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
+  }
+  if (options["enable-review-gate-fail-open"] && options["disable-review-gate-fail-open"]) {
+    throw new Error("Choose either --enable-review-gate-fail-open or --disable-review-gate-fail-open.");
   }
 
   const cwd = resolveCommandCwd(options);
@@ -230,9 +265,40 @@ async function handleSetup(argv) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
   }
+  if (options["enable-review-gate-fail-open"]) {
+    setConfig(workspaceRoot, "stopReviewGateFailOpen", true);
+    actionsTaken.push("Enabled fail-open mode for stop-time review gate tool failures.");
+  } else if (options["disable-review-gate-fail-open"]) {
+    setConfig(workspaceRoot, "stopReviewGateFailOpen", false);
+    actionsTaken.push("Disabled fail-open mode for stop-time review gate tool failures.");
+  }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
+}
+
+function renderDoctorReport(report) {
+  const lines = [
+    `${report.ready ? "READY" : "NOT READY"} ${report.summary}`,
+    `node: ${report.checks.node.ok ? "ok" : "missing"}`,
+    `codex: ${report.checks.codexExecutable.ok ? "ok" : "missing"}`,
+    `claude: ${report.checks.claudeExecutable.ok ? "ok" : "missing"}`,
+    `state: ${report.stateDir.available && report.stateDir.writable ? "ok" : "unavailable"}`,
+    `installed plugin: ${report.checks.installedPlugin.ok ? "detected" : "not detected"}`
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+function handleDoctor(argv) {
+  const { options, positionals } = parseStrictCommandInput("doctor", argv, {
+    booleanOptions: ["json"]
+  });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected doctor argument: ${positionals.join(" ")}`);
+  }
+
+  const report = doctorReport(process.cwd(), process.env);
+  outputResult(options.json ? report : renderDoctorReport(report), options.json);
 }
 
 function buildAdversarialReviewPrompt(context, focusText) {
@@ -244,6 +310,17 @@ function buildAdversarialReviewPrompt(context, focusText) {
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
     REVIEW_INPUT: context.content
   });
+}
+
+export function buildAdversarialReviewTurnOptions(context, request, focusText) {
+  return {
+    prompt: buildAdversarialReviewPrompt(context, focusText),
+    model: request.model,
+    effort: request.effort,
+    sandbox: "read-only",
+    outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    onProgress: request.onProgress
+  };
 }
 
 function ensureCodexAvailable(cwd) {
@@ -312,15 +389,15 @@ function findLatestResumableTaskJob(jobs) {
   );
 }
 
-async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
+async function waitForSingleJobSnapshot(workspaceRoot, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
-  let snapshot = buildSingleJobSnapshot(cwd, reference);
+  let snapshot = buildSingleJobSnapshot(workspaceRoot, reference, options);
 
   while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
-    snapshot = buildSingleJobSnapshot(cwd, reference);
+    snapshot = buildSingleJobSnapshot(workspaceRoot, reference, options);
   }
 
   return {
@@ -404,14 +481,7 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
-    prompt,
-    model: request.model,
-    sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
-  });
+  const result = await runAppServerTurn(context.repoRoot, buildAdversarialReviewTurnOptions(context, request, focusText));
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
@@ -454,7 +524,7 @@ async function executeReviewRun(request) {
   };
 }
 
-
+// Lease and tracked-job ownership live at command-handler boundaries; executeTaskRun must not acquire resource leases or write job state internally.
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureCodexAvailable(request.cwd);
@@ -487,8 +557,9 @@ async function executeTaskRun(request) {
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
-    persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    persistThread: request.persistThread !== false,
+    // Internal role turns use the disabled thread-name shape: { threadName: null }.
+    threadName: request.persistThread === false ? null : (resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT))
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -526,11 +597,49 @@ async function executeTaskRun(request) {
   };
 }
 
-function buildReviewJobMetadata(reviewName, target) {
+export function renderReviewContextForPrompt(context) {
+  const changedFiles = Array.isArray(context.changedFiles) && context.changedFiles.length
+    ? context.changedFiles.join("\n")
+    : "No changed-file list available.";
+  const body = String(context.content || "").trim();
+  const inputMode = context.inputMode || "unknown";
+  const targetMode = context.mode ?? context.target?.mode ?? "unknown";
+  return [
+    `Target: ${context.target?.label || "unknown"}`,
+    `Target mode: ${targetMode}`,
+    `Repository: ${context.repoRoot || context.cwd || "unknown"}`,
+    `Branch: ${context.branch || "unknown"}`,
+    `Summary: ${context.summary || "No summary available."}`,
+    `Input mode: ${inputMode}`,
+    `Files: ${context.fileCount ?? "unknown"}`,
+    `Diff bytes: ${context.diffBytes ?? "unknown"}`,
+    "",
+    "Collection guidance:",
+    context.collectionGuidance || "Inspect the repository read-only before finalizing findings.",
+    "",
+    "Changed files:",
+    changedFiles,
+    "",
+    "Repository context:",
+    body || "No inline context was collected; inspect the target read-only before finalizing findings."
+  ].join("\n");
+}
+
+export function buildMultiReviewRolePrompt(context, role) {
+  const template = loadPromptTemplate(ROOT_DIR, "multi-review-role");
+  return interpolateTemplate(template, {
+    ROLE_TITLE: role.title,
+    ROLE_FOCUS: role.focus,
+    REVIEW_CONTEXT: renderReviewContextForPrompt(context)
+  });
+}
+
+export function buildReviewJobMetadata(reviewName, target, quality = null) {
+  const suffix = quality ? ` quality=${quality.quality}` : "";
   return {
     kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
     title: reviewName === "Review" ? "Codex Review" : `Codex ${reviewName}`,
-    summary: `${reviewName} ${target.label}`
+    summary: `${reviewName} ${target.label}${suffix}`
   };
 }
 
@@ -581,6 +690,7 @@ function createTrackedProgress(job, options = {}) {
     progress: createProgressReporter({
       stderr: Boolean(options.stderr),
       logFile,
+      job,
       onEvent: createJobProgressUpdater(job.workspaceRoot, job.id)
     })
   };
@@ -606,8 +716,24 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    backgroundLeaseId: null
   };
+}
+
+function verifyStopGateChildTask() {
+  if (process.env.CODEX_FOR_CLAUDE_STOP_GATE_CHILD !== "1") {
+    return false;
+  }
+  const verification = verifyResourceLease(process.env.CODEX_FOR_CLAUDE_PARENT_STOP_GATE_LEASE_ID, "stop-gate", {
+    env: process.env,
+    expectedParentPid: process.ppid,
+    expectedCommand: "stop-review-gate"
+  });
+  if (!verification.ok) {
+    throw new Error(`Stop gate child lease verification failed: ${verification.reason || "invalid parent stop-gate lease"}.`);
+  }
+  return true;
 }
 
 function readTaskPrompt(cwd, options, positionals) {
@@ -651,21 +777,170 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+function sharedBackgroundJobPatch(job, patch) {
+  const { request, backgroundLease, backgroundLeaseId, lease, ...metadata } = job;
+  return {
+    ...metadata,
+    ...patch
+  };
+}
+
+function backgroundSessionEndedError(job) {
+  const error = new Error(`Claude session ${job.sessionId} ended before background task ${job.id} could start.`);
+  error.code = "ESESSIONENDED";
+  return error;
+}
+
+function removeBackgroundJobForEndedSession(job, childPid = null) {
+  if (Number.isInteger(childPid) && childPid > 0) {
+    try {
+      terminateProcessTree(childPid);
+    } catch {
+      // Best-effort cleanup only; the session lifecycle hook also tears down matching jobs.
+    }
+  }
+  updateState(job.workspaceRoot, (state) => {
+    state.jobs = state.jobs.filter((item) => item.id !== job.id);
+  });
+  removeJobSidecar(job.workspaceRoot, job);
+}
+
+function throwIfBackgroundSessionEnded(job, childPid = null) {
+  if (!job.sessionId || !hasEndedSession(job.workspaceRoot, job.sessionId)) {
+    return;
+  }
+  removeBackgroundJobForEndedSession(job, childPid);
+  throw backgroundSessionEndedError(job);
+}
+
+function recordBackgroundLaunchFailure(job, queuedRecord, logFile, error, dependencies = {}) {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const completedAt = nowIso();
+  const failedRecord = {
+    ...queuedRecord,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage,
+    completedAt
+  };
+  appendLogLine(logFile, `Failed to start background task worker: ${errorMessage}`);
+  if (!upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    logFile,
+    ...(queuedRecord.governorVersion ? { governorVersion: queuedRecord.governorVersion } : {}),
+    errorMessage,
+    completedAt
+  }))) {
+    removeBackgroundJobForEndedSession(queuedRecord);
+    throw backgroundSessionEndedError(queuedRecord);
+  }
+  dependencies.beforeFailedJobFileWrite?.(failedRecord);
+  const failedJobFile = writeJobFile(job.workspaceRoot, job.id, failedRecord);
+  if (!failedJobFile) {
+    removeBackgroundJobForEndedSession(failedRecord);
+    throw backgroundSessionEndedError(failedRecord);
+  }
+}
+
+function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies = {}) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
-
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  const governorEnabledLease = !backgroundLease.disabled;
+  const spawnTaskWorker = dependencies.spawnTaskWorker ?? spawnDetachedTaskWorker;
+  const transferLease = dependencies.transferResourceLease ?? transferResourceLease;
+  let transferred = false;
+  let childPid = null;
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
-    request
+    ...(governorEnabledLease ? { governorVersion: 1 } : {}),
+    request: {
+      ...request,
+      backgroundLeaseId: backgroundLease.lease?.id ?? null
+    }
   };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+
+  try {
+    throwIfBackgroundSessionEnded(queuedRecord);
+    const queuedStateApplied = upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
+      status: "queued",
+      phase: "queued",
+      pid: null,
+      logFile,
+      ...(governorEnabledLease ? { governorVersion: 1 } : {})
+    }));
+    if (!queuedStateApplied) {
+      removeBackgroundJobForEndedSession(queuedRecord);
+      throw backgroundSessionEndedError(queuedRecord);
+    }
+    dependencies.afterQueuedStatePublished?.(queuedRecord);
+    throwIfBackgroundSessionEnded(queuedRecord);
+    dependencies.beforeQueuedJobFileWrite?.(queuedRecord);
+    const queuedJobFile = writeJobFile(job.workspaceRoot, job.id, queuedRecord);
+    if (!queuedJobFile) {
+      removeBackgroundJobForEndedSession(queuedRecord);
+      throw backgroundSessionEndedError(queuedRecord);
+    }
+    throwIfBackgroundSessionEnded(queuedRecord);
+
+    const child = spawnTaskWorker(cwd, job.id);
+    childPid = child.pid;
+    if (!Number.isInteger(child.pid) || child.pid <= 0) {
+      throw new Error("Failed to start background task worker: missing worker pid.");
+    }
+
+    if (governorEnabledLease && !transferLease(backgroundLease.lease?.id, child.pid, process.env, { keepTransferable: true })) {
+      throw new Error("Failed to transfer background resource lease to task worker.");
+    }
+    transferred = governorEnabledLease;
+    throwIfBackgroundSessionEnded(queuedRecord, child.pid);
+
+    const spawnedRecord = {
+      ...queuedRecord,
+      pid: child.pid
+    };
+    const spawnedStateApplied = upsertJob(job.workspaceRoot, sharedBackgroundJobPatch(job, {
+      status: "queued",
+      phase: "queued",
+      pid: child.pid,
+      logFile,
+      ...(governorEnabledLease ? { governorVersion: 1 } : {})
+    }));
+    if (!spawnedStateApplied) {
+      removeBackgroundJobForEndedSession(spawnedRecord, child.pid);
+      throw backgroundSessionEndedError(spawnedRecord);
+    }
+    dependencies.afterSpawnedStatePublished?.(spawnedRecord);
+    throwIfBackgroundSessionEnded(spawnedRecord, child.pid);
+    dependencies.beforeSpawnedJobFileWrite?.(spawnedRecord);
+    const spawnedJobFile = writeJobFile(job.workspaceRoot, job.id, spawnedRecord);
+    if (!spawnedJobFile) {
+      removeBackgroundJobForEndedSession(spawnedRecord, child.pid);
+      throw backgroundSessionEndedError(spawnedRecord);
+    }
+    throwIfBackgroundSessionEnded(spawnedRecord, child.pid);
+  } catch (error) {
+    if (error?.code === "ESESSIONENDED") {
+      backgroundLease.release();
+      throw error;
+    }
+    if (queuedRecord.sessionId && hasEndedSession(queuedRecord.workspaceRoot, queuedRecord.sessionId)) {
+      backgroundLease.release();
+      removeBackgroundJobForEndedSession(queuedRecord, childPid);
+      throw backgroundSessionEndedError(queuedRecord);
+    }
+    if (!transferred) {
+      backgroundLease.release();
+    }
+    recordBackgroundLaunchFailure(job, queuedRecord, logFile, error, dependencies);
+    throw error;
+  }
 
   return {
     payload: {
@@ -679,47 +954,103 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
 }
 
+function processAlive(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function jobTimestampMs(job) {
+  const values = [job?.updatedAt, job?.createdAt].map((value) => Date.parse(String(value ?? "")));
+  const parsed = values.find((value) => Number.isFinite(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function shouldReclaimBackgroundLease(storedJob, claim) {
+  if (storedJob?.status !== "queued" || storedJob?.startedAt) {
+    return false;
+  }
+  if (processAlive(storedJob.pid)) {
+    return false;
+  }
+  if (Number(claim?.active ?? 0) > 0) {
+    return false;
+  }
+  const leaseState = claim?.leaseState;
+  if (!leaseState?.exists || leaseState.kind !== "background-job" || !leaseState.stale) {
+    return false;
+  }
+  if (!leaseState.transferable || leaseState.claimed) {
+    return false;
+  }
+  const timestampMs = jobTimestampMs(storedJob);
+  if (!Number.isFinite(timestampMs)) {
+    return false;
+  }
+  const ageMs = Date.now() - timestampMs;
+  return ageMs >= STALE_BACKGROUND_HANDOFF_MS;
+}
+
 async function handleReviewCommand(argv, config) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+  const { options, positionals } = parseStrictCommandInput("review", argv, {
+    valueOptions: ["base", "scope", "model", "cwd", "quality"],
     booleanOptions: ["json", "background", "wait"],
-    aliasMap: {
-      m: "model"
-    }
+    aliasMap: { C: "cwd", m: "model" }
   });
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const focusText = positionals.join(" ").trim();
-  const target = resolveReviewTarget(cwd, {
-    base: options.base,
-    scope: options.scope
+  const resourceLease = acquireResourceLease("model-call", {
+    env: process.env,
+    command: config.reviewName === "Adversarial Review" ? "adversarial-review" : "review"
   });
+  if (!resourceLease.ok) {
+    throw capacityBlockedError(resourceLease);
+  }
 
-  config.validateRequest?.(target, focusText);
-  const metadata = buildReviewJobMetadata(config.reviewName, target);
-  const job = createCompanionJob({
-    prefix: "review",
-    kind: metadata.kind,
-    title: metadata.title,
-    workspaceRoot,
-    jobClass: "review",
-    summary: metadata.summary
-  });
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  try {
+    const focusText = positionals.join(" ").trim();
+    const target = resolveReviewTarget(cwd, {
+      base: options.base,
+      scope: options.scope
+    });
+
+    config.validateRequest?.(target, focusText);
+    const quality = resolveQuality(options.quality || "standard");
+    const metadata = buildReviewJobMetadata(config.reviewName, target, quality);
+    const job = createCompanionJob({
+      prefix: "review",
+      kind: metadata.kind,
+      title: metadata.title,
+      workspaceRoot,
+      jobClass: "review",
+      summary: metadata.summary
+    });
+    await runForegroundCommand(
+      job,
+      (progress) =>
+        executeReviewRun({
+          cwd,
+          base: options.base,
+          scope: options.scope,
+          model: options.model,
+          focusText,
+          reviewName: config.reviewName,
+          effort: config.reviewName === "Adversarial Review" ? quality.effort : null,
+          onProgress: progress
+        }),
+      { json: options.json }
+    );
+  } finally {
+    resourceLease.release();
+  }
 }
 
 async function handleReview(argv) {
@@ -730,19 +1061,20 @@ async function handleReview(argv) {
 }
 
 async function handleTask(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+  const { options, positionals } = parseStrictCommandInput("task", argv, {
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "quality"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
-    aliasMap: {
-      m: "model"
-    }
+    aliasMap: { C: "cwd", m: "model" },
+    promptAfterFirstPositional: true
   });
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const quality = resolveQuality(options.quality || "standard");
+  const effort = normalizeReasoningEffort(options.effort || quality.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
+  const stopGateChild = verifyStopGateChildTask();
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
@@ -756,10 +1088,24 @@ async function handleTask(argv) {
   });
 
   if (options.background) {
-    ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
-
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const backgroundLease = acquireResourceLease("background-job", {
+      env: process.env,
+      transferable: true,
+      pid: 0,
+      command: "task-worker",
+      jobId: job.id
+    });
+    if (!backgroundLease.ok) {
+      throw capacityBlockedError(backgroundLease);
+    }
+    try {
+      ensureCodexAvailable(cwd);
+      requireTaskRequest(prompt, resumeLast);
+    } catch (error) {
+      backgroundLease.release();
+      throw error;
+    }
     const request = buildTaskRequest({
       cwd,
       model,
@@ -769,26 +1115,36 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = enqueueBackgroundTask(cwd, job, request, backgroundLease);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
+  const foregroundJob = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const runForegroundTask = async () =>
+    runForegroundCommand(
+      foregroundJob,
+      (progress) =>
+        executeTaskRun({
+          cwd,
+          model,
+          effort,
+          prompt,
+          write,
+          resumeLast,
+          jobId: foregroundJob.id,
+          onProgress: progress
+        }),
+      { json: options.json }
+    );
+  if (stopGateChild) {
+    await runForegroundTask();
+    return;
+  }
+  await withResourceLease(
+    "model-call",
+    { env: process.env, command: "task" },
+    runForegroundTask
   );
 }
 
@@ -813,28 +1169,62 @@ async function handleTaskWorker(argv) {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
   }
 
-  const { logFile, progress } = createTrackedProgress(
-    {
-      ...storedJob,
-      workspaceRoot
-    },
-    {
-      logFile: storedJob.logFile ?? null
+  let workerLease = { release() {} };
+  if (storedJob.governorVersion === 1) {
+    let claim = request.backgroundLeaseId
+      ? claimResourceLease(request.backgroundLeaseId, "background-job", process.env)
+      : claimResourceLease(null, "background-job", process.env);
+    if (!request.backgroundLeaseId && !claim.ok) {
+      throw new Error(`Stored job ${options["job-id"]} is missing its background resource lease.`);
     }
-  );
-  await runTrackedJob(
-    {
-      ...storedJob,
-      workspaceRoot,
-      logFile
-    },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
-    { logFile }
-  );
+    if (!claim.ok && String(claim.reason || "").includes("lease is not claimable") && shouldReclaimBackgroundLease(storedJob, claim)) {
+      claim = acquireResourceLease("background-job", {
+        env: process.env,
+        command: "task-worker-reclaim",
+        jobId: storedJob.id
+      });
+      if (!claim.ok) {
+        const error = new Error(capacityBlockedMessage(claim));
+        error.status = 75;
+        error.code = "ECAPACITY";
+        throw error;
+      }
+    }
+    if (!claim.ok) {
+      throw new Error(claim.reason || "Failed to claim background resource lease.");
+    }
+    workerLease = claim;
+  }
+
+  try {
+    const trackedJob = sharedBackgroundJobPatch(
+      {
+        ...storedJob,
+        workspaceRoot
+      },
+      {}
+    );
+    const { logFile, progress } = createTrackedProgress(
+      trackedJob,
+      {
+        logFile: storedJob.logFile ?? null
+      }
+    );
+    await runTrackedJob(
+      {
+        ...trackedJob,
+        logFile
+      },
+      () =>
+        executeTaskRun({
+          ...request,
+          onProgress: progress
+        }),
+      { logFile }
+    );
+  } finally {
+    workerLease.release();
+  }
 }
 
 async function handleStatus(argv) {
@@ -844,14 +1234,22 @@ async function handleStatus(argv) {
   });
 
   const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  try {
+    releaseTerminalJobLeasesForWorkspace(workspaceRoot, process.env);
+    reapStaleResourceLeases(process.env);
+  } catch {
+    // Status cleanup is advisory; rendering current job state is more important.
+  }
   const reference = positionals[0] ?? "";
   if (reference) {
     const snapshot = options.wait
-      ? await waitForSingleJobSnapshot(cwd, reference, {
+      ? await waitForSingleJobSnapshot(workspaceRoot, reference, {
           timeoutMs: options["timeout-ms"],
-          pollIntervalMs: options["poll-interval-ms"]
+          pollIntervalMs: options["poll-interval-ms"],
+          all: options.all
         })
-      : buildSingleJobSnapshot(cwd, reference);
+      : buildSingleJobSnapshot(workspaceRoot, reference, { all: options.all });
     outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
     return;
   }
@@ -860,7 +1258,7 @@ async function handleStatus(argv) {
     throw new Error("`status --wait` requires a job id.");
   }
 
-  const report = buildStatusSnapshot(cwd, { all: options.all });
+  const report = buildStatusSnapshot(workspaceRoot, { all: options.all });
   outputResult(renderStatusPayload(report, options.json), options.json);
 }
 
@@ -926,11 +1324,28 @@ async function handleCancel(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
+  if (hasEndedSession(workspaceRoot, job.sessionId)) {
+    removeJobSidecar(workspaceRoot, job);
+    throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
+  }
+  let existing = {};
+  try {
+    existing = readStoredJob(workspaceRoot, job.id) ?? {};
+  } catch (error) {
+    if (hasEndedSession(workspaceRoot, job.sessionId) || error?.code === "ENOENT") {
+      removeJobSidecar(workspaceRoot, job);
+      throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
+    }
+    throw error;
+  }
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  if (hasEndedSession(workspaceRoot, job.sessionId)) {
+    removeJobSidecar(workspaceRoot, job);
+    throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
+  }
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -953,19 +1368,27 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
+  if (!upsertJob(workspaceRoot, {
     id: job.id,
+    sessionId: job.sessionId,
     status: "cancelled",
     phase: "cancelled",
     pid: null,
     errorMessage: "Cancelled by user.",
     completedAt
+  })) {
+    removeJobSidecar(workspaceRoot, job);
+    throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
+  }
+  const cancelledJobFile = writeJobFile(workspaceRoot, job.id, {
+    ...existing,
+    ...nextJob,
+    cancelledAt: completedAt
   });
+  if (!cancelledJobFile) {
+    removeJobSidecar(workspaceRoot, nextJob);
+    throw new Error(`Claude session ${job.sessionId} ended before job ${job.id} could be cancelled.`);
+  }
 
   const payload = {
     jobId: job.id,
@@ -976,6 +1399,175 @@ async function handleCancel(argv) {
   };
 
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+}
+
+function renderReleaseCheckDetail(detail) {
+  if (detail == null) {
+    return "";
+  }
+  if (typeof detail === "string") {
+    return detail;
+  }
+  return JSON.stringify(detail);
+}
+
+function handleReleaseCheck(argv) {
+  const { options, positionals } = parseStrictCommandInput("release-check", argv, {
+    booleanOptions: ["json", "ci-simulate", "require-codex-cli"]
+  });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected release-check argument: ${positionals.join(" ")}`);
+  }
+
+  const report = runReleaseCheck(process.cwd(), {
+    ciSimulate: Boolean(options["ci-simulate"]),
+    requireCodexCli: Boolean(options["require-codex-cli"])
+  });
+
+  if (options.json) {
+    outputResult(report, true);
+  } else {
+    for (const item of report.checks) {
+      const detail = renderReleaseCheckDetail(item.detail);
+      console.log(`${item.ok ? "PASS" : "FAIL"} ${item.name}${detail ? ` ${detail}` : ""}`);
+    }
+  }
+
+  if (!report.ok) {
+    process.exitCode = 1;
+  }
+}
+
+function renderGithubActionsValidation(payload) {
+  return `${payload.checks.map((item) => `${item.ok ? "PASS" : "FAIL"} ${item.name}`).join("\n")}\n`;
+}
+
+function handleGithubActions(argv) {
+  const { action = "render", options, positionals } = parseStrictCommandInput("github-actions", argv, {
+    actions: ["render", "validate", "init"],
+    valueOptions: ["ref"],
+    booleanOptions: ["force", "json"]
+  });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected github-actions argument: ${positionals.join(" ")}`);
+  }
+  if (options.json && action !== "validate") {
+    throw new Error("github-actions --json is only supported for validate.");
+  }
+
+  const rendered = renderWorkflow({ ref: options.ref });
+  if (action === "render") {
+    process.stdout.write(rendered);
+    return;
+  }
+
+  if (action === "validate") {
+    const payload = validateWorkflow(rendered);
+    outputResult(options.json ? payload : renderGithubActionsValidation(payload), options.json);
+    process.exitCode = payload.ok || (payload.preview && payload.structuralOk) ? 0 : 1;
+    return;
+  }
+
+  if (action === "init") {
+    const target = writeWorkflow(process.cwd(), rendered, { force: Boolean(options.force) });
+    process.stdout.write(`Wrote ${target}\n`);
+    return;
+  }
+
+  throw new Error("github-actions action must be render, validate, or init.");
+}
+
+async function handleMultiReview(argv) {
+  const { options, positionals } = parseStrictCommandInput("multi-review", argv, {
+    valueOptions: ["roles", "role-pack", "base", "scope", "model", "quality", "cwd"],
+    booleanOptions: ["json"],
+    aliasMap: { C: "cwd", m: "model" }
+  });
+  if (positionals.length > 0) {
+    throw new Error(`Unexpected multi-review argument: ${positionals.join(" ")}`);
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const commandLease = acquireResourceLease("model-call", {
+    env: process.env,
+    command: "multi-review"
+  });
+  if (!commandLease.ok) {
+    throw capacityBlockedError(commandLease);
+  }
+
+  try {
+    const workspaceRoot = resolveCommandWorkspace(options);
+    const target = resolveReviewTarget(cwd, {
+      base: options.base,
+      scope: options.scope
+    });
+    const roles = resolveRoles({ roles: options.roles, rolePack: options["role-pack"] || "default" });
+    const model = normalizeRequestedModel(options.model);
+    const quality = resolveQuality(options.quality || "standard");
+    const job = createCompanionJob({
+      prefix: "review",
+      kind: "multi-review",
+      title: "Codex Multi-Review",
+      workspaceRoot,
+      jobClass: "review",
+      summary: `${roles.length} roles for ${target.label}`
+    });
+    await runForegroundCommand(
+      job,
+      async (progress) => {
+        const context = collectReviewContext(cwd, target);
+        const results = [];
+        for (const role of roles) {
+          try {
+            const prompt = buildMultiReviewRolePrompt(context, role);
+            const result = await executeTaskRun({
+              cwd: context.repoRoot,
+              prompt,
+              model,
+              effort: quality.effort,
+              write: false,
+              resumeLast: false,
+              persistThread: false,
+              jobId: job.id,
+              onProgress: progress
+            });
+            const status = Number.isFinite(Number(result.exitStatus)) ? Number(result.exitStatus) : 0;
+            results.push({
+              role: role.id,
+              title: role.title,
+              status,
+              output: result.payload?.rawOutput ?? "",
+              reasoningSummary: result.payload?.reasoningSummary ?? null
+            });
+          } catch (error) {
+            const message = redactMachinePaths(error instanceof Error ? error.message : String(error));
+            results.push({
+              role: role.id,
+              title: role.title,
+              status: 1,
+              output: `Role failed: ${message}`,
+              reasoningSummary: null,
+              error: message
+            });
+          }
+        }
+        const rendered = results.map((item) => `## ${item.title}\n\n${item.output || "No output."}`).join("\n\n");
+        return {
+          exitStatus: results.every((item) => item.status === 0) ? 0 : 1,
+          payload: { target, quality, roles: results },
+          rendered,
+          summary: `Multi-review finished for ${target.label}.`,
+          jobTitle: "Codex Multi-Review",
+          jobClass: "review",
+          targetLabel: target.label
+        };
+      },
+      { json: options.json }
+    );
+  } finally {
+    commandLease.release?.();
+  }
 }
 
 async function main() {
@@ -989,6 +1581,9 @@ async function main() {
     case "setup":
       await handleSetup(argv);
       break;
+    case "doctor":
+      handleDoctor(argv);
+      break;
     case "review":
       await handleReview(argv);
       break;
@@ -996,6 +1591,9 @@ async function main() {
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
+      break;
+    case "multi-review":
+      await handleMultiReview(argv);
       break;
     case "task":
       await handleTask(argv);
@@ -1009,6 +1607,12 @@ async function main() {
     case "result":
       handleResult(argv);
       break;
+    case "github-actions":
+      handleGithubActions(argv);
+      break;
+    case "release-check":
+      handleReleaseCheck(argv);
+      break;
     case "task-resume-candidate":
       handleTaskResumeCandidate(argv);
       break;
@@ -1020,8 +1624,31 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+function isDirectEntrypoint() {
+  if (!process.argv[1]) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectEntrypoint()) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    if (error?.code === "ECAPACITY" || error?.status === 75) {
+      process.exitCode = 75;
+      return;
+    }
+    process.exitCode = 1;
+  });
+}
+
+export const __testHooks = {
+  enqueueBackgroundTask,
+  handleCancel,
+  shouldReclaimBackgroundLease
+};

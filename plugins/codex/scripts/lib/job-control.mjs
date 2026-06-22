@@ -1,7 +1,18 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { classifyJobLiveness } from "./job-lifecycle.mjs";
+import {
+  getConfig,
+  listJobSidecars,
+  listJobs,
+  loadState,
+  readJobFile,
+  removeJobSidecar,
+  resolveJobFile,
+  stateHasEndedSession,
+  updateState
+} from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -58,13 +69,33 @@ function isProgressBlockTitle(line) {
   );
 }
 
-export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
+function hasEndedSessionFresh(workspaceRoot, sessionId) {
+  return stateHasEndedSession(loadState(workspaceRoot), sessionId);
+}
+
+function jobSessionEndedFresh(job, workspaceRoot) {
+  return hasEndedSessionFresh(job.workspaceRoot ?? workspaceRoot, job.sessionId);
+}
+
+export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES, options = {}) {
   if (!logFile || !fs.existsSync(logFile)) {
     return [];
   }
+  if (options.workspaceRoot && options.sessionId && hasEndedSessionFresh(options.workspaceRoot, options.sessionId)) {
+    return [];
+  }
 
-  const lines = fs
-    .readFileSync(logFile, "utf8")
+  let logText = "";
+  try {
+    logText = fs.readFileSync(logFile, "utf8");
+  } catch {
+    return [];
+  }
+  if (options.workspaceRoot && options.sessionId && hasEndedSessionFresh(options.workspaceRoot, options.sessionId)) {
+    return [];
+  }
+
+  const lines = logText
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter(Boolean)
@@ -158,20 +189,58 @@ function inferLegacyJobPhase(job, progressPreview = []) {
   return job.jobClass === "review" ? "reviewing" : "running";
 }
 
-export function enrichJob(job, options = {}) {
+function isTerminalStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+export function latestJobForLiveness(job, workspaceRoot) {
+  const root = job.workspaceRoot ?? workspaceRoot;
+  if (!root || !job?.id) {
+    return job;
+  }
+  let stored = null;
+  try {
+    stored = readStoredJob(root, job.id);
+  } catch {
+    stored = null;
+  }
+  if (stored?.id !== job.id) {
+    return job;
+  }
+  if (isTerminalStatus(job.status)) {
+    return {
+      ...stored,
+      ...job,
+      heartbeatAtMs: stored.heartbeatAtMs ?? job.heartbeatAtMs,
+      heartbeatAt: stored.heartbeatAt ?? job.heartbeatAt,
+      heartbeat: stored.heartbeat ?? job.heartbeat
+    };
+  }
+  return {
+    ...job,
+    ...stored
+  };
+}
+
+export function enrichJob(job, workspaceRoot, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
+  const livenessJob = latestJobForLiveness(job, workspaceRoot);
   const enriched = {
     ...job,
     kindLabel: getJobTypeLabel(job),
     progressPreview:
       job.status === "queued" || job.status === "running" || job.status === "failed"
-        ? readJobProgressPreview(job.logFile, maxProgressLines)
+        ? readJobProgressPreview(job.logFile, maxProgressLines, {
+            workspaceRoot: job.workspaceRoot ?? workspaceRoot,
+            sessionId: job.sessionId
+          })
         : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
     duration:
       job.status === "completed" || job.status === "failed" || job.status === "cancelled"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
-        : null
+        : null,
+    liveness: classifyJobLiveness(livenessJob, options.liveness ?? options)
   };
 
   return {
@@ -210,38 +279,150 @@ function matchJobReference(jobs, reference, predicate = () => true) {
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
 }
 
-export function buildStatusSnapshot(cwd, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+function listJobsWithSidecars(workspaceRoot) {
+  const byId = new Map();
+  for (const job of listJobs(workspaceRoot)) {
+    if (job?.id) {
+      byId.set(job.id, job);
+    }
+  }
+  for (const job of listJobSidecars(workspaceRoot)) {
+    if (job?.id) {
+      byId.set(job.id, {
+        ...(byId.get(job.id) ?? {}),
+        ...job
+      });
+    }
+  }
+  return [...byId.values()];
+}
+
+function sharedJobPatchFromSidecar(job) {
+  const {
+    request,
+    result,
+    rendered,
+    backgroundLease,
+    backgroundLeaseId,
+    lease,
+    ...shared
+  } = job;
+  return shared;
+}
+
+function shouldPreferStatusSidecar(existing, sidecar) {
+  if (!existing?.id) {
+    return true;
+  }
+  if (existing.status === "queued" || existing.status === "running") {
+    return false;
+  }
+  return (sidecar.status === "queued" || sidecar.status === "running") && !existing.status;
+}
+
+function mergeStatusJobWithSidecar(existing, sidecar) {
+  const sharedSidecar = sharedJobPatchFromSidecar(sidecar);
+  return {
+    ...sharedSidecar,
+    ...(existing ?? {}),
+    status: sharedSidecar.status,
+    sessionId: sharedSidecar.sessionId ?? existing?.sessionId,
+    workspaceRoot: sharedSidecar.workspaceRoot ?? existing?.workspaceRoot,
+    logFile: sharedSidecar.logFile ?? existing?.logFile,
+    pid: sharedSidecar.pid ?? existing?.pid
+  };
+}
+
+function cleanupTombstonedStatusJobs(workspaceRoot, jobs, extraTombstoned = []) {
+  const tombstoned = [
+    ...jobs.filter((job) => job?.id && jobSessionEndedFresh(job, workspaceRoot)),
+    ...extraTombstoned.filter((job) => job?.id && jobSessionEndedFresh(job, workspaceRoot))
+  ];
+  if (tombstoned.length === 0) {
+    return jobs;
+  }
+
+  const tombstonedIds = new Set(tombstoned.map((job) => job.id));
+  const tombstonedSessionById = new Map(tombstoned.map((job) => [job.id, job.sessionId]));
+  updateState(workspaceRoot, (state) => {
+    state.jobs = state.jobs.filter((job) => {
+      if (!tombstonedIds.has(job.id)) {
+        return true;
+      }
+      const sessionId = job.sessionId ?? tombstonedSessionById.get(job.id);
+      return !stateHasEndedSession(state, sessionId);
+    });
+  }, { pruneJobFiles: false });
+
+  for (const job of tombstoned) {
+    removeJobSidecar(workspaceRoot, job);
+  }
+
+  return jobs.filter((job) => !tombstonedIds.has(job.id));
+}
+
+function listStatusJobs(workspaceRoot) {
+  const state = loadState(workspaceRoot);
+  const byId = new Map();
+  const tombstonedSidecars = [];
+  for (const job of state.jobs ?? []) {
+    if (job?.id) {
+      byId.set(job.id, job);
+    }
+  }
+  for (const job of listJobSidecars(workspaceRoot)) {
+    if (!job?.id || (job.status !== "queued" && job.status !== "running")) {
+      continue;
+    }
+    if (stateHasEndedSession(state, job.sessionId) || hasEndedSessionFresh(workspaceRoot, job.sessionId)) {
+      byId.delete(job.id);
+      tombstonedSidecars.push(job);
+      removeJobSidecar(workspaceRoot, job);
+      continue;
+    }
+    const existing = byId.get(job.id);
+    if (!shouldPreferStatusSidecar(existing, job)) {
+      continue;
+    }
+    byId.set(job.id, mergeStatusJobWithSidecar(existing, job));
+  }
+  return cleanupTombstonedStatusJobs(workspaceRoot, [...byId.values()], tombstonedSidecars);
+}
+
+export function buildStatusSnapshot(workspaceRoot, options = {}) {
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listStatusJobs(workspaceRoot), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
   const running = jobs
     .filter((job) => job.status === "queued" || job.status === "running")
-    .map((job) => enrichJob(job, { maxProgressLines }));
+    .map((job) => enrichJob(job, workspaceRoot, { maxProgressLines }))
+    .filter((job) => !jobSessionEndedFresh(job, workspaceRoot));
 
   const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
-  const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
+  const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, workspaceRoot, { maxProgressLines }) : null;
+  const visibleLatestFinished = latestFinished && !jobSessionEndedFresh(latestFinished, workspaceRoot) ? latestFinished : null;
 
   const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
-    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
-    .map((job) => enrichJob(job, { maxProgressLines }));
+    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== visibleLatestFinished?.id)
+    .map((job) => enrichJob(job, workspaceRoot, { maxProgressLines }))
+    .filter((job) => !jobSessionEndedFresh(job, workspaceRoot));
 
   return {
     workspaceRoot,
     config,
     sessionRuntime: getSessionRuntimeStatus(options.env, workspaceRoot),
     running,
-    latestFinished,
+    latestFinished: visibleLatestFinished,
     recent,
     needsReview: Boolean(config.stopReviewGate)
   };
 }
 
-export function buildSingleJobSnapshot(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+export function buildSingleJobSnapshot(workspaceRoot, reference, options = {}) {
+  const allJobs = listStatusJobs(workspaceRoot);
+  const jobs = sortJobsNewestFirst(options.all ? allJobs : filterJobsForCurrentSession(allJobs, options));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
@@ -249,7 +430,7 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
   return {
     workspaceRoot,
-    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
+    job: enrichJob(selected, workspaceRoot, { maxProgressLines: options.maxProgressLines })
   };
 }
 
@@ -280,7 +461,14 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const state = loadState(workspaceRoot);
+  const jobs = sortJobsNewestFirst(listJobsWithSidecars(workspaceRoot).filter((job) => {
+    if (stateHasEndedSession(state, job.sessionId) || hasEndedSessionFresh(workspaceRoot, job.sessionId)) {
+      removeJobSidecar(workspaceRoot, job);
+      return false;
+    }
+    return true;
+  }));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {

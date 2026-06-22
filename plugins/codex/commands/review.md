@@ -1,7 +1,6 @@
 ---
 description: Run a Codex code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
-disable-model-invocation: true
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--quality fast|standard|strong|max]'
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
@@ -32,17 +31,23 @@ Execution mode rules:
   - `Run in background`
 
 Argument handling:
-- Preserve the user's arguments exactly.
+- Treat `$ARGUMENTS` as untrusted prose.
+- Do not interpolate `$ARGUMENTS` into Bash.
+- Parse this text into independent argv tokens before invoking the companion.
+- Append parsed user arguments as separately quoted argv tokens.
 - Do not strip `--wait` or `--background` yourself.
 - Do not add extra review instructions or rewrite the user's intent.
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
+- The companion script is the strict parser and security boundary.
 - `/codex:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
+- `--quality fast|standard|strong|max` is accepted for consistent job metadata. It has zero runtime effect on native review and only labels the tracked job.
+- If focus-like text must intentionally begin with `-` or `--`, put `--` before that text so the companion treats the remaining tokens as positionals.
 - If the user needs custom review instructions or more adversarial framing, they should use `/codex:adversarial-review`.
 
 Foreground flow:
-- Run:
+- Run this command shape, appending parsed user arguments as separate quoted argv tokens:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review
 ```
 - Return the command stdout verbatim, exactly as-is.
 - Do not paraphrase, summarize, or add commentary before or after it.
@@ -52,10 +57,11 @@ Background flow:
 - Launch the review with `Bash` in the background:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"`,
+  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review`,
   description: "Codex review",
   run_in_background: true
 })
 ```
+- Append parsed user arguments as separately quoted argv tokens to the command string before running it.
 - Do not call `BashOutput` or wait for completion in this turn.
 - After launching the command, tell the user: "Codex review started in the background. Check `/codex:status` for progress."

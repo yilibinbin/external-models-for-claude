@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { listJobSidecars, loadState, markSessionEnded, removeJobSidecar, updateState } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -44,33 +44,53 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const stateFile = resolveStateFile(workspaceRoot);
-  if (!fs.existsSync(stateFile)) {
-    return;
-  }
-
   const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
-  }
+  const initiallyRemovedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  const initiallyRemovedIds = new Set(initiallyRemovedJobs.map((job) => job.id));
 
-  for (const job of removedJobs) {
+  const terminateJob = (job) => {
     const stillRunning = job.status === "queued" || job.status === "running";
     if (!stillRunning) {
-      continue;
+      return;
     }
     try {
       terminateProcessTree(job.pid ?? Number.NaN);
     } catch {
       // Ignore teardown failures during session shutdown.
     }
+  };
+
+  for (const job of initiallyRemovedJobs) {
+    terminateJob(job);
   }
 
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+  let removedJobs = [];
+  updateState(workspaceRoot, (state) => {
+    markSessionEnded(state, sessionId);
+    removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
   });
+
+  const removedById = new Map(removedJobs.map((job) => [job.id, job]));
+  for (const job of listJobSidecars(workspaceRoot)) {
+    if (job.sessionId === sessionId && !removedById.has(job.id)) {
+      removedById.set(job.id, job);
+    }
+  }
+
+  if (removedById.size === 0) {
+    return;
+  }
+
+  for (const job of removedById.values()) {
+    if (!initiallyRemovedIds.has(job.id)) {
+      terminateJob(job);
+    }
+  }
+
+  for (const job of removedById.values()) {
+    removeJobSidecar(workspaceRoot, job);
+  }
 }
 
 function handleSessionStart(input) {

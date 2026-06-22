@@ -12,8 +12,8 @@
     {
       "name": "codex",
       "source": "./plugins/codex",
-      "description": "OpenAI official plugin to use Codex from Claude Code for review and task delegation.",
-      "version": "1.0.4",
+      "description": "OpenAI Codex for Claude Code with local marketplace extensions: release checks, diagnostics, capacity governance, hardened jobs, preview CI workflow rendering, multi-role review, quality presets, and safer stop gates.",
+      "version": "1.1.0-fh.1",
       "category": "Productivity",
       "author": {
         "name": "OpenAI",
