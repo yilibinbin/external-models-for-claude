@@ -1098,10 +1098,16 @@ def test_codex_task_prompt_keeps_option_like_tokens_after_first_positional():
 def test_codex_rescue_task_callers_use_terminator_for_generated_prompts():
     rescue_command = read_text(PLUGIN / "commands" / "rescue.md")
     rescue_agent = read_text(PLUGIN / "agents" / "codex-rescue.md")
+    rescue_command_runtime_line = next(line for line in rescue_command.splitlines() if "runtime flags such as" in line)
+    rescue_agent_runtime_line = next(line for line in rescue_agent.splitlines() if "runtime flags such as" in line)
     assert "task ... -- <task text>" in rescue_command
     assert "-- before the forwarded task text" in rescue_command
+    assert "`--wait` is a Claude-side foreground selection hint; do not forward it to `task`." in rescue_command
+    assert "`--wait`" not in rescue_command_runtime_line
     assert "task ... -- <task text>" in rescue_agent
     assert "-- before the forwarded task text" in rescue_agent
+    assert "`--wait` is a Claude-side foreground selection hint; do not forward it to `task`." in rescue_agent
+    assert "`--wait`" not in rescue_agent_runtime_line
 
 
 def test_codex_stop_hook_task_invocation_uses_terminator_before_task_strict_parser_lands():
