@@ -32,6 +32,16 @@ Reload Claude Code plugins after installation.
 
 The `codex` plugin in this marketplace is a local Apache-2.0 extension of the OpenAI-authored Codex Claude Code plugin files bundled under `plugins/codex`. OpenAI attribution, `LICENSE`, and `NOTICE` are preserved; local extensions are documented in `plugins/codex/FORK_NOTICE.md` without asserting unverified upstream lineage.
 
+### Codex for Claude extended commands
+
+- `/codex:doctor` checks local readiness without running a model request.
+- `/codex:github-actions render|init|validate` creates a safe pull-request review workflow template. In this release it remains preview/advisory until release-host Codex CLI version and stdin auth contracts are verified.
+- `/codex:multi-review` runs focused Codex read-only review passes using role packs.
+- `/codex:multi-review` holds one model-call capacity slot for the entire sequential role run. Each role is still a separate sequential Codex turn, so the default five-role pack can issue five Codex turns under that one slot. With model-call limit `1`, it can block normal foreground review commands. With the default limit `2`, one multi-review normally leaves one slot, but two concurrent model-call commands can saturate the pool and make a third foreground review return `capacity_blocked`. Stop-gate review uses a separate `stop-gate` capacity slot.
+- `--quality fast|standard|strong|max` is Codex-native and affects task, adversarial-review, and multi-review reasoning effort. Native `/codex:review` records only the visible job-summary label and has zero runtime effect.
+- Unknown flags on review/task commands are rejected. Use `--` before prompt or focus text that intentionally starts with flag-like tokens.
+- `/codex:setup` keeps the optional Stop review gate fail-closed by default for tool, auth, timeout, capacity, and invalid-output failures. Set `stopReviewGateFailOpen` only when editor availability is preferred over strict Stop gating.
+
 ## Requirements
 
 - Claude Code with plugin support.
@@ -60,7 +70,7 @@ The `codex` plugin in this marketplace is a local Apache-2.0 extension of the Op
 
 - The `codex` plugin is OpenAI's official Apache-2.0 plugin copied from `openai/codex-plugin-cc`; its license and notice files remain under `plugins/codex`.
 - The root MIT license covers the marketplace files and the `gemini-for-claude` / `antigravity-for-claude` plugins maintained here.
-- Hooks are opt-in where the individual plugin documents them. Review gates fail open on provider/auth/runtime failures unless explicitly configured otherwise by the plugin.
+- Hooks are opt-in where the individual plugin documents them. Codex Stop review gates fail closed by default; check each plugin's documentation for its own gate posture.
 
 ## 中文说明
 

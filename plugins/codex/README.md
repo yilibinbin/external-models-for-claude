@@ -13,6 +13,13 @@ The `codex` plugin in this marketplace is a local Apache-2.0 extension of the Op
 
 This plugin keeps Codex as the only provider. It does not route requests to Gemini, Antigravity, or Claude providers.
 
+## Extended Commands
+
+- `/codex:doctor` checks local readiness without running a model request.
+- `/codex:github-actions render|init|validate` creates a safe pull-request review workflow template. In this release it remains preview/advisory until release-host Codex CLI version and stdin auth contracts are verified.
+- `/codex:multi-review` runs focused Codex read-only review passes using role packs.
+- `/codex:setup` can enable the optional Stop review gate.
+
 ## Quality Presets
 
 `--quality fast|standard|strong|max` is Codex-native. It never selects Gemini, Antigravity, or Claude models. It changes Codex `turn/start` reasoning effort only for `task`, `adversarial-review`, and `multi-review`.
@@ -29,6 +36,10 @@ This strict flag behavior applies to setup, the new deterministic commands, and 
 
 ## Capacity
 
-`/codex:multi-review` uses one `model-call` lease for the full sequential role run. If you set `CODEX_FOR_CLAUDE_GLOBAL_MAX_MODEL_CALLS=1`, that command can block other foreground review commands until every role completes.
+`/codex:multi-review` uses one `model-call` lease for the full sequential role run. Each role is still a separate sequential Codex turn, so the default five-role pack can issue five Codex turns under that one slot. If you set `CODEX_FOR_CLAUDE_GLOBAL_MAX_MODEL_CALLS=1`, that command can block other foreground review commands until every role completes.
 
 The default global `model-call` limit is 2, which lets one multi-review and one foreground model command run together, but two concurrent model-call commands, or one `multi-review` plus one long task, can still saturate the pool and make the next foreground review or task return `capacity_blocked` until a slot is released. Stop-gate review uses the independent `stop-gate` pool, controlled by `CODEX_FOR_CLAUDE_GLOBAL_MAX_STOP_GATES` and defaulting to `1`.
+
+## Stop Review Gate
+
+`/codex:setup` keeps the optional Stop review gate fail-closed by default for tool, auth, timeout, capacity, and invalid-output failures. Set `stopReviewGateFailOpen` only when editor availability is preferred over strict Stop gating.

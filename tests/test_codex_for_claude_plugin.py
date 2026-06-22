@@ -25,12 +25,15 @@ FALLBACK_EXPECTED_COMMANDS = [
     "adversarial-review.md",
     "cancel.md",
     "doctor.md",
+    "github-actions.md",
+    "multi-review.md",
     "rescue.md",
     "result.md",
     "review.md",
     "setup.md",
     "status.md",
 ]
+TEXT_EXTENSIONS = {".md", ".mdx", ".mjs", ".ts", ".txt", ".json", ".yaml", ".yml"}
 
 
 def read_json(path):
@@ -39,6 +42,28 @@ def read_json(path):
 
 def read_text(path):
     return path.read_text(encoding="utf8")
+
+
+def provider_isolation_text():
+    parts = [
+        read_text(PLUGIN / "README.md"),
+        read_text(PLUGIN / "FORK_NOTICE.md"),
+        read_text(PLUGIN / "CHANGELOG.md"),
+    ]
+    roots = [
+        PLUGIN / "scripts",
+        PLUGIN / "commands",
+        PLUGIN / "skills",
+        PLUGIN / "prompts",
+        PLUGIN / "templates",
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path.suffix in TEXT_EXTENSIONS:
+                parts.append(read_text(path))
+    return "\n".join(parts)
 
 
 def load_release_check_exports():
@@ -416,6 +441,60 @@ def test_codex_readme_documents_default_model_call_saturation_caveat():
     assert "next foreground review or task return `capacity_blocked`" in text
     assert "Stop-gate review uses the independent `stop-gate` pool" in text
     assert "always-available spare slot" not in text.lower()
+
+
+def test_codex_command_surface_includes_new_commands():
+    commands = {path.name for path in (PLUGIN / "commands").glob("*.md")}
+    expected = {
+        "adversarial-review.md",
+        "cancel.md",
+        "doctor.md",
+        "github-actions.md",
+        "multi-review.md",
+        "rescue.md",
+        "result.md",
+        "review.md",
+        "setup.md",
+        "status.md",
+    }
+    assert commands == expected
+
+
+def test_codex_print_usage_mentions_new_commands():
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    usage_body = js_function_body(companion, "printUsage")
+    for command in ["doctor", "github-actions", "multi-review", "release-check"]:
+        assert command in usage_body
+
+
+def test_codex_shipped_text_has_no_external_provider_leakage():
+    text = provider_isolation_text()
+    assert "GEMINI_FOR_CODEX" not in text
+    assert "ANTIGRAVITY_FOR_CODEX" not in text
+    assert "GEMINI_FOR_CLAUDE" not in text
+    assert "ANTIGRAVITY_FOR_CLAUDE" not in text
+    assert "model-provider gemini" not in text.lower()
+    assert "model-provider claude" not in text.lower()
+
+
+def test_codex_source_does_not_import_sibling_provider_plugins():
+    roots = [
+        PLUGIN / "scripts",
+        PLUGIN / "commands",
+        PLUGIN / "skills",
+        PLUGIN / "prompts",
+        PLUGIN / "templates",
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix in TEXT_EXTENSIONS:
+                text = read_text(path)
+                assert "../gemini-for-claude" not in text
+                assert "../antigravity-for-claude" not in text
+                assert "plugins/gemini-for-claude" not in text
+                assert "plugins/antigravity-for-claude" not in text
 
 
 def test_codex_commands_do_not_disable_model_invocation():
