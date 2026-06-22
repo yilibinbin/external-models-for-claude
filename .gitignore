@@ -1,5 +1,6 @@
 .DS_Store
 .pytest_cache/
+.codegraph/
 __pycache__/
 *.py[cod]
 node_modules/
@@ -8,3 +9,7 @@ coverage/
 .env.*
 !.env.example
 *.log
+task_plan.md
+findings.md
+progress.md
+docs/superpowers/plans/
