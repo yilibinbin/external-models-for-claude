@@ -30,7 +30,7 @@ claude plugin install claude-for-claude@external-models-for-claude --scope user
 - `/codex:doctor` 只检查本地就绪状态，不发起模型请求。
 - `/codex:github-actions render|init|validate` 会创建安全的 pull request 审阅 workflow 模板。本版本中它仍是 preview/advisory，因为 release host 上的 Codex CLI 版本和 stdin 认证契约尚未验证。
 - `/codex:multi-review` 使用角色包运行聚焦的 Codex 只读审阅轮次。
-- `/codex:multi-review` 在整个顺序角色运行期间只占用一个 `model-call` 容量槽。每个角色仍是一次独立的顺序 Codex turn，因此默认五角色包可在该容量槽下发起五次 Codex turn。当 model-call 限制为 `1` 时，它可能阻塞普通前台审阅命令。默认限制为 `2` 时，一个 multi-review 通常还会留下一个槽位，但两个并发 model-call 命令会耗尽容量，使第三个前台审阅返回 `capacity_blocked`。Stop gate 审阅使用独立的 `stop-gate` 容量槽。
+- `/codex:multi-review` 在整个顺序角色运行期间只占用一个 `model-call` 容量槽。每个角色仍是一次独立的顺序 Codex turn，因此默认五个角色包可在该容量槽下发起五次 Codex turn。当 model-call 限制为 `1` 时，它可能阻塞普通前台审阅命令。默认限制为 `2` 时，一个 multi-review 通常还会留下一个槽位，但两个并发 model-call 命令会耗尽容量，使第三个前台审阅返回 `capacity_blocked`。Stop gate 审阅使用独立的 `stop-gate` 容量槽。
 - `--quality fast|standard|strong|max` 是 Codex 原生命令选项，会影响 task、adversarial-review 和 multi-review 的 reasoning effort。原生 `/codex:review` 只记录可见的 job-summary 标签，没有运行时效果。
 - review/task 命令会拒绝未知 flag。若 prompt 或 focus 文本需要以类似 flag 的 token 开头，请先写 `--`。
 - `/codex:setup` 的可选 Stop review gate 默认 fail-closed；工具、认证、超时、容量和无效输出失败都会阻止 Stop。只有当编辑器可用性优先于严格 Stop gating 时，才设置 `stopReviewGateFailOpen`。

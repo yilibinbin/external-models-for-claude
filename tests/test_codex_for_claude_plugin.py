@@ -1071,6 +1071,33 @@ def test_codex_command_policy_allows_equals_values_starting_with_dash():
     assert payload["positionals"] == []
 
 
+def test_codex_command_policy_short_value_hint_does_not_suggest_inline_equals():
+    script = """
+        import { parseStrictCommandInput } from './plugins/codex/scripts/lib/command-policy.mjs';
+        try {
+          parseStrictCommandInput('review', ['-m', '--json'], {
+            valueOptions: ['model'],
+            booleanOptions: ['json'],
+            aliasMap: { m: 'model' }
+          });
+        } catch (error) {
+          console.log(JSON.stringify({ message: error.message }));
+        }
+    """
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", script],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert "-m requires a separate value token" in payload["message"]
+    assert "-m=--json" not in payload["message"]
+
+
 def test_codex_new_commands_use_strict_command_parser():
     companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
     args_module = read_text(PLUGIN / "scripts" / "lib" / "args.mjs")

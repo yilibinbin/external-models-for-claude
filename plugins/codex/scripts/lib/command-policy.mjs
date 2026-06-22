@@ -4,9 +4,12 @@ function optionNameForMessage(rawKey, short = false) {
   return `${short ? "-" : "--"}${rawKey}`;
 }
 
-function missingValueMessage(optionName, nextValue) {
+function missingValueMessage(optionName, nextValue, options = {}) {
   if (nextValue === undefined) {
     return `${optionName} requires a value.`;
+  }
+  if (options.inlineEquals === false) {
+    return `${optionName} requires a separate value token. Short options do not support inline = values; use the long option form with = when the value intentionally starts with "-".`;
   }
   return `${optionName} requires a value. If the value intentionally starts with "-", use ${optionName}=${nextValue}.`;
 }
@@ -99,7 +102,7 @@ export function parseStrictCommandInput(command, rawArgv, allowed = {}) {
     if (valueOptions.has(key)) {
       const nextValue = tokens[index + 1];
       if (nextValue === undefined || nextValue.startsWith("-")) {
-        throw new Error(missingValueMessage(optionName, nextValue));
+        throw new Error(missingValueMessage(optionName, nextValue, { inlineEquals: false }));
       }
       options[key] = nextValue;
       index += 1;

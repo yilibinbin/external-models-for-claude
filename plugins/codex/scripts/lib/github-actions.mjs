@@ -261,7 +261,7 @@ function expectedPluginRootResolverBlock() {
     'const fs = require("fs");',
     'const data = JSON.parse(fs.' + 'readFileSync(0, "utf8"));',
     "const plugins = Array.isArray(data) ? data : data.plugins || [];",
-    'const plugin = plugins.find((item) => item.name === "codex" || item.id === "codex@external-models-for-claude");',
+    'const plugin = plugins.find((item) => item.id === "codex@external-models-for-claude") || plugins.find((item) => item.name === "codex");',
     "const root = plugin && (plugin.installPath || plugin.path || plugin.root);",
     "if (!root) {",
     "console" + '.error("Could not resolve codex@external-models-for-claude install root from claude plugin list --json.");',
