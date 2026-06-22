@@ -512,43 +512,46 @@ export function createResourceGovernor(config) {
       return { ok: true, disabled: true };
     }
     if (!leaseId || !validLeaseId(leaseId)) {
-      return { ok: false, reason: "resource lease is missing" };
+      return { ok: false, reason: "lease missing" };
     }
-    const root = ensureRoot(env);
+    const root = resourceLockRoot(env);
     const lease = readJsonOrNull(leasePath(root, leaseId));
     if (!isOurLease(lease)) {
-      return { ok: false, reason: "resource lease is missing" };
+      return { ok: false, reason: "lease missing" };
     }
     if (lease.kind !== kind) {
-      return { ok: false, reason: "resource lease kind mismatch" };
-    }
-    if (isStaleLease(lease)) {
-      return { ok: false, reason: "resource lease is stale" };
+      return { ok: false, reason: "lease kind mismatch" };
     }
     const expectedCommand = options.expectedCommand ?? options.command;
     if (expectedCommand != null && String(expectedCommand) !== String(lease.command || "")) {
-      return { ok: false, reason: "resource lease command mismatch" };
+      return { ok: false, reason: "lease command mismatch" };
     }
     if (options.expectedPid != null && Number(options.expectedPid) !== Number(lease.pid)) {
-      return { ok: false, reason: "resource lease pid mismatch" };
+      return { ok: false, reason: "lease pid mismatch" };
     }
-    const parentHolderPid = Number(lease.ownerPid ?? lease.pid);
-    if (options.expectedParentPid != null && Number(options.expectedParentPid) !== parentHolderPid) {
-      return { ok: false, reason: "resource lease parent pid mismatch" };
+    const parentPid = Number(lease.ownerPid);
+    if (options.expectedParentPid != null && Number(options.expectedParentPid) !== parentPid) {
+      return { ok: false, reason: "lease parent mismatch" };
     }
     if (options.expectedOwnerPid != null && Number(options.expectedOwnerPid) !== Number(lease.ownerPid)) {
-      return { ok: false, reason: "resource lease owner pid mismatch" };
+      return { ok: false, reason: "lease owner mismatch" };
+    }
+    if (leaseAgeMs(lease, Date.now()) >= DEFAULT_LEASE_TTL_MS) {
+      return { ok: false, reason: "lease stale" };
     }
     const pidToCheck = Number(options.expectedPid ?? lease.pid);
     if (Number.isInteger(pidToCheck) && pidToCheck > 0 && !processAlive(pidToCheck)) {
-      return { ok: false, reason: "resource lease process is not alive" };
+      return { ok: false, reason: "lease parent not alive" };
     }
-    if (options.expectedParentPid != null && Number.isInteger(parentHolderPid) && parentHolderPid > 0 && !processAlive(parentHolderPid)) {
-      return { ok: false, reason: "resource lease parent is not alive" };
+    if (options.expectedParentPid != null && Number.isInteger(parentPid) && parentPid > 0 && !processAlive(parentPid)) {
+      return { ok: false, reason: "lease parent not alive" };
     }
     const ownerToCheck = Number(options.expectedOwnerPid ?? lease.ownerPid);
     if (Number.isInteger(ownerToCheck) && ownerToCheck > 0 && !processAlive(ownerToCheck)) {
-      return { ok: false, reason: "resource lease owner is not alive" };
+      return { ok: false, reason: "lease parent not alive" };
+    }
+    if (isStaleLease(lease)) {
+      return { ok: false, reason: "lease stale" };
     }
     return { ok: true, lease };
   }

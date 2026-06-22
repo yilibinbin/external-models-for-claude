@@ -30,7 +30,8 @@ function defaultState() {
   return {
     version: STATE_VERSION,
     config: {
-      stopReviewGate: false
+      stopReviewGate: false,
+      stopReviewGateFailOpen: false
     },
     endedSessions: [],
     jobs: []

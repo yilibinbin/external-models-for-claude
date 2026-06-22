@@ -202,6 +202,69 @@ def fake_cli_dir(tmp_path, claude_plugin_list):
     return bin_dir
 
 
+def fake_codex_app_server_dir(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "fake-codex-app-server.mjs").write_text(
+        """
+import readline from 'node:readline';
+const threadId = 'thread-stop-gate';
+const turnId = 'turn-stop-gate';
+const rl = readline.createInterface({ input: process.stdin });
+function send(message) {
+  console.log(JSON.stringify(message));
+}
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') {
+    send({ id: message.id, result: {} });
+  } else if (message.method === 'thread/start') {
+    send({ id: message.id, result: { thread: { id: threadId } } });
+  } else if (message.method === 'thread/name/set') {
+    send({ id: message.id, result: {} });
+  } else if (message.method === 'turn/start') {
+    send({
+      method: 'item/completed',
+      params: {
+        threadId,
+        item: {
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: process.env.CODEX_TEST_STOP_OUTPUT || 'BLOCK: fake stop issue'
+        }
+      }
+    });
+    send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
+    send({ id: message.id, result: { turn: { id: turnId, status: 'completed' } } });
+  } else {
+    send({ id: message.id, result: {} });
+  }
+});
+""",
+        encoding="utf8",
+    )
+    write_executable(
+        bin_dir / "codex",
+        """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'codex 1.0.0\\n'
+  exit 0
+fi
+if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then
+  printf 'codex app-server help\\n'
+  exit 0
+fi
+if [ "$1" = "app-server" ]; then
+  exec node "$(dirname "$0")/fake-codex-app-server.mjs"
+fi
+printf 'unexpected fake codex args: %s\\n' "$*" >&2
+exit 1
+""",
+    )
+    return bin_dir
+
+
 def companion_env(tmp_path, bin_dir):
     return {
         "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -1511,11 +1574,11 @@ def test_codex_resource_governor_verify_expected_command_rejects_mismatch(tmp_pa
     assert payload == {
         "matchingOk": True,
         "mismatchedOk": False,
-        "reason": "resource lease command mismatch",
+        "reason": "lease command mismatch",
     }
 
 
-def test_codex_resource_governor_verify_expected_parent_pid_uses_owner_or_holder(tmp_path):
+def test_codex_resource_governor_verify_expected_parent_pid_uses_owner(tmp_path):
     payload = run_node_script(
         """
         import fs from 'node:fs';
@@ -1528,9 +1591,10 @@ def test_codex_resource_governor_verify_expected_parent_pid_uses_owner_or_holder
         const withoutOwner = JSON.parse(fs.readFileSync(file, 'utf8'));
         delete withoutOwner.ownerPid;
         fs.writeFileSync(file, `${JSON.stringify(withoutOwner, null, 2)}\\n`);
-        const holderFallback = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedParentPid: process.pid });
+        const missingOwner = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedParentPid: process.pid });
         const deadOwner = JSON.parse(fs.readFileSync(file, 'utf8'));
         deadOwner.ownerPid = 99999999;
+        deadOwner.createdAtMs = Date.now();
         fs.writeFileSync(file, `${JSON.stringify(deadOwner, null, 2)}\\n`);
         const deadParent = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedParentPid: 99999999 });
         lease.release();
@@ -1538,7 +1602,8 @@ def test_codex_resource_governor_verify_expected_parent_pid_uses_owner_or_holder
           ownerMatchOk: ownerMatch.ok,
           mismatchOk: mismatch.ok,
           mismatchReason: mismatch.reason,
-          holderFallbackOk: holderFallback.ok,
+          missingOwnerOk: missingOwner.ok,
+          missingOwnerReason: missingOwner.reason,
           deadParentOk: deadParent.ok,
           deadParentReason: deadParent.reason
         }));
@@ -1547,10 +1612,397 @@ def test_codex_resource_governor_verify_expected_parent_pid_uses_owner_or_holder
     )
     assert payload["ownerMatchOk"] is True
     assert payload["mismatchOk"] is False
-    assert payload["mismatchReason"] == "resource lease parent pid mismatch"
-    assert payload["holderFallbackOk"] is True
+    assert payload["mismatchReason"] == "lease parent mismatch"
+    assert payload["missingOwnerOk"] is False
+    assert payload["missingOwnerReason"] == "lease parent mismatch"
     assert payload["deadParentOk"] is False
-    assert payload["deadParentReason"] == "resource lease parent is not alive"
+    assert payload["deadParentReason"] == "lease parent not alive"
+
+
+def test_codex_stop_child_parent_lease_verification_rejects_stale_or_dead_parent(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { acquireResourceLease, resourceLockRoot, verifyResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const lease = acquireResourceLease('stop-gate', { env: process.env, command: 'stop-review-gate' });
+        if (!lease.ok) throw new Error('lease failed');
+        const file = path.join(resourceLockRoot(process.env), `${lease.lease.id}.json`);
+        const original = JSON.parse(fs.readFileSync(file, 'utf8'));
+        fs.writeFileSync(file, `${JSON.stringify({ ...original, createdAtMs: Date.now() - 25 * 60 * 60 * 1000 }, null, 2)}\\n`);
+        const stale = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedParentPid: process.pid, expectedCommand: 'stop-review-gate' });
+        fs.writeFileSync(file, `${JSON.stringify({ ...original, ownerPid: 99999999, createdAtMs: Date.now() }, null, 2)}\\n`);
+        const dead = verifyResourceLease(lease.lease.id, 'stop-gate', { env: process.env, expectedParentPid: 99999999, expectedCommand: 'stop-review-gate' });
+        lease.release();
+        console.log(JSON.stringify({ stale: stale.ok, staleReason: stale.reason, dead: dead.ok, deadReason: dead.reason }));
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {
+        "stale": False,
+        "staleReason": "lease stale",
+        "dead": False,
+        "deadReason": "lease parent not alive",
+    }
+
+
+def test_codex_stop_child_parent_lease_verification_accepts_spawned_child_ppid(tmp_path):
+    payload = run_node_script(
+        """
+        import { spawnSync } from 'node:child_process';
+        import { acquireResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+        const lease = acquireResourceLease('stop-gate', { env: process.env, command: 'stop-review-gate' });
+        if (!lease.ok) throw new Error('parent lease failed');
+        const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+          import { verifyResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
+          const verification = verifyResourceLease(process.env.CODEX_FOR_CLAUDE_PARENT_STOP_GATE_LEASE_ID, 'stop-gate', { env: process.env, expectedParentPid: process.ppid, expectedCommand: 'stop-review-gate' });
+          process.stdout.write(JSON.stringify({ ok: verification.ok, reason: verification.reason || '' }));
+        `], {
+          cwd: process.cwd(),
+          env: { ...process.env, CODEX_FOR_CLAUDE_PARENT_STOP_GATE_LEASE_ID: lease.lease.id },
+          encoding: 'utf8'
+        });
+        lease.release();
+        if (child.status !== 0) {
+          process.stderr.write(child.stderr);
+          process.exit(child.status || 1);
+        }
+        console.log(child.stdout);
+        """,
+        env=governor_env(tmp_path),
+    )
+    assert payload == {"ok": True, "reason": ""}
+
+
+def test_codex_stop_gate_task_invocation_uses_terminator():
+    hook_source = read_text(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")
+    assert '[scriptPath, "task", "--json", "--", prompt]' in hook_source
+    assert '[scriptPath, "task", "--json", prompt]' not in hook_source
+
+
+def test_codex_internal_task_callers_use_terminator_for_generated_prompts():
+    hook_source = read_text(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")
+    rescue_command = read_text(PLUGIN / "commands" / "rescue.md")
+    rescue_agent = read_text(PLUGIN / "agents" / "codex-rescue.md")
+    assert '[scriptPath, "task", "--json", "--", prompt]' in hook_source
+    assert '[scriptPath, "task", "--json", prompt]' not in hook_source
+    assert "task ... -- <task text>" in rescue_command
+    assert "-- before the forwarded task text" in rescue_command
+    assert "task ... -- <task text>" in rescue_agent
+    assert "-- before the forwarded task text" in rescue_agent
+
+
+def test_codex_stop_gate_env_off_allows_stop(tmp_path):
+    result = subprocess.run(
+        [NODE, str(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "CODEX_FOR_CLAUDE_REVIEW_GATE": "off",
+            "CLAUDE_PLUGIN_DATA": str(tmp_path / "data"),
+            "NODE_ENV": "test",
+            "CODEX_FOR_CLAUDE_TEST_HOOK_THROW": "1",
+        },
+        input=json.dumps({"cwd": str(tmp_path)}),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+def test_codex_state_writes_are_atomic(tmp_path):
+    payload = run_node_script(
+        """
+        import { getConfig, setConfig } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        setConfig(cwd, 'stopReviewGate', true);
+        console.log(JSON.stringify(getConfig(cwd)));
+        """,
+        env={"CLAUDE_PLUGIN_DATA": str(tmp_path / "data")},
+        args=[str(tmp_path)],
+    )
+    assert payload["stopReviewGate"] is True
+    state_source = read_text(PLUGIN / "scripts" / "lib" / "state.mjs")
+    assert "function saveState" in state_source
+    assert "function withStateLock" in state_source
+    assert "withStateLock(cwd" in state_source
+    assert "writeAtomicJson" in state_source
+    assert "fs.renameSync" in state_source
+
+
+def test_codex_stop_gate_result_fail_open_for_non_findings():
+    payload = run_node_script(
+        """
+        import { classifyStopGateResult } from './plugins/codex/scripts/lib/stop-gate-result.mjs';
+        const cases = ['timeout', 'auth', 'capacity', 'invalid-output'].map((kind) =>
+          classifyStopGateResult({ ok: false, kind, reason: kind })
+        );
+        const open = classifyStopGateResult({ ok: false, kind: 'timeout', reason: 'timeout' }, { failOpen: true });
+        const block = classifyStopGateResult({ ok: true, verdict: 'BLOCK', reason: 'bug' });
+        const allow = classifyStopGateResult({ ok: true, verdict: 'ALLOW', reason: 'ok' });
+        const legacyAllow = classifyStopGateResult({ ok: true, reason: null });
+        console.log(JSON.stringify({ cases, open, block, allow, legacyAllow }));
+        """
+    )
+    assert all(item["decision"] == "block" and item["toolFailure"] for item in payload["cases"])
+    assert payload["open"]["decision"] == "allow"
+    assert payload["open"]["toolFailure"] is True
+    assert payload["open"]["reason"] == "timeout"
+    assert payload["block"]["decision"] == "block"
+    assert payload["block"]["toolFailure"] is False
+    assert payload["block"]["reason"] == "bug"
+    assert payload["allow"]["decision"] == "allow"
+    assert payload["legacyAllow"]["decision"] == "allow"
+
+
+def test_codex_stop_gate_results_have_single_classifier_consumer():
+    hook_source = read_text(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")
+    main_body = js_function_body(hook_source, "main")
+    parser_body = js_function_body(hook_source, "parseStopReviewOutput")
+    classifier_body = js_function_body(hook_source, "classifyStopTaskProcessResult")
+    run_body = js_function_body(hook_source, "runStopReview")
+    assert "classifyStopGateResult(review" in main_body
+    assert "review.ok" not in main_body
+    assert "!review.ok" not in main_body
+    assert "if (!review.ok) emit" not in hook_source
+    parser_call = 'parseStopReviewOutput(payload?.rawOutput || "")'
+    run_call = "runStopReview(cwd, input, stopGateLease, leaseEnv)"
+    assert classifier_body.count(parser_call) == 1
+    assert parser_call not in parser_body
+    assert parser_call not in run_body
+    assert 'acquireResourceLease("stop-gate"' not in run_body
+    assert "stopGateLease.release" not in run_body
+    assert parser_call not in main_body
+    assert main_body.count(run_call) == 1
+
+
+def test_codex_setup_exposes_review_gate_fail_open_flags(tmp_path):
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    setup_doc = read_text(PLUGIN / "commands" / "setup.md")
+    assert "enable-review-gate-fail-open" in companion
+    assert "disable-review-gate-fail-open" in companion
+    assert "stopReviewGateFailOpen" in companion
+    assert "--enable-review-gate-fail-open" in setup_doc
+    assert "--disable-review-gate-fail-open" in setup_doc
+    for block in fenced_bash_blocks(setup_doc):
+        assert "$ARGUMENTS" not in block
+
+    env = companion_env(tmp_path, fake_cli_dir(tmp_path, {"plugins": []}))
+    enabled = run_companion(["setup", "--json", "--enable-review-gate-fail-open"], cwd=tmp_path, env=env)
+    assert enabled.returncode == 0, enabled.stderr
+    assert json.loads(enabled.stdout)["reviewGateFailOpen"] is True
+    disabled = run_companion(["setup", "--json", "--disable-review-gate-fail-open"], cwd=tmp_path, env=env)
+    assert disabled.returncode == 0, disabled.stderr
+    assert json.loads(disabled.stdout)["reviewGateFailOpen"] is False
+    rejected = run_companion(
+        ["setup", "--enable-review-gate-fail-open", "--disable-review-gate-fail-open"],
+        cwd=tmp_path,
+        env=env,
+    )
+    assert rejected.returncode != 0
+    assert "Choose either --enable-review-gate-fail-open or --disable-review-gate-fail-open" in rejected.stderr
+
+
+def test_codex_preupgrade_stop_gate_state_defaults_fail_closed(tmp_path):
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { ensureStateDir, getConfig, resolveStateFile } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        ensureStateDir(cwd);
+        fs.writeFileSync(resolveStateFile(cwd), JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] }) + '\\n');
+        console.log(JSON.stringify(getConfig(cwd)));
+        """,
+        env={"CLAUDE_PLUGIN_DATA": str(tmp_path / "data")},
+        args=[str(tmp_path)],
+    )
+    assert payload["stopReviewGate"] is True
+    assert payload["stopReviewGateFailOpen"] is False
+
+
+def test_codex_stop_gate_parser_preserves_block_verdict():
+    payload = run_node_script(
+        """
+        import { parseStopReviewOutput } from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        const block = parseStopReviewOutput('BLOCK: real bug');
+        const multi = parseStopReviewOutput('BLOCK: short\\nfull detail line');
+        const longBlock = parseStopReviewOutput('BLOCK: ' + 'x'.repeat(10000));
+        const allow = parseStopReviewOutput('\\nALLOW: ok');
+        const invalid = parseStopReviewOutput('looks fine');
+        console.log(JSON.stringify({ block, multi, longBlock, allow, invalid }));
+        """
+    )
+    assert payload["block"]["ok"] is True
+    assert payload["block"]["verdict"] == "BLOCK"
+    assert payload["block"]["reason"] == "real bug"
+    assert payload["multi"]["verdict"] == "BLOCK"
+    assert payload["multi"]["reason"] == "short\nfull detail line"
+    assert len(payload["longBlock"]["reason"]) <= 4000
+    assert payload["longBlock"]["reason"].endswith("\n[truncated]")
+    assert payload["allow"]["verdict"] == "ALLOW"
+    assert payload["invalid"]["kind"] == "invalid-output"
+
+
+def test_codex_stop_gate_parses_verdict_before_nonzero_status_failure():
+    payload = run_node_script(
+        """
+        import { classifyStopTaskProcessResult } from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        const allow = classifyStopTaskProcessResult({ status: 1, stdout: JSON.stringify({ rawOutput: 'ALLOW: ok' }), stderr: 'exit 1' });
+        const block = classifyStopTaskProcessResult({ status: 1, stdout: JSON.stringify({ rawOutput: 'BLOCK: bug' }), stderr: 'exit 1' });
+        console.log(JSON.stringify({ allow, block }));
+        """
+    )
+    assert payload["allow"]["ok"] is True
+    assert payload["allow"]["verdict"] == "ALLOW"
+    assert payload["block"]["ok"] is True
+    assert payload["block"]["verdict"] == "BLOCK"
+    assert payload["block"]["reason"] == "bug"
+
+
+def test_codex_stop_gate_block_verdict_wins_over_nonzero_status_behavior():
+    payload = run_node_script(
+        """
+        import { classifyStopGateResult } from './plugins/codex/scripts/lib/stop-gate-result.mjs';
+        import { classifyStopTaskProcessResult } from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        const review = classifyStopTaskProcessResult({ status: 75, stdout: JSON.stringify({ rawOutput: 'BLOCK: capacity masked finding' }), stderr: 'capacity' });
+        console.log(JSON.stringify(classifyStopGateResult(review, { failOpen: true })));
+        """
+    )
+    assert payload["decision"] == "block"
+    assert payload["toolFailure"] is False
+    assert payload["reason"] == "capacity masked finding"
+
+
+def test_codex_stop_gate_full_hook_blocks_block_verdict(tmp_path):
+    bin_dir = fake_codex_app_server_dir(tmp_path)
+    env = {
+        **os.environ,
+        **governor_env(tmp_path),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "CODEX_TEST_STOP_OUTPUT": "BLOCK: found a real issue",
+    }
+    setup = run_node_script(
+        """
+        import { setConfig } from './plugins/codex/scripts/lib/state.mjs';
+        setConfig(process.argv[1], 'stopReviewGate', true);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    assert setup["ok"] is True
+    result = subprocess.run(
+        [NODE, str(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")],
+        cwd=tmp_path,
+        env=env,
+        input=json.dumps({"cwd": str(tmp_path), "last_assistant_message": "done"}),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"decision": "block", "reason": "found a real issue"}
+
+
+def test_codex_stop_gate_non_json_block_output_is_tool_failure():
+    payload = run_node_script(
+        """
+        import { classifyStopTaskProcessResult } from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        const result = classifyStopTaskProcessResult({ status: 0, stdout: 'BLOCK: untrusted bare output', stderr: '' });
+        console.log(JSON.stringify(result));
+        """
+    )
+    assert payload["ok"] is False
+    assert payload["kind"] == "invalid-json"
+
+
+def test_codex_stop_gate_disabled_hook_exception_does_not_block(tmp_path):
+    result = subprocess.run(
+        [NODE, str(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "CODEX_FOR_CLAUDE_REVIEW_GATE": "off",
+            "NODE_ENV": "test",
+            "CODEX_FOR_CLAUDE_TEST_HOOK_THROW": "1",
+            "CLAUDE_PLUGIN_DATA": str(tmp_path / "data"),
+        },
+        input=json.dumps({"cwd": str(tmp_path)}),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+def test_codex_stop_gate_enabled_hook_exception_blocks_by_default(tmp_path):
+    env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(tmp_path / "data")}
+    run_node_script(
+        """
+        import { setConfig } from './plugins/codex/scripts/lib/state.mjs';
+        setConfig(process.argv[1], 'stopReviewGate', true);
+        console.log(JSON.stringify({ ok: true }));
+        """,
+        env=env,
+        args=[str(tmp_path)],
+    )
+    result = subprocess.run(
+        [NODE, str(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")],
+        cwd=tmp_path,
+        env={**env, "NODE_ENV": "test", "CODEX_FOR_CLAUDE_TEST_HOOK_THROW": "1"},
+        input=json.dumps({"cwd": str(tmp_path)}),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "block"
+    assert "test hook crash" in payload["reason"]
+
+
+def test_codex_stop_gate_internal_timeout_is_below_host_timeout():
+    hook_source = read_text(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")
+    hooks = read_json(PLUGIN / "hooks" / "hooks.json")
+    stop_timeout = hooks["hooks"]["Stop"][0]["hooks"][0]["timeout"]
+    assert stop_timeout == 900
+    assert "15 minutes" not in hook_source
+    assert "15 * 60 * 1000" not in hook_source
+    assert "const STOP_REVIEW_TIMEOUT_MS = 8 * 60 * 1000" in hook_source
+    assert "const STOP_GATE_MUTEX_WAIT_MAX_MS = 60 * 1000" in hook_source
+    assert (8 * 60) + 60 < stop_timeout - 240
+
+
+def test_codex_stop_gate_mutex_wait_env_is_clamped():
+    payload = run_node_script(
+        """
+        import { stopGateLeaseEnv } from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        const env = stopGateLeaseEnv({
+          PATH: 'keep-path',
+          HOME: 'keep-home',
+          CLAUDE_PLUGIN_DATA: '/tmp/plugin-data',
+          CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR: '/tmp/locks',
+          CODEX_FOR_CLAUDE_MUTEX_WAIT_MS: '999999'
+        });
+        console.log(JSON.stringify(env));
+        """
+    )
+    assert payload["PATH"] == "keep-path"
+    assert payload["HOME"] == "keep-home"
+    assert payload["CLAUDE_PLUGIN_DATA"] == "/tmp/plugin-data"
+    assert payload["CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR"] == "/tmp/locks"
+    assert payload["CODEX_FOR_CLAUDE_MUTEX_WAIT_MS"] == "60000"
 
 
 def test_codex_default_model_limit_two_can_saturate_foreground_pool(tmp_path):
@@ -3290,11 +3742,22 @@ def test_codex_heartbeat_after_session_end_removes_sidecar_without_republish(tmp
 
 def test_codex_stop_child_disables_heartbeat_and_progress_updates():
     source = read_text(PLUGIN / "scripts" / "lib" / "tracked-jobs.mjs")
+    hook_source = read_text(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")
+    companion_source = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
     heartbeat = js_function_body(source, "writeHeartbeatIfRunning")
     progress = js_function_body(source, "createJobProgressUpdater")
     run_tracked = js_function_body(source, "runTrackedJob")
+    task_body = js_function_body(companion_source, "handleTask")
     assert 'process.env.CODEX_FOR_CLAUDE_DISABLE_HEARTBEAT === "1"' in heartbeat
     assert 'process.env.CODEX_FOR_CLAUDE_DISABLE_PROGRESS_UPDATES === "1"' in progress
+    assert 'CODEX_FOR_CLAUDE_DISABLE_HEARTBEAT: "1"' in hook_source
+    assert 'CODEX_FOR_CLAUDE_DISABLE_PROGRESS_UPDATES: "1"' in hook_source
+    assert 'CODEX_FOR_CLAUDE_FILE_LOCK_WAIT_MS: "35000"' in hook_source
+    assert 'CODEX_FOR_CLAUDE_SKIP_STATE_PRUNE: "1"' in hook_source
+    assert "verifyStopGateChildTask()" in task_body
+    assert "verifyResourceLease" in companion_source
+    assert "expectedParentPid: process.ppid" in companion_source
+    assert 'expectedCommand: "stop-review-gate"' in companion_source
     assert "let heartbeatActive = true" in run_tracked
     assert "let heartbeat = null" in run_tracked
     assert "heartbeat?.unref?.()" in run_tracked

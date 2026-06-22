@@ -76,6 +76,7 @@ import {
   acquireResourceLease,
   claimResourceLease,
   transferResourceLease,
+  verifyResourceLease,
   reapStaleResourceLeases,
   capacityBlockedMessage
 } from "./lib/resource-governor.mjs";
@@ -94,7 +95,7 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
+      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--enable-review-gate-fail-open|--disable-review-gate-fail-open] [--json]",
       "  node scripts/codex-companion.mjs doctor [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
@@ -224,6 +225,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    reviewGateFailOpen: Boolean(config.stopReviewGateFailOpen),
     actionsTaken,
     nextSteps
   };
@@ -232,7 +234,13 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 async function handleSetup(argv) {
   const { options, positionals } = parseStrictCommandInput("setup", argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json", "enable-review-gate", "disable-review-gate"],
+    booleanOptions: [
+      "json",
+      "enable-review-gate",
+      "disable-review-gate",
+      "enable-review-gate-fail-open",
+      "disable-review-gate-fail-open"
+    ],
     aliasMap: { C: "cwd" }
   });
   if (positionals.length > 0) {
@@ -241,6 +249,9 @@ async function handleSetup(argv) {
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
+  }
+  if (options["enable-review-gate-fail-open"] && options["disable-review-gate-fail-open"]) {
+    throw new Error("Choose either --enable-review-gate-fail-open or --disable-review-gate-fail-open.");
   }
 
   const cwd = resolveCommandCwd(options);
@@ -253,6 +264,13 @@ async function handleSetup(argv) {
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+  if (options["enable-review-gate-fail-open"]) {
+    setConfig(workspaceRoot, "stopReviewGateFailOpen", true);
+    actionsTaken.push("Enabled fail-open mode for stop-time review gate tool failures.");
+  } else if (options["disable-review-gate-fail-open"]) {
+    setConfig(workspaceRoot, "stopReviewGateFailOpen", false);
+    actionsTaken.push("Disabled fail-open mode for stop-time review gate tool failures.");
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
@@ -703,6 +721,21 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
   };
 }
 
+function verifyStopGateChildTask() {
+  if (process.env.CODEX_FOR_CLAUDE_STOP_GATE_CHILD !== "1") {
+    return false;
+  }
+  const verification = verifyResourceLease(process.env.CODEX_FOR_CLAUDE_PARENT_STOP_GATE_LEASE_ID, "stop-gate", {
+    env: process.env,
+    expectedParentPid: process.ppid,
+    expectedCommand: "stop-review-gate"
+  });
+  if (!verification.ok) {
+    throw new Error(`Stop gate child lease verification failed: ${verification.reason || "invalid parent stop-gate lease"}.`);
+  }
+  return true;
+}
+
 function readTaskPrompt(cwd, options, positionals) {
   if (options["prompt-file"]) {
     return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
@@ -1041,6 +1074,7 @@ async function handleTask(argv) {
   const quality = resolveQuality(options.quality || "standard");
   const effort = normalizeReasoningEffort(options.effort || quality.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
+  const stopGateChild = verifyStopGateChildTask();
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
@@ -1087,25 +1121,30 @@ async function handleTask(argv) {
   }
 
   const foregroundJob = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const runForegroundTask = async () =>
+    runForegroundCommand(
+      foregroundJob,
+      (progress) =>
+        executeTaskRun({
+          cwd,
+          model,
+          effort,
+          prompt,
+          write,
+          resumeLast,
+          jobId: foregroundJob.id,
+          onProgress: progress
+        }),
+      { json: options.json }
+    );
+  if (stopGateChild) {
+    await runForegroundTask();
+    return;
+  }
   await withResourceLease(
     "model-call",
     { env: process.env, command: "task" },
-    async () =>
-      runForegroundCommand(
-        foregroundJob,
-        (progress) =>
-          executeTaskRun({
-            cwd,
-            model,
-            effort,
-            prompt,
-            write,
-            resumeLast,
-            jobId: foregroundJob.id,
-            onProgress: progress
-          }),
-        { json: options.json }
-      )
+    runForegroundTask
   );
 }
 

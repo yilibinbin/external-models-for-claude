@@ -1,6 +1,6 @@
 ---
 description: Check whether the local Codex CLI is ready and optionally toggle the stop-time review gate
-argument-hint: '[--enable-review-gate|--disable-review-gate]'
+argument-hint: '[--enable-review-gate|--disable-review-gate] [--enable-review-gate-fail-open|--disable-review-gate-fail-open]'
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 
@@ -18,6 +18,18 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --enable-r
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --disable-review-gate
+```
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --enable-review-gate-fail-open
+```
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --disable-review-gate-fail-open
+```
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --enable-review-gate --disable-review-gate-fail-open
 ```
 
 If the result says Codex is unavailable and npm is available:
