@@ -1000,6 +1000,126 @@ def test_codex_strict_command_parser_preserves_aliases_and_terminator():
     assert payload["positionals"] == ["--bad", "focus"]
 
 
+def test_codex_adversarial_review_focus_text_reaches_strict_parser():
+    script = (
+        "const p = await import('./plugins/codex/scripts/lib/command-policy.mjs');"
+        "const parsed = p.parseStrictCommandInput('adversarial-review', ['--base','main','--','focus','on','--flag-like','text'], {valueOptions:['base','scope','model','cwd','quality'], booleanOptions:['json','background','wait'], aliasMap:{C:'cwd',m:'model'}});"
+        "process.stdout.write(JSON.stringify(parsed));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["options"]["base"] == "main"
+    assert payload["positionals"] == ["focus", "on", "--flag-like", "text"]
+
+
+def test_codex_review_wrapper_tokenization_contract_preserves_focus_text():
+    script = (
+        "const p = await import('./plugins/codex/scripts/lib/command-policy.mjs');"
+        "const parsed = p.parseStrictCommandInput('review', ['--base','main','--','focus','on','quoted phrase','--flag-like','text'], {valueOptions:['base','scope','model','cwd','quality'], booleanOptions:['json','background','wait'], aliasMap:{C:'cwd',m:'model'}});"
+        "process.stdout.write(JSON.stringify(parsed));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["options"]["base"] == "main"
+    assert payload["positionals"] == ["focus", "on", "quoted phrase", "--flag-like", "text"]
+
+
+def test_codex_task_options_must_precede_prompt_in_prompt_first_mode():
+    script = (
+        "const p = await import('./plugins/codex/scripts/lib/command-policy.mjs');"
+        "const allowed = {valueOptions:['model','effort','cwd','prompt-file','quality'], booleanOptions:['json','write','resume-last','resume','fresh','background'], aliasMap:{C:'cwd', m:'model'}, promptAfterFirstPositional:true};"
+        "const before = p.parseStrictCommandInput('task', ['--model','gpt-5','fix','it'], allowed);"
+        "const after = p.parseStrictCommandInput('task', ['fix','it','--model','gpt-5'], allowed);"
+        "process.stdout.write(JSON.stringify({before, after}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["before"]["options"]["model"] == "gpt-5"
+    assert payload["before"]["positionals"] == ["fix", "it"]
+    assert payload["after"]["options"].get("model") is None
+    assert payload["after"]["positionals"] == ["fix", "it", "--model", "gpt-5"]
+
+
+def test_codex_quality_legacy_commands_reject_unknown_flags():
+    for args in [
+        ["review", "--qualiy", "max"],
+        ["adversarial-review", "--qualiy", "max"],
+        ["task", "--qualiy", "max", "inspect"],
+    ]:
+        result = run_node("plugins/codex/scripts/codex-companion.mjs", args, timeout=10)
+        assert result.returncode == 1
+        assert "Unsupported option" in result.stderr
+
+
+def test_codex_review_and_task_use_strict_command_parser():
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    for name in ["handleTask", "handleReviewCommand"]:
+        body = js_function_body(companion, name)
+        assert "parseStrictCommandInput(" in body
+        assert "parseCommandInput(" not in body
+        assert "parseArgs(" not in body
+
+
+def test_codex_strict_parser_preserves_cwd_and_model_aliases_for_migrated_commands():
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    for name in ["handleTask", "handleReviewCommand", "handleMultiReview"]:
+        body = js_function_body(companion, name)
+        assert 'C: "cwd"' in body
+        assert 'm: "model"' in body
+    setup_body = js_function_body(companion, "handleSetup")
+    assert 'C: "cwd"' in setup_body
+
+
+def test_codex_task_prompt_can_intentionally_start_with_flag_after_terminator():
+    script = (
+        "const p = await import('./plugins/codex/scripts/lib/command-policy.mjs');"
+        "const parsed = p.parseStrictCommandInput('task', ['--','--foo','is','broken'], {valueOptions:['model','effort','cwd','prompt-file','quality'], booleanOptions:['json','write','resume-last','resume','fresh','background'], aliasMap:{C:'cwd', m:'model'}, promptAfterFirstPositional:true});"
+        "process.stdout.write(JSON.stringify(parsed.positionals));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["--foo", "is", "broken"]
+
+
+def test_codex_task_prompt_keeps_option_like_tokens_after_first_positional():
+    script = (
+        "const p = await import('./plugins/codex/scripts/lib/command-policy.mjs');"
+        "const parsed = p.parseStrictCommandInput('task', ['fix', '--foo', 'regression'], {valueOptions:['model','effort','cwd','prompt-file','quality'], booleanOptions:['json','write','resume-last','resume','fresh','background'], aliasMap:{C:'cwd', m:'model'}, promptAfterFirstPositional:true});"
+        "process.stdout.write(JSON.stringify(parsed.positionals));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["fix", "--foo", "regression"]
+
+
+def test_codex_rescue_task_callers_use_terminator_for_generated_prompts():
+    rescue_command = read_text(PLUGIN / "commands" / "rescue.md")
+    rescue_agent = read_text(PLUGIN / "agents" / "codex-rescue.md")
+    assert "task ... -- <task text>" in rescue_command
+    assert "-- before the forwarded task text" in rescue_command
+    assert "task ... -- <task text>" in rescue_agent
+    assert "-- before the forwarded task text" in rescue_agent
+
+
+def test_codex_stop_hook_task_invocation_uses_terminator_before_task_strict_parser_lands():
+    hook_source = read_text(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")
+    assert '[scriptPath, "task", "--json", "--", prompt]' in hook_source
+    assert '[scriptPath, "task", "--json", prompt]' not in hook_source
+
+
+def test_codex_review_command_wrappers_do_not_interpolate_raw_arguments():
+    for name in ["review.md", "adversarial-review.md"]:
+        text = read_text(PLUGIN / "commands" / name)
+        assert "$ARGUMENTS" in text
+        assert '"$ARGUMENTS"' not in text
+        assert "Do not interpolate `$ARGUMENTS` into Bash" in text
+        assert "Parse this text into independent argv tokens before invoking the companion" in text
+        assert "Append parsed user arguments as separately quoted argv tokens" in text
+
+
 def test_codex_setup_command_does_not_interpolate_raw_arguments():
     text = read_text(PLUGIN / "commands" / "setup.md")
 
@@ -6836,6 +6956,72 @@ def test_codex_quality_policy_is_available_before_multi_review_wiring():
     assert standard["effort"] == "medium"
     assert maxq["effort"] == "high"
     assert maxq["nativeReviewEffect"] == "metadata-only"
+
+
+def test_codex_quality_policy_maps_presets_to_effort_and_model():
+    script = (
+        "const q = await import('./plugins/codex/scripts/lib/quality-policy.mjs');"
+        "process.stdout.write(JSON.stringify([q.resolveQuality('fast'), q.resolveQuality('standard'), q.resolveQuality('max')]));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    fast, standard, maxq = json.loads(result.stdout)
+    assert fast["effort"] == "low"
+    assert standard["effort"] == "medium"
+    assert maxq["effort"] == "high"
+    assert maxq["nativeReviewEffect"] == "metadata-only"
+
+
+def test_codex_adversarial_review_quality_effort_is_forwarded_to_turn_start():
+    script = (
+        "const c = await import('./plugins/codex/scripts/codex-companion.mjs');"
+        "const context = {repoRoot:process.cwd(), branch:'main', summary:'1 file changed', target:{label:'working tree', mode:'working-tree'}, content:'diff --git a/src/demo.js b/src/demo.js', changedFiles:['src/demo.js'], inputMode:'inline-diff', collectionGuidance:'working tree diff', fileCount:1, diffBytes:42};"
+        "const options = c.buildAdversarialReviewTurnOptions(context, {model:'gpt-5', effort:'high'}, 'focus');"
+        "process.stdout.write(JSON.stringify({effort:options.effort, model:options.model, sandbox:options.sandbox}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload == {"effort": "high", "model": "gpt-5", "sandbox": "read-only"}
+
+
+def test_codex_native_review_quality_is_metadata_summary_only():
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+    review_doc = read_text(PLUGIN / "commands" / "review.md")
+    assert "export function buildReviewJobMetadata(reviewName, target, quality = null)" in companion
+    assert "quality=${quality.quality}" in companion
+    assert "--quality" in review_doc
+    assert "zero runtime effect on native review" in review_doc
+    native_start = companion.index('if (reviewName === "Review")')
+    adversarial_start = companion.index("const context = collectReviewContext(request.cwd, target);", native_start)
+    native_block = companion[native_start:adversarial_start]
+    assert native_start < adversarial_start
+    assert "sourceThreadId" in native_block
+    match = re.search(r"runAppServerReview\(\s*request\.cwd\s*,\s*\{(?P<options>.*?)\}\s*\)", native_block, re.S)
+    assert match, "native review must still call runAppServerReview(request.cwd, options)"
+    options_region = match.group("options")
+    assert "target: reviewTarget" in options_region
+    assert "model: request.model" in options_region
+    assert "onProgress: request.onProgress" in options_region
+    assert "quality" not in options_region
+    assert "request.effort" not in options_region
+    assert "effort:" not in native_block
+    assert "request.effort" not in native_block
+
+
+def test_codex_native_review_quality_summary_metadata_behavior():
+    script = (
+        "const c = await import('./plugins/codex/scripts/codex-companion.mjs');"
+        "const metadata = c.buildReviewJobMetadata('Review', {label:'working tree'}, {quality:'strong'});"
+        "const plain = c.buildReviewJobMetadata('Review', {label:'working tree'}, null);"
+        "process.stdout.write(JSON.stringify({metadata, plain}));"
+    )
+    result = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["metadata"]["kind"] == "review"
+    assert payload["metadata"]["summary"].endswith("quality=strong")
+    assert payload["plain"]["summary"] == "Review working tree"
 
 
 def test_codex_multi_review_command_exists_and_is_argument_safe():

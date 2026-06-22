@@ -294,6 +294,17 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
+export function buildAdversarialReviewTurnOptions(context, request, focusText) {
+  return {
+    prompt: buildAdversarialReviewPrompt(context, focusText),
+    model: request.model,
+    effort: request.effort,
+    sandbox: "read-only",
+    outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    onProgress: request.onProgress
+  };
+}
+
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -452,14 +463,7 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
-    prompt,
-    model: request.model,
-    sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
-  });
+  const result = await runAppServerTurn(context.repoRoot, buildAdversarialReviewTurnOptions(context, request, focusText));
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
@@ -612,11 +616,12 @@ export function buildMultiReviewRolePrompt(context, role) {
   });
 }
 
-function buildReviewJobMetadata(reviewName, target) {
+export function buildReviewJobMetadata(reviewName, target, quality = null) {
+  const suffix = quality ? ` quality=${quality.quality}` : "";
   return {
     kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
     title: reviewName === "Review" ? "Codex Review" : `Codex ${reviewName}`,
-    summary: `${reviewName} ${target.label}`
+    summary: `${reviewName} ${target.label}${suffix}`
   };
 }
 
@@ -961,12 +966,10 @@ function shouldReclaimBackgroundLease(storedJob, claim) {
 }
 
 async function handleReviewCommand(argv, config) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+  const { options, positionals } = parseStrictCommandInput("review", argv, {
+    valueOptions: ["base", "scope", "model", "cwd", "quality"],
     booleanOptions: ["json", "background", "wait"],
-    aliasMap: {
-      m: "model"
-    }
+    aliasMap: { C: "cwd", m: "model" }
   });
 
   const cwd = resolveCommandCwd(options);
@@ -987,7 +990,8 @@ async function handleReviewCommand(argv, config) {
     });
 
     config.validateRequest?.(target, focusText);
-    const metadata = buildReviewJobMetadata(config.reviewName, target);
+    const quality = resolveQuality(options.quality || "standard");
+    const metadata = buildReviewJobMetadata(config.reviewName, target, quality);
     const job = createCompanionJob({
       prefix: "review",
       kind: metadata.kind,
@@ -1006,6 +1010,7 @@ async function handleReviewCommand(argv, config) {
           model: options.model,
           focusText,
           reviewName: config.reviewName,
+          effort: config.reviewName === "Adversarial Review" ? quality.effort : null,
           onProgress: progress
         }),
       { json: options.json }
@@ -1023,18 +1028,18 @@ async function handleReview(argv) {
 }
 
 async function handleTask(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+  const { options, positionals } = parseStrictCommandInput("task", argv, {
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "quality"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
-    aliasMap: {
-      m: "model"
-    }
+    aliasMap: { C: "cwd", m: "model" },
+    promptAfterFirstPositional: true
   });
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const quality = resolveQuality(options.quality || "standard");
+  const effort = normalizeReasoningEffort(options.effort || quality.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
