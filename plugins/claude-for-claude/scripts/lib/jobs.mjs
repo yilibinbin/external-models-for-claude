@@ -140,6 +140,33 @@ export function claimReservedJob(cwd, jobId, workerPid = process.pid, env = proc
       staleMtime = 0;
     }
     if (staleMtime === 0 || Date.now() - staleMtime > CLAIM_LOCK_STALE_MS) {
+      // Do not reclaim a lock whose owner process is still alive: a slow but
+      // live claimant must not be reclaimed (that would let two workers commit
+      // the same claim). mtime staleness alone is insufficient.
+      let ownerPid = NaN;
+      try {
+        ownerPid = Number(fs.readFileSync(ownerFile, "utf8").trim().split(".")[0]);
+      } catch {
+        // No readable owner file: the holder never finished stamping (or it is
+        // gone); treat as reclaimable.
+      }
+      if (Number.isInteger(ownerPid) && ownerPid > 0 && ownerPid !== process.pid) {
+        let ownerAlive = false;
+        try {
+          process.kill(ownerPid, 0);
+          ownerAlive = true;
+        } catch (error) {
+          // ESRCH = dead (reclaimable). EPERM = alive but not ours (do not reclaim).
+          ownerAlive = error?.code === "EPERM";
+        }
+        if (ownerAlive) {
+          return {
+            status: "not_claimed",
+            jobId,
+            reason: "Job is being claimed by another worker."
+          };
+        }
+      }
       try {
         // Re-verify the lock has not been refreshed since we judged it stale,
         // then remove exactly that orphan.
@@ -174,6 +201,22 @@ export function claimReservedJob(cwd, jobId, workerPid = process.pid, env = proc
         status: "not_claimed",
         jobId,
         reason: "Job changed before it could be claimed."
+      };
+    }
+    // Re-verify we still own the lock immediately before committing: if a stale
+    // reclaim handed the lock to another worker after we acquired it, abort the
+    // claim rather than race to renameSync.
+    let stillOwned = false;
+    try {
+      stillOwned = fs.readFileSync(ownerFile, "utf8") === ownerToken;
+    } catch {
+      stillOwned = false;
+    }
+    if (!stillOwned) {
+      return {
+        status: "not_claimed",
+        jobId,
+        reason: "Claim lock ownership was lost before commit."
       };
     }
     fs.writeFileSync(tmpFile, `${JSON.stringify(running, null, 2)}\n`, "utf8");

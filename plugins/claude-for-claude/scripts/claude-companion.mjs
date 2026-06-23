@@ -1953,7 +1953,7 @@ function runReleaseCheck(rawArgs = []) {
   try {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     if (manifest.name !== "claude-for-claude") failures.push("manifest name mismatch");
-    if (manifest.version !== "0.1.0") failures.push(`manifest version is ${manifest.version}, expected 0.1.0`);
+    if (manifest.version !== "0.1.1") failures.push(`manifest version is ${manifest.version}, expected 0.1.1`);
     const legacyPluginName = ["claude", "for", "codex"].join("-");
     if (JSON.stringify(manifest).includes(legacyPluginName)) failures.push(`manifest contains ${legacyPluginName}`);
   } catch (error) {

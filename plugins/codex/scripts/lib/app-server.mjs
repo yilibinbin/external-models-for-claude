@@ -305,6 +305,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
         try {
           terminateProcessTree(this.proc.pid);
         } catch {
+          // Best-effort; fall through to the hard-kill below.
+        }
+        // terminateProcessTree only delivers SIGTERM on POSIX, so a child that
+        // ignores SIGTERM would otherwise survive. Always escalate to SIGKILL
+        // if it has not exited.
+        if (this.proc.exitCode === null) {
           try { this.proc.kill("SIGKILL"); } catch { /* already gone */ }
         }
       }

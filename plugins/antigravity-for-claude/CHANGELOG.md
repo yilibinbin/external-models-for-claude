@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1
+## 0.1.1 - 2026-06-23
 
 - Honour `stop_hook_active` in the Antigravity Stop review gate via a non-blocking stdin read and a `runReviewGate` loop-guard short-circuit (parity with claude-for-claude).
 - Align `review` argument-hint with the parser (drop the unimplemented `--wait`); map the session-lifecycle event explicitly instead of silently defaulting to `start`.
