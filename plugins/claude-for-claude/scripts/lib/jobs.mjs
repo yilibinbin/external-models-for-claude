@@ -109,10 +109,17 @@ export function claimReservedJob(cwd, jobId, workerPid = process.pid, env = proc
   // older than CLAIM_LOCK_STALE_MS is an orphan (the holder was hard-killed mid
   // claim) and is reclaimed once to avoid permanently wedging the job.
   const lockDir = `${file}.claim.lock`;
+  const ownerFile = `${lockDir}/owner`;
+  // Unique per-claim token so cleanup never deletes a lock a *different* claim
+  // now owns (the prior bug: a paused holder reclaimed as stale, then its own
+  // finally removed the new owner's lock and allowed a double claim).
+  const ownerToken = `${process.pid}.${process.hrtime.bigint().toString(36)}`;
   const CLAIM_LOCK_STALE_MS = 30 * 1000;
   const acquireLock = () => {
     try {
       fs.mkdirSync(lockDir);
+      // Stamp ownership immediately so cleanup can verify we still hold it.
+      fs.writeFileSync(ownerFile, ownerToken, "utf8");
       return { ok: true };
     } catch (error) {
       if (error && error.code === "EEXIST") {
@@ -121,18 +128,30 @@ export function claimReservedJob(cwd, jobId, workerPid = process.pid, env = proc
       throw error;
     }
   };
+  // Only the holder we observed-as-stale may be reclaimed: re-stat after the
+  // remove to ensure we did not delete a lock that was refreshed in between.
   let locked = acquireLock();
   if (!locked.ok) {
-    let stale = false;
+    let staleMtime = null;
     try {
-      stale = Date.now() - fs.statSync(lockDir).mtimeMs > CLAIM_LOCK_STALE_MS;
+      staleMtime = fs.statSync(lockDir).mtimeMs;
     } catch {
       // Lock vanished between mkdir and stat; treat as reclaimable and retry.
-      stale = true;
+      staleMtime = 0;
     }
-    if (stale) {
+    if (staleMtime === 0 || Date.now() - staleMtime > CLAIM_LOCK_STALE_MS) {
       try {
-        fs.rmSync(lockDir, { recursive: true, force: true });
+        // Re-verify the lock has not been refreshed since we judged it stale,
+        // then remove exactly that orphan.
+        let current = null;
+        try {
+          current = fs.statSync(lockDir).mtimeMs;
+        } catch {
+          current = 0;
+        }
+        if (current === 0 || current === staleMtime) {
+          fs.rmSync(lockDir, { recursive: true, force: true });
+        }
       } catch {
         // Another worker may have just reclaimed it; fall through to the retry.
       }
@@ -162,7 +181,16 @@ export function claimReservedJob(cwd, jobId, workerPid = process.pid, env = proc
     return { status: "claimed", job: running };
   } finally {
     fs.rmSync(tmpFile, { force: true });
-    fs.rmSync(lockDir, { recursive: true, force: true });
+    // Only remove the lock if we still own it; never delete a lock another
+    // claim re-acquired (which would let two workers run the same job).
+    try {
+      if (fs.readFileSync(ownerFile, "utf8") === ownerToken) {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      }
+    } catch {
+      // Owner file missing/unreadable: the lock was already reclaimed by
+      // another worker; leave it alone.
+    }
   }
 }
 

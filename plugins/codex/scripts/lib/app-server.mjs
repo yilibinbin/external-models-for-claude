@@ -383,7 +383,16 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      // initialize() can reject on INITIALIZE_TIMEOUT_MS against a wedged
+      // app-server. connect() throws before returning, so the caller's
+      // `if (client) await client.close()` cleanup never runs — tear down the
+      // half-built client here to avoid orphaning the spawned child / socket.
+      await client.close().catch(() => {});
+      throw error;
+    }
     return client;
   }
 }

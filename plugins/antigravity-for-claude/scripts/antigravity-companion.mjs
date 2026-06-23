@@ -2189,6 +2189,12 @@ function runReviewGate(rawArgs) {
   if (!reviewGateEnabled()) {
     return;
   }
+  // Loop-guard: when Claude Code re-invokes Stop because a prior gate blocked,
+  // it sets stop_hook_active (forwarded via env by the hook wrapper). Re-running
+  // the full model gate on that recursive Stop would loop, so allow the stop.
+  if (process.env.ANTIGRAVITY_FOR_CLAUDE_STOP_HOOK_ACTIVE === "1") {
+    return;
+  }
   const args = parseArgsOrExit(rawArgs);
   const deadline = reviewGateDeadline(reviewGateTimeoutBudgetMs(process.env, args.timeout));
   if (args.help) {

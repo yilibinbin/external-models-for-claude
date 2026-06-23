@@ -7,8 +7,11 @@ const SECRET_PATTERNS = [
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z_]{20,}\b/g,
   /\bsk-[A-Za-z0-9_-]{20,}\b/g,
-  // JSON / quoted key:value form, e.g. "password": "hunter2" or {"secret":'...'}
-  /(["'`]?\b(?:api[_-]?key|token|secret|password|passwd|pwd)\b["'`]?\s*[:=]\s*)["'`][^"'`]+["'`]/gi,
+  // JSON / quoted key:value form, e.g. "password": "hunter2" or {"secret":'...'}.
+  // The value class consumes backslash escapes (\" \\ ...) as a unit so an
+  // embedded escaped quote does not end the value early and leak its suffix
+  // (e.g. {"password":"abc\"def"} must redact the whole value, not just "abc").
+  /(["'`]?\b(?:api[_-]?key|token|secret|password|passwd|pwd)\b["'`]?\s*[:=]\s*)(["'`])(?:\\.|(?!\2)[^\\])+\2/gi,
   // bare (unquoted) key=value form. The negative lookahead only skips when the
   // value is EXACTLY the placeholder (followed by a delimiter or end), so this
   // stays idempotent without skipping a real value that merely starts with
