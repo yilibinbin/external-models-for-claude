@@ -1,6 +1,6 @@
 ---
 description: Run a bounded Claude scorecard review loop
-argument-hint: '[--max-rounds <n>] [--score-threshold <n>] [focus ...]'
+argument-hint: '[--taskset <id>] [--max-review-rounds 1..3] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---

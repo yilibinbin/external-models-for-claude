@@ -28,7 +28,9 @@ function git(cwd, args) {
     cwd,
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
-    timeout: 10000,
+    // The UserPromptSubmit host hook timeout is 5s and this runs three git
+    // calls sequentially, so keep each well under that combined budget.
+    timeout: 1500,
     killSignal: "SIGKILL"
   });
   return result.status === 0 ? result.stdout : "";

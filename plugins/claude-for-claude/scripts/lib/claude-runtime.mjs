@@ -187,6 +187,12 @@ export function parseClaudeJson(stdout) {
   if (parsed.error) {
     return { ok: false, response: "", error: JSON.stringify(parsed.error), stats: parsed.stats || {} };
   }
+  if (parsed.is_error === true || (typeof parsed.subtype === "string" && parsed.subtype !== "success") || parsed.api_error_status) {
+    const message = typeof parsed.result === "string" && parsed.result
+      ? parsed.result
+      : JSON.stringify(parsed.error || parsed.api_error_status || parsed);
+    return { ok: false, response: "", error: message, stats: parsed.stats || {} };
+  }
   const response = typeof parsed.response === "string"
     ? parsed.response
     : typeof parsed.result === "string"

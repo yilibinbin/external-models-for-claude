@@ -1,6 +1,6 @@
 {
   "name": "claude-for-claude",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Use Claude CLI from Claude Code for read-only review, planning, scorecard quality loops, role-pack review teams, advisory coordination, tracked jobs, and opt-in stop gates.",
   "author": {
     "name": "fanghao",

@@ -1,6 +1,6 @@
 ---
 description: List Claude reviewer role packs
-argument-hint: '[--json]'
+argument-hint: '[list|inspect <pack>|validate <file>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
@@ -20,6 +20,6 @@ Companion path:
 `${CLAUDE_PLUGIN_ROOT}/scripts/claude-companion.mjs`
 
 Command:
-`roles`
+`roles list`
 
-Return the companion output directly.
+Use `roles inspect <pack>` or `roles validate <file>` when the user asks to inspect or validate a specific role pack. Return the companion output directly.

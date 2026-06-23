@@ -7,7 +7,7 @@ This marketplace includes OpenAI-authored Codex Claude Code plugin files under `
 - Copyright/attribution: OpenAI
 - License: Apache License, Version 2.0
 - Version included: 1.0.4
-- Local extended version: 1.1.0-fh.1
+- Local extended version: 1.1.0-fh.2
 
 Local marketplace extensions preserve the bundled `plugins/codex/LICENSE` and `plugins/codex/NOTICE` files.
 

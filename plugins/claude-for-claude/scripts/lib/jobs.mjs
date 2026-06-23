@@ -103,18 +103,138 @@ export function claimReservedJob(cwd, jobId, workerPid = process.pid, env = proc
     startedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
-  const tmpFile = `${file}.${process.pid}.claim.tmp`;
-  fs.writeFileSync(tmpFile, `${JSON.stringify(running, null, 2)}\n`, "utf8");
-  if (fs.readFileSync(file, "utf8") !== original) {
-    fs.rmSync(tmpFile, { force: true });
+  // Acquire an exclusive claim lock so two racing workers cannot both pass the
+  // read-compare-rename window. mkdir is atomic; EEXIST means another worker is
+  // mid-claim, so we lose the race. The claim window is sub-second, so a lock
+  // older than CLAIM_LOCK_STALE_MS is an orphan (the holder was hard-killed mid
+  // claim) and is reclaimed once to avoid permanently wedging the job.
+  const lockDir = `${file}.claim.lock`;
+  const ownerFile = `${lockDir}/owner`;
+  // Unique per-claim token so cleanup never deletes a lock a *different* claim
+  // now owns (the prior bug: a paused holder reclaimed as stale, then its own
+  // finally removed the new owner's lock and allowed a double claim).
+  const ownerToken = `${process.pid}.${process.hrtime.bigint().toString(36)}`;
+  const CLAIM_LOCK_STALE_MS = 30 * 1000;
+  const acquireLock = () => {
+    try {
+      fs.mkdirSync(lockDir);
+      // Stamp ownership immediately so cleanup can verify we still hold it.
+      fs.writeFileSync(ownerFile, ownerToken, "utf8");
+      return { ok: true };
+    } catch (error) {
+      if (error && error.code === "EEXIST") {
+        return { ok: false };
+      }
+      throw error;
+    }
+  };
+  // Only the holder we observed-as-stale may be reclaimed: re-stat after the
+  // remove to ensure we did not delete a lock that was refreshed in between.
+  let locked = acquireLock();
+  if (!locked.ok) {
+    let staleMtime = null;
+    try {
+      staleMtime = fs.statSync(lockDir).mtimeMs;
+    } catch {
+      // Lock vanished between mkdir and stat; treat as reclaimable and retry.
+      staleMtime = 0;
+    }
+    if (staleMtime === 0 || Date.now() - staleMtime > CLAIM_LOCK_STALE_MS) {
+      // Do not reclaim a lock whose owner process is still alive: a slow but
+      // live claimant must not be reclaimed (that would let two workers commit
+      // the same claim). mtime staleness alone is insufficient.
+      let ownerPid = NaN;
+      try {
+        ownerPid = Number(fs.readFileSync(ownerFile, "utf8").trim().split(".")[0]);
+      } catch {
+        // No readable owner file: the holder never finished stamping (or it is
+        // gone); treat as reclaimable.
+      }
+      if (Number.isInteger(ownerPid) && ownerPid > 0 && ownerPid !== process.pid) {
+        let ownerAlive = false;
+        try {
+          process.kill(ownerPid, 0);
+          ownerAlive = true;
+        } catch (error) {
+          // ESRCH = dead (reclaimable). EPERM = alive but not ours (do not reclaim).
+          ownerAlive = error?.code === "EPERM";
+        }
+        if (ownerAlive) {
+          return {
+            status: "not_claimed",
+            jobId,
+            reason: "Job is being claimed by another worker."
+          };
+        }
+      }
+      try {
+        // Re-verify the lock has not been refreshed since we judged it stale,
+        // then remove exactly that orphan.
+        let current = null;
+        try {
+          current = fs.statSync(lockDir).mtimeMs;
+        } catch {
+          current = 0;
+        }
+        if (current === 0 || current === staleMtime) {
+          fs.rmSync(lockDir, { recursive: true, force: true });
+        }
+      } catch {
+        // Another worker may have just reclaimed it; fall through to the retry.
+      }
+      locked = acquireLock();
+    }
+  }
+  if (!locked.ok) {
     return {
       status: "not_claimed",
       jobId,
-      reason: "Job changed before it could be claimed."
+      reason: "Job is being claimed by another worker."
     };
   }
-  fs.renameSync(tmpFile, file);
-  return { status: "claimed", job: running };
+  const tmpFile = `${file}.${process.pid}.claim.tmp`;
+  try {
+    // Re-read under the lock: another worker may have already claimed and
+    // changed the queued state before we acquired the lock.
+    if (fs.readFileSync(file, "utf8") !== original) {
+      return {
+        status: "not_claimed",
+        jobId,
+        reason: "Job changed before it could be claimed."
+      };
+    }
+    // Re-verify we still own the lock immediately before committing: if a stale
+    // reclaim handed the lock to another worker after we acquired it, abort the
+    // claim rather than race to renameSync.
+    let stillOwned = false;
+    try {
+      stillOwned = fs.readFileSync(ownerFile, "utf8") === ownerToken;
+    } catch {
+      stillOwned = false;
+    }
+    if (!stillOwned) {
+      return {
+        status: "not_claimed",
+        jobId,
+        reason: "Claim lock ownership was lost before commit."
+      };
+    }
+    fs.writeFileSync(tmpFile, `${JSON.stringify(running, null, 2)}\n`, "utf8");
+    fs.renameSync(tmpFile, file);
+    return { status: "claimed", job: running };
+  } finally {
+    fs.rmSync(tmpFile, { force: true });
+    // Only remove the lock if we still own it; never delete a lock another
+    // claim re-acquired (which would let two workers run the same job).
+    try {
+      if (fs.readFileSync(ownerFile, "utf8") === ownerToken) {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      }
+    } catch {
+      // Owner file missing/unreadable: the lock was already reclaimed by
+      // another worker; leave it alone.
+    }
+  }
 }
 
 export function updateJob(cwd, jobId, updates, env = process.env) {

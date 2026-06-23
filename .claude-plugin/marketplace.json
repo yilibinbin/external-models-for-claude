@@ -13,7 +13,7 @@
       "name": "codex",
       "source": "./plugins/codex",
       "description": "OpenAI Codex for Claude Code with local marketplace extensions: release checks, diagnostics, capacity governance, hardened jobs, preview CI workflow rendering, multi-role review, quality presets, and safer stop gates.",
-      "version": "1.1.0-fh.1",
+      "version": "1.1.0-fh.2",
       "category": "Productivity",
       "author": {
         "name": "OpenAI",
@@ -35,7 +35,7 @@
       "name": "antigravity-for-claude",
       "source": "./plugins/antigravity-for-claude",
       "description": "Use Antigravity CLI from Claude Code for read-only review, planning, scorecards, jobs, and explicit Gemini or Claude model-provider selection.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "category": "Productivity",
       "author": {
         "name": "fanghao",
@@ -46,7 +46,7 @@
       "name": "claude-for-claude",
       "source": "./plugins/claude-for-claude",
       "description": "Use Claude CLI from Claude Code for isolated read-only review, planning, scorecards, role-pack review teams, jobs, and opt-in stop gates.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "category": "Productivity",
       "author": {
         "name": "fanghao",

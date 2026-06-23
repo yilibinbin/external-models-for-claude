@@ -428,7 +428,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.1" in notices
+    assert "Local extended version: 1.1.0-fh.2" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -7856,7 +7856,7 @@ def test_codex_github_actions_module_has_no_top_level_side_effects():
 
 
 def test_codex_github_actions_plugin_root_resolves_template_from_installed_cache_layout(tmp_path):
-    installed = tmp_path / "cache" / "external-models-for-claude" / "codex" / "1.1.0-fh.1"
+    installed = tmp_path / "cache" / "external-models-for-claude" / "codex" / "1.1.0-fh.2"
     shutil.copytree(PLUGIN, installed)
     module_url = (installed / "scripts" / "lib" / "github-actions.mjs").as_uri()
     script = (

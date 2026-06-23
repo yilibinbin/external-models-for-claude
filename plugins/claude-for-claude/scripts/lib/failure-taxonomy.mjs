@@ -36,7 +36,11 @@ export function classifyProviderFailure(result = {}, options = {}) {
   const status = Number.isInteger(result.status) ? result.status : 1;
   const stdout = String(result.stdout || "").trim();
   const errorCode = String(result.errorCode || result.error?.code || "");
-  const text = textOf(result.stderr, result.error?.message || result.error, options.diagnostic, options.message);
+  // The Claude CLI reports provider errors (auth/quota/rate-limit/overload) in its
+  // stdout JSON `result` field, not stderr. Include stdout in the match text only on
+  // a non-success status so a genuine review that mentions these words is not misclassified.
+  const failureStdout = status !== 0 ? stdout : "";
+  const text = textOf(result.stderr, result.error?.message || result.error, options.diagnostic, options.message, failureStdout);
   if (String(options.category || "")) {
     return normalizeFailureCategory(options.category);
   }

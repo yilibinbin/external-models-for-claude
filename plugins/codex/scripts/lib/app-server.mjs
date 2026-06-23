@@ -21,6 +21,9 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+// The handshake should be near-instant; bound it so a wedged app-server that
+// never emits the initialize response fails fast instead of hanging forever.
+const INITIALIZE_TIMEOUT_MS = 30 * 1000;
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -90,10 +93,40 @@ class AppServerClientBase {
     const id = this.nextId;
     this.nextId += 1;
 
+    // Most RPCs (review/start, turn/start) are intentionally long-running and
+    // must not be bounded here. Only handshake RPCs opt into a timeout via
+    // `timeoutMs` so a wedged app-server cannot hang connect()/initialize().
+    const timeoutMs = Number.isInteger(this.requestTimeoutOverrideMs) && this.requestTimeoutOverrideMs > 0
+      ? this.requestTimeoutOverrideMs
+      : 0;
+
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      let timer = null;
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          const pending = this.pending.get(id);
+          if (!pending) {
+            return;
+          }
+          this.pending.delete(id);
+          pending.reject(createProtocolError(`codex app-server did not respond to "${method}" within ${timeoutMs}ms.`));
+        }, timeoutMs);
+        if (typeof timer.unref === "function") {
+          timer.unref();
+        }
+      }
+      this.pending.set(id, { resolve, reject, method, timer });
       this.sendMessage({ id, method, params });
     });
+  }
+
+  async requestWithTimeout(method, params, timeoutMs) {
+    this.requestTimeoutOverrideMs = timeoutMs;
+    try {
+      return await this.request(method, params);
+    } finally {
+      this.requestTimeoutOverrideMs = 0;
+    }
   }
 
   notify(method, params = {}) {
@@ -138,6 +171,9 @@ class AppServerClientBase {
         return;
       }
       this.pending.delete(message.id);
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
 
       if (message.error) {
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
@@ -168,6 +204,9 @@ class AppServerClientBase {
     this.exitError = error ?? null;
 
     for (const pending of this.pending.values()) {
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
       pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
     this.pending.clear();
@@ -218,10 +257,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleLine(line);
     });
 
-    await this.request("initialize", {
+    await this.requestWithTimeout("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
+    }, INITIALIZE_TIMEOUT_MS);
     this.notify("initialized", {});
   }
 
@@ -258,7 +297,40 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       }, 50).unref?.();
     }
 
-    await this.exitPromise;
+    // Bound the wait: a wedged child that ignores SIGTERM must not hang close()
+    // forever (that would defeat the initialize timeout). Escalate to SIGKILL /
+    // terminateProcessTree and resolve regardless after a short grace period.
+    await this.awaitExitWithDeadline(() => {
+      if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
+        try {
+          terminateProcessTree(this.proc.pid);
+        } catch {
+          // Best-effort; fall through to the hard-kill below.
+        }
+        // terminateProcessTree only delivers SIGTERM on POSIX, so a child that
+        // ignores SIGTERM would otherwise survive. Always escalate to SIGKILL
+        // if it has not exited.
+        if (this.proc.exitCode === null) {
+          try { this.proc.kill("SIGKILL"); } catch { /* already gone */ }
+        }
+      }
+    });
+  }
+
+  async awaitExitWithDeadline(onTimeout, graceMs = 2000) {
+    let timer = null;
+    const guard = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        try { onTimeout?.(); } catch { /* best-effort */ }
+        resolve();
+      }, graceMs);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([this.exitPromise, guard]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   sendMessage(message) {
@@ -298,10 +370,10 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
       });
     });
 
-    await this.request("initialize", {
+    await this.requestWithTimeout("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
+    }, INITIALIZE_TIMEOUT_MS);
     this.notify("initialized", {});
   }
 
@@ -315,7 +387,22 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     if (this.socket) {
       this.socket.end();
     }
-    await this.exitPromise;
+    // Bound the wait so a half-open/unresponsive broker socket cannot hang
+    // close() forever and defeat the initialize timeout. Force-destroy and
+    // resolve after a short grace period.
+    let timer = null;
+    const guard = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        try { this.socket?.destroy(); } catch { /* already gone */ }
+        resolve();
+      }, 2000);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([this.exitPromise, guard]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   sendMessage(message) {
@@ -344,7 +431,16 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      // initialize() can reject on INITIALIZE_TIMEOUT_MS against a wedged
+      // app-server. connect() throws before returning, so the caller's
+      // `if (client) await client.close()` cleanup never runs — tear down the
+      // half-built client here to avoid orphaning the spawned child / socket.
+      await client.close().catch(() => {});
+      throw error;
+    }
     return client;
   }
 }

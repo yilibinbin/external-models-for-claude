@@ -24,7 +24,13 @@ function readHookInput() {
   if (!raw) {
     return {};
   }
-  return JSON.parse(raw);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // A garbled payload must not abort SessionEnd cleanup (broker/job teardown);
+    // fail safe like the Stop hook rather than crashing with exit 1.
+    return {};
+  }
 }
 
 function shellEscape(value) {

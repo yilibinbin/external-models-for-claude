@@ -345,8 +345,20 @@ export function capacityBlockedResult(plugin, lease) {
   };
 }
 
+function governorIoErrorResult(error) {
+  const message = `resource governor unavailable: ${error?.message || String(error)}`;
+  return { status: 75, stdout: "", stderr: `${message}\n`, error: message, errorCode: "EGOVERNOR" };
+}
+
 export function withResourceLeaseSync(kind, options, callback) {
-  const lease = acquireResourceLease(kind, options);
+  let lease;
+  try {
+    lease = acquireResourceLease(kind, options);
+  } catch (error) {
+    // ensureRoot()/acquireMutex() I/O can throw (e.g. unwritable lock dir);
+    // degrade to a clear error result instead of crashing the foreground command.
+    return governorIoErrorResult(error);
+  }
   if (!lease.ok) {
     return capacityBlockedResult(PLUGIN_NAME, lease);
   }
@@ -358,7 +370,12 @@ export function withResourceLeaseSync(kind, options, callback) {
 }
 
 export async function withResourceLeaseAsync(kind, options, callback) {
-  const lease = acquireResourceLease(kind, options);
+  let lease;
+  try {
+    lease = acquireResourceLease(kind, options);
+  } catch (error) {
+    return governorIoErrorResult(error);
+  }
   if (!lease.ok) {
     return capacityBlockedResult(PLUGIN_NAME, lease);
   }

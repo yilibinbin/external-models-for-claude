@@ -1,6 +1,6 @@
 ---
 description: Run Antigravity CLI review against local git state
-argument-hint: "[--wait|--background] [--scorecard] [--structured] [--json] [--model-provider gemini|claude] [focus]"
+argument-hint: "[--background] [--scorecard] [--structured] [--json] [--model-provider gemini|claude] [focus]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---

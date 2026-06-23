@@ -13,7 +13,7 @@ import {
 import { hasMachinePath, MACHINE_PATH_PATTERN_SOURCE } from "./path-hygiene.mjs";
 
 export const MARKETPLACE_VERSION = "0.2.0";
-export const CODEX_VERSION = "1.1.0-fh.1";
+export const CODEX_VERSION = "1.1.0-fh.2";
 export const MARKETPLACE_CODEX_AUTHOR = {
   name: "OpenAI",
   url: "https://github.com/openai/codex-plugin-cc"

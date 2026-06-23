@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0-fh.2
+
+- Tear down the spawned child/socket when `app-server` `initialize()` times out, and bound `close()` so a wedged child that ignores SIGTERM cannot hang it (escalates to SIGKILL/`terminateProcessTree`/`socket.destroy`).
+- Add a bounded `initialize`/request timeout so a wedged `codex app-server` fails fast instead of hanging review/task/status.
+- Fail-safe the SessionEnd/SessionStart lifecycle hook on malformed stdin; bound `sendBrokerShutdown` with a socket timeout; set an explicit `maxBuffer` on the Stop-gate review subprocess; terminate an orphaned worker when a background lease transfer fails; surface the login next-step when the auth probe fails.
+
 ## 1.1.0-fh.1
 
 - Add local marketplace extension notice while preserving OpenAI attribution.

@@ -124,7 +124,7 @@ def test_claude_marketplace_lists_claude_for_claude():
     assert marketplace["metadata"]["version"] == "0.2.0"
     plugins = {item["name"]: item for item in marketplace["plugins"]}
     assert plugins["claude-for-claude"]["source"] == "./plugins/claude-for-claude"
-    assert plugins["claude-for-claude"]["version"] == "0.1.0"
+    assert plugins["claude-for-claude"]["version"] == "0.1.1"
     assert plugins["claude-for-claude"]["category"] == "Productivity"
     assert "Claude CLI" in plugins["claude-for-claude"]["description"]
     assert {"codex", "gemini-for-claude", "antigravity-for-claude", "claude-for-claude"} <= set(plugins)
@@ -135,7 +135,7 @@ def test_claude_for_claude_manifest_is_claude_native():
     manifest = read_json(PLUGIN / ".claude-plugin" / "plugin.json")
 
     assert manifest["name"] == "claude-for-claude"
-    assert manifest["version"] == "0.1.0"
+    assert manifest["version"] == "0.1.1"
     assert "Claude CLI" in manifest["description"]
     assert manifest["homepage"] == "https://github.com/yilibinbin/external-models-for-claude"
     assert manifest["repository"] == "https://github.com/yilibinbin/external-models-for-claude"

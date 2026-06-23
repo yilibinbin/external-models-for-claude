@@ -333,6 +333,10 @@ function parseArgs(rawArgs) {
       args.latest = true;
     } else if (token === "--background") {
       args.background = true;
+    } else if (token === "--wait") {
+      // Review runs synchronously by default; accept --wait as an explicit no-op
+      // so it is consumed rather than swallowed into the model focus text.
+      args.wait = true;
     } else if (token === "--use-mailbox") {
       args.useMailbox = true;
     } else if (token === "--advisory-leases") {
@@ -2183,6 +2187,12 @@ async function runStoredJob(rawArgs) {
 
 function runReviewGate(rawArgs) {
   if (!reviewGateEnabled()) {
+    return;
+  }
+  // Loop-guard: when Claude Code re-invokes Stop because a prior gate blocked,
+  // it sets stop_hook_active (forwarded via env by the hook wrapper). Re-running
+  // the full model gate on that recursive Stop would loop, so allow the stop.
+  if (process.env.ANTIGRAVITY_FOR_CLAUDE_STOP_HOOK_ACTIVE === "1") {
     return;
   }
   const args = parseArgsOrExit(rawArgs);

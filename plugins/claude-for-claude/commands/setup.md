@@ -1,6 +1,6 @@
 ---
 description: Inspect or configure Claude for Claude
-argument-hint: '[--enable-review-gate|--disable-review-gate] [--review-gate-mode multi-role] [--json]'
+argument-hint: '[--enable-review-gate|--disable-review-gate] [--review-gate-mode multi-role]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

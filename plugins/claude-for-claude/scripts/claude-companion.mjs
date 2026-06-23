@@ -718,7 +718,8 @@ function printUsage(commandName = "") {
       break;
     case "review-gate":
       process.stdout.write("Run the opt-in Stop hook review gate for current git changes.\n");
-      process.stdout.write("Options: [--enable|--disable|--status] [--role-pack <pack>] [--roles <list>]\n");
+      process.stdout.write("Options: [--role-pack <pack>] [--roles <list>]\n");
+      process.stdout.write("Enable/disable the gate with: setup --enable-review-gate | setup --disable-review-gate (status via setup).\n");
       break;
     case "real-smoke":
       process.stdout.write("Run opt-in live Claude CLI smoke checks when enabled by environment.\n");
@@ -1952,7 +1953,7 @@ function runReleaseCheck(rawArgs = []) {
   try {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     if (manifest.name !== "claude-for-claude") failures.push("manifest name mismatch");
-    if (manifest.version !== "0.1.0") failures.push(`manifest version is ${manifest.version}, expected 0.1.0`);
+    if (manifest.version !== "0.1.1") failures.push(`manifest version is ${manifest.version}, expected 0.1.1`);
     const legacyPluginName = ["claude", "for", "codex"].join("-");
     if (JSON.stringify(manifest).includes(legacyPluginName)) failures.push(`manifest contains ${legacyPluginName}`);
   } catch (error) {
@@ -2611,6 +2612,12 @@ function parseClaudeJson(stdout) {
   }
   if (parsed.error) {
     return { ok: false, response: "", error: JSON.stringify(parsed.error) };
+  }
+  if (parsed.is_error === true || (typeof parsed.subtype === "string" && parsed.subtype !== "success") || parsed.api_error_status) {
+    const message = typeof parsed.result === "string" && parsed.result
+      ? parsed.result
+      : JSON.stringify(parsed.error || parsed.api_error_status || parsed);
+    return { ok: false, response: "", error: message };
   }
   const response = typeof parsed.response === "string"
     ? parsed.response
@@ -3702,7 +3709,9 @@ function stripTerminalControls(text) {
 
 function runRolesCommand(rawArgs) {
   const tokens = normalizeArgv(rawArgs);
-  const subcommand = tokens.shift();
+  // Default a bare `roles` (or `roles --json`) invocation to `list` so the
+  // /claude:roles slash command and skills do not need to repeat the subcommand.
+  const subcommand = (!tokens.length || tokens[0].startsWith("--")) ? "list" : tokens.shift();
   const jsonOutput = tokens.includes("--json");
   const filtered = tokens.filter((token) => token !== "--json");
   try {
@@ -3954,11 +3963,14 @@ async function runReviewGate(rawArgs) {
     return;
   }
 
-  if (input.stop_hook_active) {
+  // The Stop hook wrapper reads the host payload and forwards the loop-guard and
+  // cwd via env vars (stdin is intentionally not piped to preserve the wrapper
+  // timeout). Honour those as a fallback when stdin did not carry them.
+  if (input.stop_hook_active || process.env.CLAUDE_FOR_CLAUDE_STOP_HOOK_ACTIVE === "1") {
     return;
   }
 
-  const cwd = input.cwd || process.cwd();
+  const cwd = input.cwd || process.env.CLAUDE_FOR_CLAUDE_HOOK_CWD || process.cwd();
   try {
     process.chdir(cwd);
   } catch (error) {
@@ -3993,6 +4005,16 @@ async function runReviewGate(rawArgs) {
     return;
   }
   if (config.lastAllowedReviewGateDiffHash === diffHash) {
+    return;
+  }
+  // Loop-guard: if the identical working tree was already blocked, re-emit the
+  // prior block decision without re-running the full multi-role review, so an
+  // unchanged tree cannot trigger repeated ~870s reviews on consecutive Stops.
+  if (config.lastBlockedReviewGateDiffHash === diffHash && config.lastBlockedReviewGateReason) {
+    process.stdout.write(`${JSON.stringify({
+      decision: "block",
+      reason: config.lastBlockedReviewGateReason
+    })}\n`);
     return;
   }
 
@@ -4072,9 +4094,14 @@ async function runReviewGate(rawArgs) {
     const reason = blocks
       .map((block) => `${block.role}: ${block.reason}`)
       .join("; ");
+    const blockReason = `Claude review gate found blocking issues: ${reason}`;
+    // Record the blocked tree so an identical unchanged tree short-circuits to
+    // the same decision on the next Stop instead of re-running the full review.
+    setConfig(cwd, "lastBlockedReviewGateDiffHash", diffHash);
+    setConfig(cwd, "lastBlockedReviewGateReason", blockReason);
     process.stdout.write(`${JSON.stringify({
       decision: "block",
-      reason: `Claude review gate found blocking issues: ${reason}`
+      reason: blockReason
     })}\n`);
     return;
   }
@@ -5103,5 +5130,10 @@ export async function main(argv = process.argv.slice(2)) {
 
 const entrypointPath = process.argv[1] ? path.resolve(process.argv[1]) : "";
 if (entrypointPath && fileURLToPath(import.meta.url) === entrypointPath) {
-  await main();
+  await main().catch((error) => {
+    // Last-resort guard so foreground commands surface a clean message instead
+    // of a raw Node stack trace (e.g. governor I/O failures before a handler).
+    console.error(stripTerminalControls(error?.message || String(error)));
+    process.exit(2);
+  });
 }

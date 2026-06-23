@@ -164,6 +164,9 @@ function runStopReview(cwd, input = {}, stopGateLease, leaseEnv) {
     cwd,
     env: childEnv,
     encoding: "utf8",
+    // Default 1 MiB is too small for verbose --json review output; an ENOBUFS
+    // truncation would look like a tool failure and (fail-closed) block Stop.
+    maxBuffer: 16 * 1024 * 1024,
     timeout: STOP_REVIEW_TIMEOUT_MS
   });
 

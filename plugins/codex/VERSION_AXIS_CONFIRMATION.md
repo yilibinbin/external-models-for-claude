@@ -16,15 +16,15 @@ Baseline commands:
 
 Throwaway version-axis commands:
 
-- `claude plugin validate --strict "$tmp_repo/repo/.claude-plugin/marketplace.json"` with marketplace `metadata.version = "0.2.0"` and codex entry `version = "1.1.0-fh.1"` exited 0.
-- `claude plugin validate --strict "$tmp_repo/repo/plugins/codex"` with codex manifest `version = "1.1.0-fh.1"` exited 0.
+- `claude plugin validate --strict "$tmp_repo/repo/.claude-plugin/marketplace.json"` with marketplace `metadata.version = "0.2.0"` and codex entry `version = "1.1.0-fh.2"` exited 0.
+- `claude plugin validate --strict "$tmp_repo/repo/plugins/codex"` with codex manifest `version = "1.1.0-fh.2"` exited 0.
 - `claude plugin validate --strict "$tmp_repo/repo/.claude-plugin/marketplace.json"` after setting codex entry `version = { "invalid": true }` exited 1 with `plugins.0.version: Invalid input: expected string, received object`.
 
 Accepted marketplace metadata version: `0.2.0`
 
-Accepted codex marketplace entry version: `1.1.0-fh.1`
+Accepted codex marketplace entry version: `1.1.0-fh.2`
 
-Accepted codex plugin manifest version: `1.1.0-fh.1`
+Accepted codex plugin manifest version: `1.1.0-fh.2`
 
 Negative invalid-entry-version probe result: rejected by strict validation with exit code 1.
 
@@ -32,4 +32,4 @@ marketplaceEntryVersionSupported: true
 
 validatorUnavailable: false
 
-Fallback decision: no fallback needed. Use marketplace tag/version `v0.2.0` / `0.2.0` and Codex local extension version `1.1.0-fh.1`.
+Fallback decision: no fallback needed. Use marketplace tag/version `v0.2.0` / `0.2.0` and Codex local extension version `1.1.0-fh.2`.
