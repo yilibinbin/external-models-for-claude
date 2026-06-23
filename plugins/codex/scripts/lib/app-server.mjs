@@ -297,7 +297,34 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       }, 50).unref?.();
     }
 
-    await this.exitPromise;
+    // Bound the wait: a wedged child that ignores SIGTERM must not hang close()
+    // forever (that would defeat the initialize timeout). Escalate to SIGKILL /
+    // terminateProcessTree and resolve regardless after a short grace period.
+    await this.awaitExitWithDeadline(() => {
+      if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
+        try {
+          terminateProcessTree(this.proc.pid);
+        } catch {
+          try { this.proc.kill("SIGKILL"); } catch { /* already gone */ }
+        }
+      }
+    });
+  }
+
+  async awaitExitWithDeadline(onTimeout, graceMs = 2000) {
+    let timer = null;
+    const guard = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        try { onTimeout?.(); } catch { /* best-effort */ }
+        resolve();
+      }, graceMs);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([this.exitPromise, guard]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   sendMessage(message) {
@@ -354,7 +381,22 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     if (this.socket) {
       this.socket.end();
     }
-    await this.exitPromise;
+    // Bound the wait so a half-open/unresponsive broker socket cannot hang
+    // close() forever and defeat the initialize timeout. Force-destroy and
+    // resolve after a short grace period.
+    let timer = null;
+    const guard = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        try { this.socket?.destroy(); } catch { /* already gone */ }
+        resolve();
+      }, 2000);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([this.exitPromise, guard]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   sendMessage(message) {
