@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Honour `stop_hook_active` in the Antigravity Stop review gate via a non-blocking stdin read and a `runReviewGate` loop-guard short-circuit (parity with claude-for-claude).
+- Align `review` argument-hint with the parser (drop the unimplemented `--wait`); map the session-lifecycle event explicitly instead of silently defaulting to `start`.
+- Document all 16 shipped skills in `skills/README.md`.
+
 ## 0.1.0 - 2026-06-14
 
 - Add normalized scorecard review contracts for `review`, plugin-managed `multi-review`, `adversarial-review`, and `plan-review`.
