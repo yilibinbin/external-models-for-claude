@@ -103,18 +103,67 @@ export function claimReservedJob(cwd, jobId, workerPid = process.pid, env = proc
     startedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
-  const tmpFile = `${file}.${process.pid}.claim.tmp`;
-  fs.writeFileSync(tmpFile, `${JSON.stringify(running, null, 2)}\n`, "utf8");
-  if (fs.readFileSync(file, "utf8") !== original) {
-    fs.rmSync(tmpFile, { force: true });
+  // Acquire an exclusive claim lock so two racing workers cannot both pass the
+  // read-compare-rename window. mkdir is atomic; EEXIST means another worker is
+  // mid-claim, so we lose the race. The claim window is sub-second, so a lock
+  // older than CLAIM_LOCK_STALE_MS is an orphan (the holder was hard-killed mid
+  // claim) and is reclaimed once to avoid permanently wedging the job.
+  const lockDir = `${file}.claim.lock`;
+  const CLAIM_LOCK_STALE_MS = 30 * 1000;
+  const acquireLock = () => {
+    try {
+      fs.mkdirSync(lockDir);
+      return { ok: true };
+    } catch (error) {
+      if (error && error.code === "EEXIST") {
+        return { ok: false };
+      }
+      throw error;
+    }
+  };
+  let locked = acquireLock();
+  if (!locked.ok) {
+    let stale = false;
+    try {
+      stale = Date.now() - fs.statSync(lockDir).mtimeMs > CLAIM_LOCK_STALE_MS;
+    } catch {
+      // Lock vanished between mkdir and stat; treat as reclaimable and retry.
+      stale = true;
+    }
+    if (stale) {
+      try {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      } catch {
+        // Another worker may have just reclaimed it; fall through to the retry.
+      }
+      locked = acquireLock();
+    }
+  }
+  if (!locked.ok) {
     return {
       status: "not_claimed",
       jobId,
-      reason: "Job changed before it could be claimed."
+      reason: "Job is being claimed by another worker."
     };
   }
-  fs.renameSync(tmpFile, file);
-  return { status: "claimed", job: running };
+  const tmpFile = `${file}.${process.pid}.claim.tmp`;
+  try {
+    // Re-read under the lock: another worker may have already claimed and
+    // changed the queued state before we acquired the lock.
+    if (fs.readFileSync(file, "utf8") !== original) {
+      return {
+        status: "not_claimed",
+        jobId,
+        reason: "Job changed before it could be claimed."
+      };
+    }
+    fs.writeFileSync(tmpFile, `${JSON.stringify(running, null, 2)}\n`, "utf8");
+    fs.renameSync(tmpFile, file);
+    return { status: "claimed", job: running };
+  } finally {
+    fs.rmSync(tmpFile, { force: true });
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  }
 }
 
 export function updateJob(cwd, jobId, updates, env = process.env) {

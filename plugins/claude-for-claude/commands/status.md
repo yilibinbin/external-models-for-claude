@@ -1,5 +1,5 @@
 ---
-description: List tracked Claude for Claude background jobs
+description: Show Claude for Claude setup and job status diagnostic
 argument-hint: '[--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)

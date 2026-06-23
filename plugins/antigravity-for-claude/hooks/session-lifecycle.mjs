@@ -84,8 +84,20 @@ function writeMarker(event) {
 }
 
 try {
-  const event = process.argv[2] === "end" ? "end" : "start";
-  writeMarker(event);
+  const arg = process.argv[2];
+  // Map explicitly and accept both the wired literals (start/end) and the
+  // Claude Code event names; warn instead of silently coercing an unknown arg.
+  let event = null;
+  if (arg === "end" || arg === "SessionEnd") {
+    event = "end";
+  } else if (arg === "start" || arg === "SessionStart") {
+    event = "start";
+  }
+  if (event === null) {
+    process.stderr.write(`[antigravity-for-claude lifecycle] unrecognized lifecycle arg "${arg ?? ""}"; skipping\n`);
+  } else {
+    writeMarker(event);
+  }
 } catch (error) {
   process.stderr.write(`[antigravity-for-claude lifecycle] ${error.message || String(error)}\n`);
 }

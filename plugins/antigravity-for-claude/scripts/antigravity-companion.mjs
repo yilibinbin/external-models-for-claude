@@ -333,6 +333,10 @@ function parseArgs(rawArgs) {
       args.latest = true;
     } else if (token === "--background") {
       args.background = true;
+    } else if (token === "--wait") {
+      // Review runs synchronously by default; accept --wait as an explicit no-op
+      // so it is consumed rather than swallowed into the model focus text.
+      args.wait = true;
     } else if (token === "--use-mailbox") {
       args.useMailbox = true;
     } else if (token === "--advisory-leases") {

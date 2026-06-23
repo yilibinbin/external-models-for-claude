@@ -7,7 +7,13 @@ const SECRET_PATTERNS = [
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z_]{20,}\b/g,
   /\bsk-[A-Za-z0-9_-]{20,}\b/g,
-  /\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s"'`]+/gi
+  // JSON / quoted key:value form, e.g. "password": "hunter2" or {"secret":'...'}
+  /(["'`]?\b(?:api[_-]?key|token|secret|password|passwd|pwd)\b["'`]?\s*[:=]\s*)["'`][^"'`]+["'`]/gi,
+  // bare (unquoted) key=value form. The negative lookahead only skips when the
+  // value is EXACTLY the placeholder (followed by a delimiter or end), so this
+  // stays idempotent without skipping a real value that merely starts with
+  // "[secret]" (e.g. password=[secret]LEAKED would otherwise pass through).
+  /\b(?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*(?!\[secret\](?:[\s"'`,}\]]|$))[^\s"'`,}]+/gi
 ];
 
 const ANSI_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
@@ -58,7 +64,10 @@ export function stripTerminalControls(text) {
 export function redactSecrets(text) {
   let output = String(text ?? "");
   for (const pattern of SECRET_PATTERNS) {
-    output = output.replace(pattern, "[secret]");
+    // Patterns with a capture group keep the key prefix and redact only the value.
+    output = output.replace(pattern, (match, keyPrefix) =>
+      typeof keyPrefix === "string" ? `${keyPrefix}[secret]` : "[secret]"
+    );
   }
   return output;
 }

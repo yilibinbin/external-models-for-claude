@@ -44,6 +44,13 @@ export async function sendBrokerShutdown(endpoint) {
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     socket.setEncoding("utf8");
+    // Bound the shutdown so a dead peer on a stale socket cannot stall SessionEnd
+    // up to the host hook timeout; destroy and resolve if it never replies.
+    socket.setTimeout(1000);
+    socket.on("timeout", () => {
+      socket.destroy();
+      resolve();
+    });
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });

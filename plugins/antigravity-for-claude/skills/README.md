@@ -15,3 +15,6 @@ Antigravity for Claude ships focused skills for:
 - `antigravity-status`
 - `antigravity-result`
 - `antigravity-cancel`
+- `antigravity-collaboration-loop`
+- `antigravity-leases`
+- `antigravity-mailbox`

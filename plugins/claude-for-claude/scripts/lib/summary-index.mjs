@@ -40,5 +40,11 @@ export function writeRoundSummary(cwd, loopId, round, summary, env = process.env
 }
 
 export function readRoundSummary(cwd, loopId, round, env = process.env) {
-  return readJson(summaryFile(cwd, loopId, round, env));
+  // Degrade gracefully on a corrupt/truncated summary file, mirroring the
+  // corrupt-file handling used by the rest of the state layer (jobs/leases/tasksets).
+  try {
+    return readJson(summaryFile(cwd, loopId, round, env));
+  } catch {
+    return null;
+  }
 }

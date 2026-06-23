@@ -209,7 +209,10 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   if (!codexStatus.available) {
     nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
   }
-  if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
+  // Treat an unknown auth result (null, e.g. the app-server auth probe failed) as
+  // "still suggest login" so a not-ready setup always offers the most common fix;
+  // only an explicit requiresOpenaiAuth === false suppresses the hint.
+  if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth !== false) {
     nextSteps.push("Run `!codex login`.");
     nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`.");
   }
@@ -937,6 +940,16 @@ function enqueueBackgroundTask(cwd, job, request, backgroundLease, dependencies 
     }
     if (!transferred) {
       backgroundLease.release();
+    }
+    // The worker may already be spawned (e.g. lease transfer or a later job-file
+    // write failed). Terminate it so it is not orphaned while the job is recorded
+    // as failed and its lease file removed.
+    if (Number.isInteger(childPid) && childPid > 0) {
+      try {
+        terminateProcessTree(childPid);
+      } catch {
+        // Best-effort; the session lifecycle hook also tears down matching jobs.
+      }
     }
     recordBackgroundLaunchFailure(job, queuedRecord, logFile, error, dependencies);
     throw error;

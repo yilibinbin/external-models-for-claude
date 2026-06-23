@@ -21,6 +21,9 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+// The handshake should be near-instant; bound it so a wedged app-server that
+// never emits the initialize response fails fast instead of hanging forever.
+const INITIALIZE_TIMEOUT_MS = 30 * 1000;
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -90,10 +93,40 @@ class AppServerClientBase {
     const id = this.nextId;
     this.nextId += 1;
 
+    // Most RPCs (review/start, turn/start) are intentionally long-running and
+    // must not be bounded here. Only handshake RPCs opt into a timeout via
+    // `timeoutMs` so a wedged app-server cannot hang connect()/initialize().
+    const timeoutMs = Number.isInteger(this.requestTimeoutOverrideMs) && this.requestTimeoutOverrideMs > 0
+      ? this.requestTimeoutOverrideMs
+      : 0;
+
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      let timer = null;
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          const pending = this.pending.get(id);
+          if (!pending) {
+            return;
+          }
+          this.pending.delete(id);
+          pending.reject(createProtocolError(`codex app-server did not respond to "${method}" within ${timeoutMs}ms.`));
+        }, timeoutMs);
+        if (typeof timer.unref === "function") {
+          timer.unref();
+        }
+      }
+      this.pending.set(id, { resolve, reject, method, timer });
       this.sendMessage({ id, method, params });
     });
+  }
+
+  async requestWithTimeout(method, params, timeoutMs) {
+    this.requestTimeoutOverrideMs = timeoutMs;
+    try {
+      return await this.request(method, params);
+    } finally {
+      this.requestTimeoutOverrideMs = 0;
+    }
   }
 
   notify(method, params = {}) {
@@ -138,6 +171,9 @@ class AppServerClientBase {
         return;
       }
       this.pending.delete(message.id);
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
 
       if (message.error) {
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
@@ -168,6 +204,9 @@ class AppServerClientBase {
     this.exitError = error ?? null;
 
     for (const pending of this.pending.values()) {
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
       pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
     this.pending.clear();
@@ -218,10 +257,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleLine(line);
     });
 
-    await this.request("initialize", {
+    await this.requestWithTimeout("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
+    }, INITIALIZE_TIMEOUT_MS);
     this.notify("initialized", {});
   }
 
@@ -298,10 +337,10 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
       });
     });
 
-    await this.request("initialize", {
+    await this.requestWithTimeout("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
+    }, INITIALIZE_TIMEOUT_MS);
     this.notify("initialized", {});
   }
 
