@@ -118,10 +118,37 @@ export function hasEndedSession(cwd, sessionId) {
   return stateHasEndedSession(loadState(cwd), sessionId);
 }
 
+// Fields that must never be persisted into the shared state array (they carry
+// private request/result payloads); the sidecar file is the source of truth for
+// them. Mirrors sharedJobPatchFromSidecar in job-control.mjs.
+function stripPrivateJobFields(job) {
+  const { request, result, rendered, backgroundLease, backgroundLeaseId, lease, ...shared } = job;
+  return shared;
+}
+
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs]
+    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+  // Never evict an active (queued/running) job by the MAX_JOBS cap purely on
+  // updatedAt: a long-running job that emits few progress events would otherwise
+  // be dropped from shared state once >MAX_JOBS jobs accumulate, leaving state
+  // inconsistent (and reliant on sidecar re-merge in every consumer). Keep all
+  // active jobs (with private payload stripped, since shared state is not the
+  // privacy boundary), then fill the remaining slots with the newest terminal jobs.
+  // Shared state is not the privacy boundary or the source of truth for private
+  // payloads (the sidecar file is; /codex:result reads it via readStoredJob), so
+  // strip private fields from BOTH active and terminal jobs to keep state.json
+  // lean and consistent.
+  const active = sorted
+    .filter((job) => job.status === "queued" || job.status === "running")
+    .map(stripPrivateJobFields);
+  const terminal = sorted
+    .filter((job) => job.status !== "queued" && job.status !== "running")
+    .map(stripPrivateJobFields);
+  if (active.length >= MAX_JOBS) {
+    return active;
+  }
+  return [...active, ...terminal.slice(0, MAX_JOBS - active.length)];
 }
 
 function removeFileIfExists(filePath) {

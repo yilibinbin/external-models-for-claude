@@ -360,16 +360,26 @@ export function writeHeartbeatIfRunning(job, nowMs = null, isRunning = null) {
   }
 
   const heartbeatAtMs = Number.isFinite(nowMs) ? nowMs : Date.now();
-  const updated = mutateJobFile(job.workspaceRoot, job.id, (storedJob) => {
-    if (!storedJob?.id || !storedJob.status || ["completed", "failed", "cancelled"].includes(storedJob.status)) {
-      return null;
-    }
-    return {
-      ...storedJob,
-      heartbeatAtMs,
-      heartbeatAt: new Date(heartbeatAtMs).toISOString()
-    };
-  });
+  // Heartbeat is best-effort: a corrupt/half-written sidecar makes
+  // mutateJobFile -> readJobFile (JSON.parse) throw. Because this runs on a
+  // setInterval, an uncaught throw would terminate the detached worker (aborting
+  // the in-flight turn and orphaning the codex child). Swallow and skip the tick.
+  let updated;
+  try {
+    updated = mutateJobFile(job.workspaceRoot, job.id, (storedJob) => {
+      if (!storedJob?.id || !storedJob.status || ["completed", "failed", "cancelled"].includes(storedJob.status)) {
+        return null;
+      }
+      return {
+        ...storedJob,
+        heartbeatAtMs,
+        heartbeatAt: new Date(heartbeatAtMs).toISOString()
+      };
+    });
+  } catch (heartbeatError) {
+    process.stderr.write(`[codex-for-claude] heartbeat skipped: ${heartbeatError?.message ?? String(heartbeatError)}\n`);
+    return false;
+  }
   return Boolean(updated);
 }
 

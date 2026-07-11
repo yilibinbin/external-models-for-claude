@@ -4,6 +4,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import tempfile
 
 import pytest
 
@@ -428,7 +429,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.2" in notices
+    assert "Local extended version: 1.1.0-fh.3" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -7856,7 +7857,7 @@ def test_codex_github_actions_module_has_no_top_level_side_effects():
 
 
 def test_codex_github_actions_plugin_root_resolves_template_from_installed_cache_layout(tmp_path):
-    installed = tmp_path / "cache" / "external-models-for-claude" / "codex" / "1.1.0-fh.2"
+    installed = tmp_path / "cache" / "external-models-for-claude" / "codex" / "1.1.0-fh.3"
     shutil.copytree(PLUGIN, installed)
     module_url = (installed / "scripts" / "lib" / "github-actions.mjs").as_uri()
     script = (
@@ -8179,3 +8180,480 @@ def test_codex_companion_guarded_entrypoint_copy_tree_doctor_smoke(tmp_path):
     )
     assert result.returncode == 0
     assert json.loads(result.stdout)["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the app-server transport / broker / governor fixes
+# (H1 transport death, T1 close/initialize/malformed timeouts, T3 bounded
+# broker shutdown, M4 broker self-termination, M1 corrupt lock reclaim,
+# M2 corrupt-sidecar heartbeat, S1 argv-safe commands, L5 stop-gate
+# workspace resolution, L9 summary sanitization).
+#
+# These drive the real plugin modules. Because the host machine may have a
+# real `codex` on PATH, every app-server test builds a fake `codex` that
+# shadows it and execs a fake JSONL app-server; env["PATH"] prepends the fake
+# bin dir (keeping node on PATH) exactly like fake_codex_app_server_dir.
+# ---------------------------------------------------------------------------
+
+FAKE_APP_SERVER_CODEX = "\n".join(
+    [
+        "#!/bin/sh",
+        'if [ "$1" = "--version" ]; then printf "codex 1.0.0\\n"; exit 0; fi',
+        'if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then printf "codex app-server help\\n"; exit 0; fi',
+        'if [ "$1" = "app-server" ]; then exec node "$(dirname "$0")/fake-app-server.mjs"; fi',
+        'printf "unexpected fake codex args: %s\\n" "$*" >&2',
+        "exit 1",
+        "",
+    ]
+)
+
+
+def write_fake_app_server(tmp_path, server_js):
+    """Write a fake `codex` (shadowing the real one) plus a fake app-server .mjs."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "fake-app-server.mjs").write_text(server_js, encoding="utf8")
+    write_executable(bin_dir / "codex", FAKE_APP_SERVER_CODEX)
+    return bin_dir
+
+
+def app_server_env(tmp_path, bin_dir):
+    return {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data"),
+    }
+
+
+def run_node_inline(script, env, args=None, timeout=30, cwd=ROOT):
+    """Run inline ESM but (unlike run_node_script) let the caller inspect a
+    possibly non-zero exit and enforce a hard timeout so a hang fails loudly."""
+    command_env = os.environ.copy()
+    command_env.update(env)
+    return subprocess.run(
+        [NODE, "--input-type=module", "-e", script, *(args or [])],
+        cwd=cwd,
+        env=command_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def read_app_server_initialize_timeout_ms():
+    source = read_text(PLUGIN / "scripts" / "lib" / "app-server.mjs")
+    match = re.search(r"INITIALIZE_TIMEOUT_MS\s*=\s*([0-9]+)\s*\*\s*([0-9]+)\s*;", source)
+    if match:
+        return int(match.group(1)) * int(match.group(2))
+    plain = re.search(r"INITIALIZE_TIMEOUT_MS\s*=\s*([0-9]+)\s*;", source)
+    assert plain, "could not read INITIALIZE_TIMEOUT_MS"
+    return int(plain.group(1))
+
+
+def test_codex_captureTurn_rejects_on_transport_death(tmp_path):
+    # H1: after turn/start, the backing app-server dies. The direct client keys
+    # off exitPromise resolving (carrying the transport-death error) so an
+    # in-flight turn is not left hanging forever.
+    server_js = (
+        "import readline from 'node:readline';\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "const send = (m) => console.log(JSON.stringify(m));\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const m = JSON.parse(line);\n"
+        "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); }\n"
+        "  else if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); }\n"
+        "  else if (m.method === 'turn/start') {\n"
+        "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+        "    setTimeout(() => process.exit(1), 100);\n"
+        "  } else { send({ id: m.id, result: {} }); }\n"
+        "});\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    script = """
+        import { CodexAppServerClient } from '/tmp/codex-fix/plugins/codex/scripts/lib/app-server.mjs';
+        const client = await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });
+        client.request('turn/start', { threadId: 'thread-1' }).catch(() => {});
+        const start = Date.now();
+        // The H1 fix keys on exitPromise resolving after the child dies; bound
+        // the wait so a hang shows up as a guard timeout, not a real resolution.
+        const outcome = await Promise.race([
+          client.exitPromise.then(() => 'exit-resolved'),
+          new Promise((r) => setTimeout(() => r('hung'), 5000))
+        ]);
+        console.log(JSON.stringify({
+          outcome,
+          ms: Date.now() - start,
+          exitError: client.exitError?.message ?? null
+        }));
+        process.exit(0);
+    """
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=15)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "exit-resolved"
+    assert payload["ms"] < 4000
+    assert "exited unexpectedly" in (payload["exitError"] or "")
+
+
+def test_codex_appserver_client_close_timeout_escalates(tmp_path):
+    # T1/L3: an app-server that traps SIGTERM forces close() to escalate to
+    # SIGKILL after the 2s guard, and the guard must settle exitPromise so a
+    # SECOND close() cannot hang on the `if (this.closed) await exitPromise`
+    # fast-path.
+    server_js = (
+        "import readline from 'node:readline';\n"
+        "process.on('SIGTERM', () => {});\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "const send = (m) => console.log(JSON.stringify(m));\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const m = JSON.parse(line);\n"
+        "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); }\n"
+        "  else { send({ id: m.id, result: {} }); }\n"
+        "});\n"
+        "setInterval(() => {}, 1000);\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    script = """
+        import { CodexAppServerClient } from '/tmp/codex-fix/plugins/codex/scripts/lib/app-server.mjs';
+        const client = await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });
+        const t0 = Date.now();
+        await client.close();
+        const firstMs = Date.now() - t0;
+        const t1 = Date.now();
+        await client.close();
+        const secondMs = Date.now() - t1;
+        console.log(JSON.stringify({ firstMs, secondMs }));
+        process.exit(0);
+    """
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=20)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    # First close waits out the 2s guard then escalates; must return well under
+    # a would-be hang.
+    assert 1000 <= payload["firstMs"] < 3500
+    # Second close must be near-instant (guard already settled exitPromise).
+    assert payload["secondMs"] < 1000
+
+
+def test_codex_appserver_initialize_timeout(tmp_path):
+    # T1: an app-server that never replies to initialize must make connect()
+    # reject at INITIALIZE_TIMEOUT_MS (read from source) instead of hanging.
+    init_timeout_ms = read_app_server_initialize_timeout_ms()
+    server_js = (
+        "import readline from 'node:readline';\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "rl.on('line', () => {});\n"
+        "setInterval(() => {}, 1000);\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    script = """
+        import { CodexAppServerClient } from '/tmp/codex-fix/plugins/codex/scripts/lib/app-server.mjs';
+        const t0 = Date.now();
+        let outcome = 'connected';
+        let message = null;
+        try { await CodexAppServerClient.connect(process.argv[1], { disableBroker: true }); }
+        catch (error) { outcome = 'rejected'; message = error.message; }
+        console.log(JSON.stringify({ outcome, ms: Date.now() - t0, message }));
+        process.exit(0);
+    """
+    hard_timeout = init_timeout_ms / 1000 + 15
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=hard_timeout)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "rejected"
+    assert "initialize" in (payload["message"] or "")
+    # Rejected near the configured timeout, not immediately and not after a hang.
+    assert init_timeout_ms - 2000 <= payload["ms"] <= init_timeout_ms + 8000
+
+
+def test_codex_appserver_malformed_jsonl_rejects_pending(tmp_path):
+    # T1: a non-JSON line from the app-server drives handleExit, which must
+    # reject the in-flight request instead of leaving it pending forever.
+    server_js = (
+        "import readline from 'node:readline';\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "const send = (m) => console.log(JSON.stringify(m));\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const m = JSON.parse(line);\n"
+        "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); }\n"
+        "  else if (m.method === 'turn/start') { console.log('this is not json{{{'); setTimeout(() => process.exit(0), 30); }\n"
+        "  else { send({ id: m.id, result: {} }); }\n"
+        "});\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    script = """
+        import { CodexAppServerClient } from '/tmp/codex-fix/plugins/codex/scripts/lib/app-server.mjs';
+        const client = await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });
+        const t0 = Date.now();
+        let outcome = 'resolved', message = null;
+        try { await client.request('turn/start', { threadId: 'thread-1' }); }
+        catch (error) { outcome = 'rejected'; message = error.message; }
+        console.log(JSON.stringify({ outcome, ms: Date.now() - t0, message }));
+        process.exit(0);
+    """
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=15)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "rejected"
+    assert "Failed to parse codex app-server JSONL" in (payload["message"] or "")
+    assert payload["ms"] < 4000
+
+
+def test_codex_broker_self_terminates_on_backing_death(tmp_path):
+    # M4: when the backing app-server dies, the broker must self-terminate
+    # (non-zero exit) and remove its endpoint socket + pidFile, so the next
+    # ensureBrokerSession spawns a fresh broker instead of reusing a zombie.
+    server_js = (
+        "import readline from 'node:readline';\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "const send = (m) => console.log(JSON.stringify(m));\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const m = JSON.parse(line);\n"
+        "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); setTimeout(() => process.exit(1), 150); }\n"
+        "  else { send({ id: m.id, result: {} }); }\n"
+        "});\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    # Unix socket paths are length-bounded (~104 chars), so put the endpoint in
+    # a short system-temp dir rather than under the long tmp_path.
+    session_dir = pathlib.Path(tempfile.mkdtemp(prefix="cxc-brk-"))
+    try:
+        endpoint = f"unix:{session_dir / 'broker.sock'}"
+        pid_file = session_dir / "broker.pid"
+        log_file = session_dir / "broker.log"
+        with open(log_file, "w", encoding="utf8") as log_fd:
+            proc = subprocess.Popen(
+                [
+                    NODE,
+                    str(PLUGIN / "scripts" / "app-server-broker.mjs"),
+                    "serve",
+                    "--endpoint",
+                    endpoint,
+                    "--cwd",
+                    str(bin_dir),
+                    "--pid-file",
+                    str(pid_file),
+                ],
+                cwd=str(bin_dir),
+                env={**os.environ, **app_server_env(tmp_path, bin_dir)},
+                stdout=log_fd,
+                stderr=log_fd,
+            )
+        try:
+            rc = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise AssertionError(
+                f"broker did not self-terminate; log:\n{log_file.read_text(encoding='utf8')}"
+            )
+        assert rc != 0, log_file.read_text(encoding="utf8")
+        assert not (session_dir / "broker.sock").exists()
+        assert not pid_file.exists()
+    finally:
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def test_codex_broker_shutdown_is_bounded(tmp_path):
+    # T3: sendBrokerShutdown against a peer that accepts but never replies must
+    # resolve on the 1s socket timeout, not stall SessionEnd.
+    script = """
+        import net from 'node:net';
+        import fs from 'node:fs';
+        import os from 'node:os';
+        import path from 'node:path';
+        import { sendBrokerShutdown } from '/tmp/codex-fix/plugins/codex/scripts/lib/broker-lifecycle.mjs';
+        const sockPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cxc-sd-')), 's.sock');
+        const server = net.createServer(() => { /* accept, never reply */ });
+        await new Promise((resolve) => server.listen(sockPath, resolve));
+        const t0 = Date.now();
+        await sendBrokerShutdown(`unix:${sockPath}`);
+        const ms = Date.now() - t0;
+        console.log(JSON.stringify({ ms }));
+        // Exit hard: the accepted server-side socket is still open, so a graceful
+        // server.close() would block on the lingering connection.
+        process.exit(0);
+    """
+    result = run_node_inline(script, {"CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")}, timeout=8)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert 800 <= payload["ms"] < 2000
+
+
+@pytest.mark.parametrize("variant", ["zero", "truncated"])
+def test_codex_governor_reclaims_corrupt_lock(tmp_path, variant):
+    # M1: a corrupt/0-byte `.governor.lock` older than the stale threshold must
+    # be reclaimed so acquireResourceLease succeeds promptly instead of
+    # deadlocking on the mutex until the wait expires.
+    lock_dir = tmp_path / "locks"
+    script = """
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { acquireResourceLease } from '/tmp/codex-fix/plugins/codex/scripts/lib/resource-governor.mjs';
+        const lockDir = process.env.CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR;
+        fs.mkdirSync(lockDir, { recursive: true });
+        const lockFile = path.join(lockDir, '.governor.lock');
+        const variant = process.argv[1];
+        fs.writeFileSync(lockFile, variant === 'zero' ? '' : '{"pid":123,"createdAtMs');
+        // Backdate the mtime older than the (short) stale threshold so the lock
+        // cannot be mistaken for a concurrent writer mid-write.
+        const old = new Date(Date.now() - 60_000);
+        fs.utimesSync(lockFile, old, old);
+        const t0 = Date.now();
+        const lease = acquireResourceLease('model-call', { env: process.env, command: 'test' });
+        console.log(JSON.stringify({
+          ok: lease.ok,
+          ms: Date.now() - t0,
+          lockRemoved: !fs.existsSync(lockFile),
+          leaseId: lease.lease?.id ?? null
+        }));
+        process.exit(0);
+    """
+    env = {
+        "CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR": str(lock_dir),
+        "CODEX_FOR_CLAUDE_LOCK_STALE_MS": "2000",
+        "CODEX_FOR_CLAUDE_MUTEX_WAIT_MS": "8000",
+        "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data"),
+    }
+    result = run_node_inline(script, env, args=[variant], timeout=15)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["leaseId"] is not None
+    # Well under the 8s mutex wait: a reclaim, not a timeout.
+    assert payload["ms"] < 2000
+    assert payload["lockRemoved"] is True
+
+
+def test_codex_heartbeat_survives_corrupt_sidecar(tmp_path):
+    # M2: a corrupt/half-written sidecar makes mutateJobFile -> readJobFile
+    # throw. Because the heartbeat runs on a setInterval, an uncaught throw would
+    # terminate the detached worker; it must return false and not throw.
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { writeHeartbeatIfRunning } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        import { upsertJob, writeJobFile, resolveJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        const cwd = process.argv[1];
+        const job = { id: 'hb-corrupt', status: 'running', workspaceRoot: cwd };
+        upsertJob(cwd, job);
+        writeJobFile(cwd, job.id, job);
+        fs.writeFileSync(resolveJobFile(cwd, job.id), '{ this is : not valid json ', 'utf8');
+        let threw = false, result = null;
+        try { result = writeHeartbeatIfRunning(job, 123456, () => true); }
+        catch { threw = true; }
+        console.log(JSON.stringify({ threw, result }));
+        """,
+        env={"CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")},
+        args=[str(tmp_path / "ws")],
+    )
+    assert payload["threw"] is False
+    assert payload["result"] is False
+
+
+def test_codex_cancel_status_result_commands_are_argv_safe():
+    # S1: the cancel/status/result commands must not carry the vulnerable
+    # inline `!`node ... "$ARGUMENTS"`` interpolation and must keep the
+    # explicit no-interpolation guidance.
+    vulnerable = re.compile(r"!`node[^`]*\$ARGUMENTS[^`]*`")
+    guidance = "Do not interpolate `$ARGUMENTS` into Bash"
+    for command in ("cancel.md", "status.md", "result.md"):
+        text = read_text(PLUGIN / "commands" / command)
+        assert not vulnerable.search(text), command
+        assert guidance in text, command
+
+
+def _enable_stop_gate(repo_dir, plugin_data):
+    run_node_inline(
+        """
+        import { setConfig } from '/tmp/codex-fix/plugins/codex/scripts/lib/state.mjs';
+        setConfig(process.argv[1], 'stopReviewGate', true);
+        console.log('ok');
+        """,
+        {"CLAUDE_PLUGIN_DATA": str(plugin_data)},
+        args=[str(repo_dir)],
+        timeout=15,
+    )
+
+
+def _run_stop_gate_hook(cwd, plugin_data, stdin_text, extra_env=None):
+    env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(plugin_data)}
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [NODE, str(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")],
+        cwd=str(cwd),
+        env=env,
+        input=stdin_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=15,
+    )
+
+
+def test_codex_stop_gate_malformed_stdin_fails_closed(tmp_path):
+    # L5/T6: non-JSON Stop stdin must fail closed when the gate is on, stay
+    # silent when the gate is off, and (the L5 fix) resolve the gate against
+    # CLAUDE_PROJECT_DIR before process.cwd() even when stdin is unparseable.
+    plugin_data = tmp_path / "plugin-data"
+    gate_on = tmp_path / "gate_on"
+    gate_off = tmp_path / "gate_off"
+    gate_on.mkdir()
+    gate_off.mkdir()
+    _enable_stop_gate(gate_on, plugin_data)
+
+    # (a) gate ON + malformed stdin => fail closed (block).
+    on_result = _run_stop_gate_hook(gate_on, plugin_data, "this is not json")
+    assert on_result.returncode == 0, on_result.stderr
+    assert json.loads(on_result.stdout)["decision"] == "block"
+
+    # (b) gate OFF (default repo) + malformed stdin => no decision emitted.
+    off_result = _run_stop_gate_hook(gate_off, plugin_data, "this is not json")
+    assert off_result.returncode == 0
+    assert off_result.stdout == ""
+
+    # (c) CLAUDE_PROJECT_DIR points at the gate-ON repo while cwd is gate-OFF;
+    # malformed stdin must still block (locks in the workspace-resolution fix).
+    project_dir_result = _run_stop_gate_hook(
+        gate_off,
+        plugin_data,
+        "this is not json",
+        extra_env={"CLAUDE_PROJECT_DIR": str(gate_on)},
+    )
+    assert project_dir_result.returncode == 0, project_dir_result.stderr
+    assert json.loads(project_dir_result.stdout)["decision"] == "block"
+
+
+def test_codex_summary_is_sanitized():
+    # L9: sanitizeModelText must redact secrets + local paths and strip terminal
+    # control chars before Codex-derived text is persisted / re-displayed.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const input = [
+          'gh token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+          'aws key AKIAIOSFODNN7EXAMPLE',
+          'path /Users/alice/secret/notes.txt',
+          'ansi \\x1b[31mRED\\x1b[0m',
+          'bell A\\x07B'
+        ].join(' ');
+        console.log(JSON.stringify({ output: sanitizeModelText(input) }));
+        """
+    )
+    output = payload["output"]
+    assert "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in output
+    assert "AKIAIOSFODNN7EXAMPLE" not in output
+    assert "[secret]" in output
+    assert "/Users/alice" not in output
+    assert "\x1b" not in output
+    assert "\x07" not in output
+    # The ANSI escape is stripped but its visible payload survives.
+    assert "RED" in output
+    assert "AB" in output
