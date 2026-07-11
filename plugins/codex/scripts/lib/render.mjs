@@ -94,6 +94,13 @@ function formatJobLine(job) {
 
 function escapeMarkdownCell(value) {
   return String(value ?? "")
+    // Strip ANSI escape sequences and other control chars: model-derived cell
+    // values (e.g. job summaries) can contain escape codes that would corrupt or
+    // spoof the rendered status/finding table.
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
     .replace(/\|/g, "\\|")
     .replace(/\r?\n/g, " ")
     .trim();

@@ -229,6 +229,16 @@ export function versionAxisConfirmation(start = process.cwd()) {
 
 export function shouldExpectMarketplaceEntryVersion(start = process.cwd()) {
   const confirmation = versionAxisConfirmation(start);
+  // Two independent regexes each drive a boolean; a malformed confirmation doc
+  // that asserts both `supported:true` and `supported:false` (or both
+  // validator states) must not silently pass by picking `supported`. Reject the
+  // self-contradictory evidence instead of trusting the first-checked flag.
+  if (confirmation.marketplaceEntryVersionSupported && confirmation.marketplaceEntryVersionUnsupported) {
+    throw new Error("Version-axis confirmation is self-contradictory: marketplaceEntryVersionSupported is asserted both true and false.");
+  }
+  if (confirmation.validatorAvailable && confirmation.validatorUnavailable) {
+    throw new Error("Version-axis confirmation is self-contradictory: validatorUnavailable is asserted both true and false.");
+  }
   if (confirmation.marketplaceEntryVersionSupported) {
     return true;
   }

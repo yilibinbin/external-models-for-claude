@@ -322,6 +322,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     const guard = new Promise((resolve) => {
       timer = setTimeout(() => {
         try { onTimeout?.(); } catch { /* best-effort */ }
+        // Settle exitPromise so the `if (this.closed) await this.exitPromise`
+        // fast-path in close() can never block on a genuinely unkillable child
+        // (whose proc 'exit'/socket 'close' never fires) after the guard fired.
+        try { this.resolveExit(undefined); } catch { /* already settled */ }
         resolve();
       }, graceMs);
       timer.unref?.();

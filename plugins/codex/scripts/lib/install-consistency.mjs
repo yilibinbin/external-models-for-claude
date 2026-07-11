@@ -30,7 +30,11 @@ export function installedCodexEntry(listJson) {
     return null;
   }
 
-  const entry = plugins.find((item) => item?.name === "codex" || item?.id === PLUGIN_ID);
+  // Prefer an exact plugin-ID match over a bare name match, mirroring the
+  // ID-first workflow resolver, so a second unrelated entry named "codex" from
+  // a different marketplace cannot shadow the real plugin.
+  const entry = plugins.find((item) => item?.id === PLUGIN_ID)
+    ?? plugins.find((item) => item?.name === "codex");
   if (!entry) {
     return null;
   }

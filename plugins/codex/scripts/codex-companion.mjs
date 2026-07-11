@@ -31,6 +31,7 @@ import { runReleaseCheck } from "./lib/release-check.mjs";
 import { resolveQuality } from "./lib/quality-policy.mjs";
 import { resolveRoles } from "./lib/role-packs.mjs";
 import { redactMachinePaths } from "./lib/path-hygiene.mjs";
+import { sanitizeModelText } from "./lib/sanitize.mjs";
 import {
   generateJobId,
   getConfig,
@@ -194,7 +195,12 @@ function firstMeaningfulLine(text, fallback) {
     .split(/\r?\n/)
     .map((value) => value.trim())
     .find(Boolean);
-  return line ?? fallback;
+  // The summary is derived from raw Codex output and is persisted into job state,
+  // then re-displayed in /codex:status and /codex:result. Redact secrets, local
+  // paths, and terminal control chars so a credential or escape sequence on the
+  // first output line is not stored and re-surfaced (or used to corrupt the
+  // status table rendering).
+  return line != null ? sanitizeModelText(line) : fallback;
 }
 
 async function buildSetupReport(cwd, actionsTaken = []) {
@@ -1053,7 +1059,7 @@ async function handleReviewCommand(argv, config) {
           cwd,
           base: options.base,
           scope: options.scope,
-          model: options.model,
+          model: normalizeRequestedModel(options.model),
           focusText,
           reviewName: config.reviewName,
           effort: config.reviewName === "Adversarial Review" ? quality.effort : null,
@@ -1482,6 +1488,15 @@ function handleGithubActions(argv) {
   }
 
   if (action === "init") {
+    // Defense-in-depth for a security-critical file: never persist a workflow
+    // that fails the fork-safety structural checks, even though --ref is already
+    // strictly validated and the template is trusted.
+    const validation = validateWorkflow(rendered);
+    if (!(validation.ok || (validation.preview && validation.structuralOk))) {
+      outputResult(options.json ? validation : renderGithubActionsValidation(validation), options.json);
+      process.exitCode = 1;
+      return;
+    }
     const target = writeWorkflow(process.cwd(), rendered, { force: Boolean(options.force) });
     process.stdout.write(`Wrote ${target}\n`);
     return;

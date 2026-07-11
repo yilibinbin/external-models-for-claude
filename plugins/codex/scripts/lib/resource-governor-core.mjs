@@ -143,7 +143,16 @@ export function createResourceGovernor(config) {
         try {
           const stat = fs.statSync(file);
           const lock = readJsonOrNull(file);
-          if (lock && ((Date.now() - stat.mtimeMs) > lockStaleMs(env) || !processAlive(lock.pid))) {
+          const mtimeExpired = (Date.now() - stat.mtimeMs) > lockStaleMs(env);
+          // Reclaim when: a parseable lock is expired or its owner is dead, OR
+          // the lock is corrupt/0-byte (readJsonOrNull => null) AND old enough
+          // that it cannot be a concurrent writer mid-write. Without the null
+          // branch a non-atomic write that crashed between openSync(wx) and
+          // writeFileSync leaves a 0-byte lock that deadlocks the mutex forever.
+          const stale = lock
+            ? (mtimeExpired || !processAlive(lock.pid))
+            : mtimeExpired;
+          if (stale) {
             fs.rmSync(file, { force: true });
             continue;
           }
@@ -584,8 +593,14 @@ export function createResourceGovernor(config) {
         const file = path.join(root, name);
         const lease = readJsonOrNull(file);
         if (isOurLease(lease) && lease.kind === "background-job" && lease.jobId && ids.has(String(lease.jobId))) {
-          fs.rmSync(file, { force: true });
-          removed += 1;
+          // Per-item guard (mirroring reapStaleResourceLeasesLocked): a single
+          // EACCES/EPERM must not abort cleanup of the remaining leases in the batch.
+          try {
+            fs.rmSync(file, { force: true });
+            removed += 1;
+          } catch {
+            // Leave this lease for the next reap cycle; keep clearing the rest.
+          }
         }
       }
       return removed;

@@ -177,8 +177,33 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return session;
 }
 
+// Verify the persisted broker pid still belongs to the broker before killing it.
+// broker.json keeps the pid even when the broker died uncleanly, so on SessionEnd
+// the pid may be stale; if the OS recycled it as a new process-GROUP leader,
+// terminateProcessTree(-pid) would SIGTERM a wholly unrelated process group.
+// Require the pid to be alive AND to still match the broker's own pidFile.
+function brokerPidStillOwnsSession(pid, pidFile) {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    // ESRCH = dead (nothing to kill); EPERM = alive but not ours. Either way, skip.
+    return false;
+  }
+  // The broker writes its own pid to pidFile and removes it on graceful shutdown.
+  // Absent pidFile => already torn down (or never ours): skip the kill.
+  if (!pidFile || !fs.existsSync(pidFile)) {
+    return false;
+  }
+  try {
+    const recorded = Number.parseInt(String(fs.readFileSync(pidFile, "utf8")).trim(), 10);
+    return Number.isFinite(recorded) && recorded === pid;
+  } catch {
+    return false;
+  }
+}
+
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
-  if (Number.isFinite(pid) && killProcess) {
+  if (Number.isFinite(pid) && killProcess && brokerPidStillOwnsSession(pid, pidFile)) {
     try {
       killProcess(pid);
     } catch {

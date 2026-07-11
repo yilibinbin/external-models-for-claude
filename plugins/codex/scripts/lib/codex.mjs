@@ -597,7 +597,18 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    // Link turn capture to transport death: if the codex app-server crashes,
+    // is OOM-killed, or its socket drops after the turn has started,
+    // state.completion is never settled (only turn/completed settles it).
+    // Race it against the client's exit so a dead transport rejects the turn
+    // instead of hanging forever.
+    return await Promise.race([
+      state.completion,
+      client.exitPromise.then(() => {
+        throw client.exitError
+          ?? new Error("codex app-server connection closed before the turn completed.");
+      })
+    ]);
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);

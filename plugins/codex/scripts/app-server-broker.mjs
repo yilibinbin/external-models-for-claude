@@ -243,6 +243,21 @@ async function main() {
     process.exit(0);
   });
 
+  // Self-terminate if the backing `codex app-server` child dies: otherwise the
+  // broker lingers as a listening zombie that still answers `initialize`
+  // itself and passes the socket-connect readiness check, so ensureBrokerSession
+  // reuses a dead broker and every real RPC then fails/hangs. Tear down the
+  // endpoint/pid/state and exit non-zero so the next ensureBrokerSession spawns
+  // a fresh broker.
+  appClient.exitPromise.then(async () => {
+    try {
+      await shutdown(server);
+    } catch {
+      // Best-effort teardown; exit regardless so the stale broker cannot be reused.
+    }
+    process.exit(1);
+  });
+
   server.listen(listenTarget.path);
 }
 

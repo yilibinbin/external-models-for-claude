@@ -23,8 +23,10 @@ export function safeReadFile(filePath) {
 }
 
 export function isProbablyText(buffer) {
-  const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
-  for (const value of sample) {
+  // Scan the whole buffer for a NUL, not just the first 4 KB: a file whose first
+  // 4 KB is clean text but which contains NUL/binary bytes later would otherwise
+  // be embedded verbatim into the working-tree context sent to Codex.
+  for (const value of buffer) {
     if (value === 0) {
       return false;
     }

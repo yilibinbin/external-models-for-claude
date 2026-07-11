@@ -255,7 +255,14 @@ function handleHookException(error) {
   let config = activeGateConfig;
   if (!config) {
     try {
-      config = getConfig(activeWorkspaceRoot ?? resolveWorkspaceRoot(process.cwd()));
+      // Honor the intended workspace even when stdin was unparseable (so
+      // activeWorkspaceRoot was never set): match main()'s resolution order
+      // — CLAUDE_PROJECT_DIR before process.cwd() — so a malformed Stop payload
+      // still fails closed against the CORRECT workspace's gate config.
+      config = getConfig(
+        activeWorkspaceRoot
+          ?? resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd())
+      );
     } catch (configError) {
       const configMessage = configError instanceof Error ? configError.message : String(configError);
       process.stderr.write(`[codex review-gate] could not determine gate config; allowing Stop: ${configMessage}\n`);

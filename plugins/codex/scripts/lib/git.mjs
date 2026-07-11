@@ -218,7 +218,19 @@ function formatUntrackedFile(cwd, relativePath) {
     return `### ${relativePath}\n(skipped: binary file)`;
   }
 
-  return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
+  // Neutralize content that could break out of the fenced block: strip control
+  // chars (except tab/newline) and choose a fence longer than the longest run of
+  // backticks in the content so an inner ``` cannot desync the working-tree
+  // context sent to Codex.
+  const content = buffer
+    .toString("utf8")
+    // Strip control chars except tab (\x09), newline (\x0A), carriage return (\x0D).
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+    .trimEnd();
+  const longestBacktickRun = (content.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+  return [`### ${relativePath}`, fence, content, fence].join("\n");
 }
 
 function collectWorkingTreeContext(cwd, state, options = {}) {
