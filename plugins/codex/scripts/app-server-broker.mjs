@@ -250,11 +250,19 @@ async function main() {
   // endpoint/pid/state and exit non-zero so the next ensureBrokerSession spawns
   // a fresh broker.
   appClient.exitPromise.then(async () => {
+    // Hard deadline: server.close() only settles once every client socket has
+    // closed, so a hung companion that ignores socket.end() would keep
+    // shutdown() pending forever and process.exit(1) would never run — leaving
+    // the exact zombie broker this handler prevents. Force-exit after a grace
+    // period regardless. (Do not unref: this timer MUST keep the loop alive
+    // until it fires so the exit is guaranteed.)
+    const forceExit = setTimeout(() => process.exit(1), 2000);
     try {
       await shutdown(server);
     } catch {
       // Best-effort teardown; exit regardless so the stale broker cannot be reused.
     }
+    clearTimeout(forceExit);
     process.exit(1);
   });
 

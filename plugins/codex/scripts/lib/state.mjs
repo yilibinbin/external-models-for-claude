@@ -135,10 +135,16 @@ function pruneJobs(jobs) {
   // inconsistent (and reliant on sidecar re-merge in every consumer). Keep all
   // active jobs (with private payload stripped, since shared state is not the
   // privacy boundary), then fill the remaining slots with the newest terminal jobs.
+  // Shared state is not the privacy boundary or the source of truth for private
+  // payloads (the sidecar file is; /codex:result reads it via readStoredJob), so
+  // strip private fields from BOTH active and terminal jobs to keep state.json
+  // lean and consistent.
   const active = sorted
     .filter((job) => job.status === "queued" || job.status === "running")
     .map(stripPrivateJobFields);
-  const terminal = sorted.filter((job) => job.status !== "queued" && job.status !== "running");
+  const terminal = sorted
+    .filter((job) => job.status !== "queued" && job.status !== "running")
+    .map(stripPrivateJobFields);
   if (active.length >= MAX_JOBS) {
     return active;
   }
