@@ -821,14 +821,20 @@ export function antigravityPrintAsync(prompt, options = {}, env = process.env) {
     });
     let stdout = "";
     let stderr = "";
-    const outputState = { kept: 0 };
+    const outputState = { kept: 0, overflowed: false };
     // Bound stdout+stderr accumulation so concurrent async reviews cannot exhaust
     // memory on a runaway child; mirrors the sync supervisor's appendCapped cap.
+    // Track overflow so the close handler can surface it as an ENOBUFS failure
+    // (like the sync path) instead of resolving with silently truncated output.
     const appendCappedText = (existing, chunk) => {
-      if (outputState.kept >= MAX_BUFFER) return existing;
       const text = chunk.toString();
+      if (outputState.kept >= MAX_BUFFER) {
+        if (text.length) outputState.overflowed = true;
+        return existing;
+      }
       const available = MAX_BUFFER - outputState.kept;
       const next = text.length > available ? text.slice(0, available) : text;
+      if (next.length < text.length) outputState.overflowed = true;
       outputState.kept += next.length;
       return existing + next;
     };
@@ -917,6 +923,24 @@ export function antigravityPrintAsync(prompt, options = {}, env = process.env) {
     });
     child.on("close", (status, signal) => {
       const output = String(stdout || "").trim();
+      // A maxBuffer overflow means the review was truncated and cannot be trusted;
+      // surface it as an ENOBUFS non-retryable failure (parity with the sync path)
+      // rather than resolving with silently truncated output — even at status 0.
+      if (!timedOut && outputState.overflowed) {
+        const overflow = maxBufferOverflowMessage();
+        const normalized = {
+          status: status || 1,
+          stdout: output,
+          stderr: stderr ? `${stderr}\n${overflow}` : overflow,
+          error: overflow,
+          errorCode: "ENOBUFS",
+          timedOut: false,
+          provider: invocation.preflight
+        };
+        settle({ ...normalized, outcome: classifyAgyOutcome(normalized) });
+        cleanupAgyLogFile(invocation.logFile);
+        return;
+      }
       const emptyOutput = !timedOut && status === 0 && !output;
       const logDiagnostic = (timedOut || emptyOutput) ? readAgyLogDiagnostic(invocation.logFile) : "";
       const timedOutText = signal

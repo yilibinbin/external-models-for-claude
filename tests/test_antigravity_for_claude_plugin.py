@@ -754,13 +754,14 @@ def test_antigravity_print_async_caps_both_stdout_and_stderr_with_shared_max_buf
     body = text[start:]
 
     # A single shared budget counter (not a per-stream counter) enforces the
-    # COMBINED cap across both streams.
-    assert "const outputState = { kept: 0 };" in body, (
-        "async path lost its shared buffer-budget counter"
+    # COMBINED cap across both streams, and tracks overflow so the close handler
+    # can surface a truncated review as an ENOBUFS failure.
+    assert "const outputState = { kept: 0, overflowed: false };" in body, (
+        "async path lost its shared buffer-budget counter / overflow flag"
     )
     # The cap is checked and advanced against MAX_BUFFER — the same 20 MB
     # constant the sync path uses.
-    assert "if (outputState.kept >= MAX_BUFFER) return existing;" in body, (
+    assert "if (outputState.kept >= MAX_BUFFER) {" in body, (
         "async appender no longer short-circuits at the shared MAX_BUFFER cap"
     )
     assert "const available = MAX_BUFFER - outputState.kept;" in body, (
@@ -776,6 +777,76 @@ def test_antigravity_print_async_caps_both_stdout_and_stderr_with_shared_max_buf
     )
     assert "stderr = appendCappedText(stderr, chunk);" in body, (
         "stderr handler no longer uses the capped appender (stderr left unbounded)"
+    )
+    # The close handler must surface an overflow as an ENOBUFS failure (parity
+    # with the sync path) rather than resolving with silently truncated output.
+    assert 'errorCode: "ENOBUFS"' in body and "outputState.overflowed" in body, (
+        "async close handler no longer reports a maxBuffer overflow as ENOBUFS; "
+        "a truncated review would resolve as success"
+    )
+
+
+def test_antigravity_async_overflow_classifies_as_nonretryable_enobufs():
+    """CR follow-up to H5: a truncated (overflowed) async review must classify as
+    a non-retryable ENOBUFS provider-error, NOT as success/empty/retryable.
+
+    WHY: the H5 fix bounded async memory but originally still resolved the
+    truncated output as a normal result (status 0), so a >20 MB agy response
+    would be parsed as if complete — or, worse, retried. This pins that an
+    ENOBUFS-coded result (the code the async close handler now emits on overflow)
+    classifies as ok:false, retryable:false with the buffer-overflow message, so
+    the caller neither trusts nor re-runs a truncated review.
+    """
+    source = (
+        "const m = await import('./" + AGY_OUTCOME_LIB + "');"
+        "const o = m.classifyAgyOutcome({ status: 0, stdout: 'truncated', "
+        "stderr: 'agy output exceeded the 20 MB buffer', errorCode: 'ENOBUFS' });"
+        "process.stdout.write(JSON.stringify(o));"
+    )
+    outcome = _import_probe(source)
+
+    assert outcome["ok"] is False, outcome
+    assert outcome["retryable"] is False, outcome
+    assert "buffer" in outcome["message"].lower(), outcome
+
+
+def test_antigravity_validate_workflow_catches_github_context_under_block_scalar_edge_forms():
+    """CR follow-up to H4: block-scalar headers with reversed indicator order
+    (>1-) or a trailing comment (|2 # note) must still be recognized as block
+    scalars so their INDENTED body is scanned by no-github-context-in-run.
+
+    WHY: the original block-scalar matcher only accepted `[|>][+-]?\\d*`, so a
+    header like `run: |2 # release notes` was unmatched and fell to the inline
+    branch — which captured only the header line, letting the malicious indented
+    body (echo ${{ github.* }}) escape the injection check entirely. This is a
+    residual fork-safety bypass; the test builds exactly that workflow and asserts
+    the injection check now fails (the body is caught).
+    """
+    workflow = "\n".join([
+        "name: x",
+        "on: pull_request",
+        "jobs:",
+        "  a:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: |2 # release notes",
+        "          echo ${{ github.event.pull_request.head.repo.full_name }}",
+    ])
+    source = (
+        "const G = await import('./" + GITHUB_ACTIONS_LIB + "');"
+        "const wf = " + json.dumps(workflow) + ";"
+        "const blocks = G.extractRunBlocks(wf);"
+        "const inj = G.validateWorkflow(wf).checks.find(c => c.name === 'no-github-context-in-run');"
+        "process.stdout.write(JSON.stringify({ blocks, ok: inj.ok }));"
+    )
+    result = _import_probe(source)
+
+    # The indented malicious body must be captured...
+    assert any("github." in block for block in result["blocks"]), result
+    # ...and the injection check must FAIL (catch it).
+    assert result["ok"] is False, (
+        "block-scalar edge form let a ${{ github.* }} body bypass the fork-safety gate: "
+        f"{result}"
     )
 
 

@@ -66,10 +66,11 @@ export function extractRunBlocks(text) {
   const blocks = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
-    // Block scalar: "run: |" or folded "run: >" (with optional chomping/indent
-    // indicators such as |-, >+, |2), allowing a leading "- " YAML sequence
-    // marker. Its body is the more-indented lines below.
-    const blockScalar = line.match(/^(\s*(?:-\s+)?)run:\s*[|>][+-]?\d*\s*$/);
+    // Block scalar: "run: |" or folded "run: >" with optional chomping/indent
+    // indicators in EITHER order (|-, >+, |2, >1-) and an optional trailing
+    // "# comment", allowing a leading "- " YAML sequence marker. Its body is
+    // the more-indented lines below.
+    const blockScalar = line.match(/^(\s*(?:-\s+)?)run:\s*[|>](?:[+-]?\d?|\d[+-]?)\s*(?:#.*)?$/);
     if (blockScalar) {
       const baseIndent = blockScalar[1].length;
       const block = [];
