@@ -20,9 +20,24 @@ export function extractJsonObject(rawOutput) {
   try {
     return JSON.parse(text);
   } catch {
-    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    if (fenced) {
-      return JSON.parse(fenced[1].trim());
+    // Prefer a fenced block that matches the review schema over an earlier
+    // arbitrary block; fall back to the first parseable fenced block.
+    let firstFenced;
+    for (const match of text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+      try {
+        const parsed = JSON.parse(match[1].trim());
+        if (firstFenced === undefined) {
+          firstFenced = parsed;
+        }
+        if (looksLikeStructuredReview(parsed)) {
+          return parsed;
+        }
+      } catch {
+        // Try the next fenced block.
+      }
+    }
+    if (firstFenced !== undefined) {
+      return firstFenced;
     }
     const candidates = balancedObjectCandidates(text);
     let firstParsed;

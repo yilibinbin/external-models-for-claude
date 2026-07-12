@@ -35,7 +35,7 @@
       "name": "antigravity-for-claude",
       "source": "./plugins/antigravity-for-claude",
       "description": "Use Antigravity CLI from Claude Code for read-only review, planning, scorecards, jobs, and explicit Gemini or Claude model-provider selection.",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "category": "Productivity",
       "author": {
         "name": "fanghao",

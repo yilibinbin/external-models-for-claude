@@ -29,7 +29,9 @@ const LOG_DIAGNOSTIC_BYTES = 128 * 1024;
 const WINDOWS_TREE_CLEANUP_TIMEOUT_MS = 5000;
 const POSIX_SYNC_SUPERVISOR_GRACE_MS = 5000;
 const FORCE_WINDOWS_TREE_CLEANUP_ENV = "ANTIGRAVITY_FOR_CLAUDE_TEST_FORCE_WINDOWS_TREE_CLEANUP";
-const TRANSIENT_SPAWN_ERROR_CODES = new Set(["EAGAIN", "EMFILE", "ENFILE", "ENOBUFS"]);
+// ENOBUFS is intentionally excluded: it signals a maxBuffer overflow, which
+// rerunning cannot fix and which would discard a large-but-valid result.
+const TRANSIENT_SPAWN_ERROR_CODES = new Set(["EAGAIN", "EMFILE", "ENFILE"]);
 const POSIX_SYNC_SUPERVISOR_ATTEMPTS = 4;
 
 function spawnSync(command, args, options) {
@@ -307,6 +309,14 @@ function isTransientRunCommandFailure(result) {
   return TRANSIENT_SPAWN_ERROR_CODES.has(String(result?.errorCode || ""));
 }
 
+function maxBufferOverflowMessage(maxBuffer = MAX_BUFFER) {
+  return `agy output exceeded the ${Math.round(maxBuffer / (1024 * 1024))} MB buffer`;
+}
+
+function isMaxBufferOverflow(errorCode) {
+  return String(errorCode || "") === "ENOBUFS";
+}
+
 function runCommandWithPosixSupervisorOnce(command, args, options = {}, env = process.env) {
   const timeout = options.timeout || DEFAULT_TIMEOUT_MS;
   const result = spawnSync(process.execPath, ["-e", POSIX_SYNC_SUPERVISOR], {
@@ -344,12 +354,25 @@ function runCommandWithPosixSupervisorOnce(command, args, options = {}, env = pr
       // Fall through to the wrapper-failure result.
     }
   }
+  const errorCode = result.error?.code ? String(result.error.code) : "";
+  if (isMaxBufferOverflow(errorCode)) {
+    const overflow = maxBufferOverflowMessage();
+    return {
+      status: result.status ?? 1,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ? `${result.stderr}\n${overflow}` : overflow,
+      error: overflow,
+      errorCode,
+      signal: result.signal || "",
+      timedOut: false
+    };
+  }
   return {
     status: result.status ?? 1,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
     error: result.error ? String(result.error.message || result.error) : "",
-    errorCode: result.error?.code ? String(result.error.code) : "",
+    errorCode,
     signal: result.signal || "",
     timedOut: result.error?.code === "ETIMEDOUT"
   };
@@ -475,12 +498,23 @@ export function runCommand(command, args, options = {}) {
   if (result.error?.code === "ETIMEDOUT" || result.signal) {
     cleanupWindowsProcessTree(result.pid, env);
   }
+  const errorCode = result.error?.code ? String(result.error.code) : "";
+  if (isMaxBufferOverflow(errorCode)) {
+    const overflow = maxBufferOverflowMessage();
+    return {
+      status: result.status ?? 1,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ? `${result.stderr}\n${overflow}` : overflow,
+      error: overflow,
+      errorCode
+    };
+  }
   return {
     status: result.status ?? 1,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
     error: result.error ? String(result.error.message || result.error) : "",
-    errorCode: result.error?.code ? String(result.error.code) : ""
+    errorCode
   };
 }
 
@@ -493,7 +527,7 @@ function modelProviderFromOptions(env = process.env, options = {}) {
     return normalizeAgyProvider(options.modelProvider);
   }
   const envProvider = String(env[MODEL_PROVIDER_ENV] || "").trim().toLowerCase();
-  return envProvider && envProvider !== "claude" ? normalizeAgyProvider(envProvider) : "gemini";
+  return envProvider ? normalizeAgyProvider(envProvider) : "gemini";
 }
 
 export function validateModelForProvider(model, provider) {
@@ -787,6 +821,17 @@ export function antigravityPrintAsync(prompt, options = {}, env = process.env) {
     });
     let stdout = "";
     let stderr = "";
+    const outputState = { kept: 0 };
+    // Bound stdout+stderr accumulation so concurrent async reviews cannot exhaust
+    // memory on a runaway child; mirrors the sync supervisor's appendCapped cap.
+    const appendCappedText = (existing, chunk) => {
+      if (outputState.kept >= MAX_BUFFER) return existing;
+      const text = chunk.toString();
+      const available = MAX_BUFFER - outputState.kept;
+      const next = text.length > available ? text.slice(0, available) : text;
+      outputState.kept += next.length;
+      return existing + next;
+    };
     let settled = false;
     let timedOut = false;
     let timeoutTimer;
@@ -851,10 +896,10 @@ export function antigravityPrintAsync(prompt, options = {}, env = process.env) {
       }, killGraceMs);
     }, timeoutMs);
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      stdout = appendCappedText(stdout, chunk);
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      stderr = appendCappedText(stderr, chunk);
     });
     child.stdin.end();
     child.on("error", (error) => {

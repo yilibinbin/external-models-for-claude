@@ -52,8 +52,9 @@ export function antigravityDoctor(env = process.env, options = {}) {
     ? runDoctorCommand(command, ["models"], { env, timeout: options.timeout || 10_000 })
     : { status: 1, stdout: "", stderr: "agy models is unavailable", error: "", errorCode: "" };
   const models = parseAgyModels(modelsResult.stdout);
+  const currentProvider = options.modelProvider || env[MODEL_PROVIDER_ENV] || "gemini";
   const selected = {
-    current: safeSelect({ provider: options.modelProvider || "gemini", explicitModel: options.model || "", models, env }),
+    current: safeSelect({ provider: currentProvider, explicitModel: options.model || "", models, env }),
     providers: {
       gemini: models.gemini.length ? safeSelect({ provider: "gemini", models, env: envWithoutGenericModel(env) }) : { ok: false, error: "no Gemini models listed" },
       claude: models.claude.length ? safeSelect({ provider: "claude", models, env: envWithoutGenericModel(env) }) : { ok: false, error: "no Claude models listed" }

@@ -24,6 +24,7 @@ import {
   findReusableJob,
   finishJob,
   listJobs,
+  LockTimeoutError,
   markJobMetadataPersistenceFailed,
   markJobRunning,
   markJobViewed,
@@ -34,6 +35,7 @@ import {
   withWorkspaceJobLock
 } from "./lib/jobs.mjs";
 import { captureProcessIdentity } from "./lib/process.mjs";
+import { redactLocalPaths, redactSecrets, stripTerminalControls } from "./lib/sanitize.mjs";
 import {
   classifyJobLiveness,
   deriveJobIdempotencyKey,
@@ -261,8 +263,19 @@ function parseArgs(rawArgs) {
     timeoutMinutes: 0,
     workflowPath: ""
   };
+  let optionsTerminated = false;
   for (let index = 0; index < rawArgs.length; index += 1) {
     const token = rawArgs[index];
+    if (optionsTerminated) {
+      args.positional.push(token);
+      continue;
+    }
+    if (token === "--") {
+      // End-of-options: every following token is positional focus text, even if
+      // it starts with "-".
+      optionsTerminated = true;
+      continue;
+    }
     if (token === "--model-provider") {
       args.modelProvider = readOptionValue(rawArgs, index, token);
       index += 1;
@@ -337,6 +350,10 @@ function parseArgs(rawArgs) {
       // Review runs synchronously by default; accept --wait as an explicit no-op
       // so it is consumed rather than swallowed into the model focus text.
       args.wait = true;
+    } else if (token === "--ci-simulate") {
+      // release-check accepts --ci-simulate as an explicit no-op (CI smoke mode);
+      // consume it rather than rejecting it as an unknown argument.
+      args.ciSimulate = true;
     } else if (token === "--use-mailbox") {
       args.useMailbox = true;
     } else if (token === "--advisory-leases") {
@@ -396,6 +413,11 @@ function parseArgs(rawArgs) {
         throw new Error("--timeout-seconds must be between 1 and 3600.");
       }
       args.timeout = Math.ceil(value * 1000);
+    } else if (token.startsWith("-")) {
+      // Unknown dash-prefixed token: reject rather than swallow it into the focus
+      // text (mirrors parseDoctorArgs). Legitimate focus text does not start with
+      // "-"; use "--" to pass such text positionally.
+      throw new Error(`Unknown argument: ${token}`);
     } else {
       args.positional.push(token);
     }
@@ -1163,6 +1185,13 @@ function sanitizeBackgroundArgs(rawArgs) {
   return rawArgsWithoutBackground(rawArgs);
 }
 
+// Model-derived output is untrusted: strip terminal control sequences and redact
+// secrets/local paths before it reaches the terminal, job JSON, or the Stop-gate
+// reason. No length cap here so full reviews are preserved.
+function sanitizeModelText(text) {
+  return redactLocalPaths(redactSecrets(stripTerminalControls(text)));
+}
+
 function jobSummary(job) {
   if (!job) return null;
   const liveness = classifyJobLiveness(job, { now: Date.now(), env: process.env });
@@ -1234,7 +1263,9 @@ function spawnStoredJobWorker(job, resourceLeaseId = "") {
 
 function queueBackgroundJob(command, rawArgs) {
   const cwd = process.cwd();
-  const outcome = withWorkspaceJobLock(cwd, process.env, () => {
+  let outcome;
+  try {
+    outcome = withWorkspaceJobLock(cwd, process.env, () => {
     let args;
     try {
       args = parseArgs(rawArgs);
@@ -1324,7 +1355,14 @@ function queueBackgroundJob(command, rawArgs) {
       };
     }
     return { payload: { status: "queued", jobId: stamped.id, reused: false } };
-  });
+    });
+  } catch (error) {
+    if (error instanceof LockTimeoutError) {
+      process.stderr.write("Failed to queue background job: workspace job lock is busy.\n");
+      process.exit(2);
+    }
+    throw error;
+  }
 
   if (!outcome) {
     process.stderr.write("Failed to queue background job: workspace job lock is busy.\n");
@@ -1428,7 +1466,7 @@ function runReview(kind, rawArgs) {
     } catch (error) {
       writeReviewOperationReport(kind, args, { ...result, status: 1, stderr: error.message || String(error) }, startedAt, new Date().toISOString());
       process.stderr.write(`Invalid taskset output: ${error.message || String(error)}\n`);
-      process.stdout.write(result.stdout);
+      process.stdout.write(sanitizeModelText(result.stdout));
       process.exit(1);
     }
     return;
@@ -1442,7 +1480,7 @@ function runReview(kind, rawArgs) {
     } catch (error) {
       writeReviewOperationReport(kind, args, { ...result, status: 1, stderr: error.message || String(error) }, startedAt, new Date().toISOString());
       process.stderr.write(`Invalid scorecard output: ${error.message || String(error)}\n`);
-      process.stdout.write(result.stdout);
+      process.stdout.write(sanitizeModelText(result.stdout));
       process.exit(1);
     }
     return;
@@ -1474,8 +1512,9 @@ function runReview(kind, rawArgs) {
     process.stdout.write(`${JSON.stringify(parsed, null, 2)}\n`);
     return;
   }
-  process.stdout.write(result.stdout);
-  if (!result.stdout.endsWith("\n")) {
+  const humanStdout = sanitizeModelText(result.stdout);
+  process.stdout.write(humanStdout);
+  if (!humanStdout.endsWith("\n")) {
     process.stdout.write("\n");
   }
 }
@@ -1639,7 +1678,16 @@ function runStatus(rawArgs) {
 
 function runResult(rawArgs) {
   const jobId = requireJobId(rawArgs, "result");
-  const job = markJobViewed(jobId, process.cwd(), process.env);
+  let job;
+  try {
+    job = markJobViewed(jobId, process.cwd(), process.env);
+  } catch (error) {
+    if (error instanceof LockTimeoutError) {
+      process.stderr.write(`Job "${jobId}" is busy; try again shortly.\n`);
+      process.exit(2);
+    }
+    throw error;
+  }
   if (!job) {
     process.stderr.write(`Unknown job "${jobId}".\n`);
     process.exit(1);
@@ -1649,7 +1697,16 @@ function runResult(rawArgs) {
 
 function runCancel(rawArgs) {
   const jobId = requireJobId(rawArgs, "cancel");
-  const job = cancelJob(jobId, process.cwd(), process.env);
+  let job;
+  try {
+    job = cancelJob(jobId, process.cwd(), process.env);
+  } catch (error) {
+    if (error instanceof LockTimeoutError) {
+      process.stderr.write(`Job "${jobId}" is busy; try again shortly.\n`);
+      process.exit(2);
+    }
+    throw error;
+  }
   if (!job) {
     process.stderr.write(`Unknown job "${jobId}".\n`);
     process.exit(1);
@@ -1716,7 +1773,7 @@ function runLeases(rawArgs) {
 }
 
 function githubActionOptions(args, env = process.env) {
-  const modelProvider = normalizedModelProvider(args.modelProvider || "gemini");
+  const modelProvider = normalizedModelProvider(args.modelProvider || env[MODEL_PROVIDER_ENV] || "gemini");
   const explicitModel =
     args.model
     || env[MODEL_ENV]
@@ -1786,7 +1843,9 @@ function runReserveJob(rawArgs) {
   }
   const [command, ...commandArgs] = rawArgs;
   const cwd = process.cwd();
-  const outcome = withWorkspaceJobLock(cwd, process.env, () => {
+  let outcome;
+  try {
+    outcome = withWorkspaceJobLock(cwd, process.env, () => {
     if (!RESERVABLE_COMMANDS.has(command)) {
       return { exitCode: 2, stderr: `Command "${command}" cannot be reserved.\n` };
     }
@@ -1862,7 +1921,14 @@ function runReserveJob(rawArgs) {
       };
     }
     return { payload: { status: "reserved", jobId: stamped.id, reused: false } };
-  });
+    });
+  } catch (error) {
+    if (error instanceof LockTimeoutError) {
+      process.stderr.write("Failed to reserve background job: workspace job lock is busy.\n");
+      process.exit(2);
+    }
+    throw error;
+  }
   if (!outcome) {
     process.stderr.write("Failed to reserve background job: workspace job lock is busy.\n");
     process.exit(2);
@@ -1895,7 +1961,9 @@ function rollbackReservedJobStart(jobId, cwd = process.cwd(), { clearResourceLea
 function runReservedJob(rawArgs) {
   const jobId = requireJobId(rawArgs, "run-reserved-job");
   const cwd = process.cwd();
-  const outcome = withWorkspaceJobLock(cwd, process.env, () => {
+  let outcome;
+  try {
+    outcome = withWorkspaceJobLock(cwd, process.env, () => {
     const current = readJob(jobId, cwd, process.env);
     if (!current || current.status !== "reserved") {
       return { exitCode: 2, stderr: `Job "${jobId}" is not reserved.\n` };
@@ -1912,7 +1980,14 @@ function runReservedJob(rawArgs) {
       return { exitCode: 2, stderr: `Job "${jobId}" is not reserved.\n` };
     }
     return { job };
-  });
+    });
+  } catch (error) {
+    if (error instanceof LockTimeoutError) {
+      process.stderr.write("Failed to start reserved background job: workspace job lock is busy.\n");
+      process.exit(2);
+    }
+    throw error;
+  }
   if (!outcome) {
     process.stderr.write("Failed to start reserved background job: workspace job lock is busy.\n");
     process.exit(2);
@@ -2118,10 +2193,19 @@ async function runStoredJob(rawArgs) {
     process.stderr.write(`Unknown job "${jobId}".\n`);
     process.exit(1);
   }
-  const running = markJobRunning(jobId, {
-    pid: process.pid,
-    identity: captureProcessIdentity(process.pid)
-  }, job.cwd, process.env);
+  let running;
+  try {
+    running = markJobRunning(jobId, {
+      pid: process.pid,
+      identity: captureProcessIdentity(process.pid)
+    }, job.cwd, process.env);
+  } catch (error) {
+    if (error instanceof LockTimeoutError) {
+      process.stderr.write(`Job "${jobId}" is busy; could not mark it running.\n`);
+      process.exit(2);
+    }
+    throw error;
+  }
   if (!running) {
     process.stderr.write(`Unknown job "${jobId}".\n`);
     process.exit(1);
@@ -2132,25 +2216,34 @@ async function runStoredJob(rawArgs) {
   const resourceLease = ensureResourceLease(running.resourceLeaseId, "background-job", { env: process.env, command: running.command, transferable: false });
   if (!resourceLease.ok) {
     const message = capacityBlockedMessage("antigravity-for-claude", resourceLease);
-    finishJob(jobId, {
-      status: 75,
-      stdout: "",
-      stderr: `${message}\n`,
-      error: message
-    }, running.cwd, process.env);
+    try {
+      finishJob(jobId, {
+        status: 75,
+        stdout: "",
+        stderr: `${message}\n`,
+        error: message
+      }, running.cwd, process.env);
+    } catch (error) {
+      if (!(error instanceof LockTimeoutError)) throw error;
+    }
     process.exit(75);
   }
 
   const heartbeat = setInterval(() => {
-    updateJob(jobId, (job) => {
-      if (isTerminalJobStatus(job.status)) {
+    try {
+      updateJob(jobId, (job) => {
+        if (isTerminalJobStatus(job.status)) {
+          return job;
+        }
+        const timestamp = new Date().toISOString();
+        job.lastHeartbeatAt = timestamp;
+        job.updatedAt = timestamp;
         return job;
-      }
-      const timestamp = new Date().toISOString();
-      job.lastHeartbeatAt = timestamp;
-      job.updatedAt = timestamp;
-      return job;
-    }, running.cwd, process.env);
+      }, running.cwd, process.env);
+    } catch {
+      // A busy lock or corrupt sidecar must not crash the detached worker via an
+      // uncaught throw in the timer; the next heartbeat tick retries.
+    }
   }, jobHeartbeatIntervalMs(process.env));
   heartbeat.unref?.();
 
@@ -2160,25 +2253,40 @@ async function runStoredJob(rawArgs) {
       env: process.env,
       timeout: backgroundSupervisorTimeoutMs(running),
       onSpawn: (child) => {
-        updateJob(jobId, (job) => {
-          if (isTerminalJobStatus(job.status)) {
+        try {
+          updateJob(jobId, (job) => {
+            if (isTerminalJobStatus(job.status)) {
+              return job;
+            }
+            job.supervisedWorker = {
+              pid: child.pid,
+              identity: captureProcessIdentity(child.pid)
+            };
+            job.updatedAt = new Date().toISOString();
             return job;
-          }
-          job.supervisedWorker = {
-            pid: child.pid,
-            identity: captureProcessIdentity(child.pid)
-          };
-          job.updatedAt = new Date().toISOString();
-          return job;
-        }, running.cwd, process.env);
+          }, running.cwd, process.env);
+        } catch {
+          // Best-effort supervised-worker metadata; a busy lock or corrupt sidecar
+          // must not crash the spawn handler.
+        }
       }
     });
-    finishJob(jobId, {
-      status: result.status ?? 1,
-      stdout: result.stdout || "",
-      stderr: result.stderr || "",
-      error: result.error || ""
-    }, running.cwd, process.env);
+    try {
+      finishJob(jobId, {
+        status: result.status ?? 1,
+        stdout: result.stdout || "",
+        stderr: result.stderr || "",
+        error: result.error || ""
+      }, running.cwd, process.env);
+    } catch (error) {
+      if (error instanceof LockTimeoutError) {
+        // Surface the dropped terminal result loudly instead of a misleading
+        // "Unknown job"; the job stays non-terminal for liveness reaping.
+        process.stderr.write(`Job "${jobId}" is busy; could not record its final result.\n`);
+      } else {
+        throw error;
+      }
+    }
   } finally {
     clearInterval(heartbeat);
     resourceLease.release();
@@ -2252,7 +2360,8 @@ function runReviewGate(rawArgs) {
 
   const verdict = parseReviewGateOutput(result.stdout);
   if (verdict.kind === "block") {
-    process.stdout.write(`${JSON.stringify({ decision: "block", reason: verdict.reason })}\n`);
+    const reason = sanitizeModelText(verdict.reason);
+    process.stdout.write(`${JSON.stringify({ decision: "block", reason })}\n`);
     return;
   }
   if (verdict.kind === "allow") {
@@ -2340,7 +2449,7 @@ async function runMultiReview(rawArgs) {
   let failed = false;
   process.stdout.write(`## Orchestration\n${concurrency <= 1 ? "sequential Antigravity role review" : `parallel Antigravity role fan-out (bounded ${concurrency} max)`}\n\n`);
   for (const { role, result } of results) {
-    const body = result.stdout || result.stderr || result.error;
+    const body = sanitizeModelText(result.stdout || result.stderr || result.error);
     const timeoutNote = result.timedOut ? `${body ? "\n" : ""}[timed out]` : "";
     process.stdout.write(`## ${role}\n${body || "No output."}${timeoutNote}\n\n`);
     if (result.status !== 0) {
@@ -2422,7 +2531,7 @@ async function runPlanReview(rawArgs) {
   let failed = false;
   process.stdout.write(`# Antigravity Plan Review\n\nreviewed plan: ${args.planFile.relative}\n\n`);
   for (const { role, result } of results) {
-    const body = result.stdout || result.stderr || result.error;
+    const body = sanitizeModelText(result.stdout || result.stderr || result.error);
     process.stdout.write(`## ${role}\n${body || "No output."}\n\n`);
     if (result.status !== 0) {
       failed = true;
@@ -2485,7 +2594,7 @@ async function runAssistedReview(rawArgs) {
         scorecard = parseScorecardResult(result.stdout);
       } catch (error) {
         process.stderr.write(`Invalid assisted-review scorecard output: ${error.message || String(error)}\n`);
-        process.stdout.write(result.stdout);
+        process.stdout.write(sanitizeModelText(result.stdout));
         process.exit(1);
       }
     } else {
@@ -2715,8 +2824,8 @@ function runReleaseCheck(rawArgs) {
         && !text.includes("CO" + "DEX_PLUGIN" + "_ROOT")
     );
   const defaultProviderIsGeminiOnly = [
-    'args.modelProvider || "gemini"',
-    'envProvider && envProvider !== "claude"',
+    'args.modelProvider || env[MODEL_PROVIDER_ENV] || "gemini"',
+    'envProvider ? normalizeAgyProvider(envProvider) : "gemini"',
     'MODEL_PROVIDER: preflight?.modelProvider || args.modelProvider || process.env.ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER || "gemini"'
   ].every((needle) => companion.includes(needle) || runtime.includes(needle));
   const renderedWorkflow = renderWorkflow(ROOT_DIR, { releaseRef: RELEASE_REF });
@@ -2860,13 +2969,12 @@ function runReleaseCheck(rawArgs) {
       "sequential Antigravity role review",
       "capacityBlockedMessage(\"antigravity-for-claude\""
     ].every((needle) => resourceGovernorBackgroundHotPath.includes(needle));
+  const spawnRetryTransientSet = 'new Set(["EAGAIN", "EMFILE", "ENFILE"])';
   const spawnRetrySafetyOk = [
-    "EAGAIN",
-    "EMFILE",
-    "ENFILE",
-    "ENOBUFS",
+    spawnRetryTransientSet,
     "spawnSyncWithRetry"
   ].every((needle) => spawnRetry.includes(needle))
+    && runtime.includes(spawnRetryTransientSet)
     && [
       "POSIX_SYNC_SUPERVISOR_ATTEMPTS",
       "isTransientRunCommandFailure"

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.2 - 2026-07-11
+
+- Fix a resource-governor deadlock: a corrupt or 0-byte `.governor.lock` is now reclaimed as stale (`!lock || mtime-expired || dead-pid`) instead of blocking every review for the full wait; the lock is written and fsynced before `acquireMutex` returns so a crash cannot leave a 0-byte lock.
+- Stop classing large-but-valid `agy` output as a transient failure: `ENOBUFS`/maxBuffer overflow is no longer retried (previously re-ran the model up to 16×) and reports "agy output exceeded the 20 MB buffer"; the async print path now shares the same 20 MB stdout+stderr cap as the sync path.
+- Harden the GitHub Actions fork-safety gate: `extractRunBlocks` now also inspects inline (`run: echo …`) and folded (`run: >`) and compact `- run:` steps, closing an `${{ github.* }}` injection bypass that a mixed block/inline workflow could slip through.
+- `extractJsonObject` now prefers a schema-valid `json` block over the first fenced block, so a stray code fence in model prose no longer preempts the real structured review.
+- Honour `ANTIGRAVITY_FOR_CLAUDE_MODEL_PROVIDER=claude` (was silently downgraded to gemini); `doctor` and the GitHub-actions options path read the env too.
+- Reject unknown/mistyped dash-prefixed flags in `review` instead of folding them into the model focus text (parity with `parseDoctorArgs`); honours `--`.
+- Sanitise raw model output (secrets, local paths, control chars) before it is displayed, persisted to job JSON, or used as the Stop-gate reason; mailbox message bodies are sanitised too.
+- Tolerate corrupt job/mailbox JSON (return null / skip rather than throwing), distinguish a lock-acquire timeout from a missing job, and fsync-before-rename with orphaned-`.tmp` cleanup in the atomic JSON writers.
+- Add `--background`/`--wait` (and github-actions `--timeout-minutes`) to the affected command argument-hint frontmatter.
+
 ## 0.1.1 - 2026-06-23
 
 - Honour `stop_hook_active` in the Antigravity Stop review gate via a non-blocking stdin read and a `runReviewGate` loop-guard short-circuit (parity with claude-for-claude).

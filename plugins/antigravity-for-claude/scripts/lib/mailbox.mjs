@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { stateDirForCwd } from "./state.mjs";
+import { redactLocalPaths, redactSecrets } from "./sanitize.mjs";
 
 const MESSAGE_LIMIT = 16 * 1024;
 const THREAD_LIMIT = 120;
@@ -23,6 +24,15 @@ function cleanText(value, limit = MESSAGE_LIMIT) {
     .trim();
 }
 
+// Redact secrets and local paths from free-text mailbox bodies before persisting,
+// mirroring sanitizeSummary. Redaction runs before the length cap so a secret is
+// not half-truncated into a partial-but-recoverable form.
+function cleanBody(value, { cwd = process.cwd(), env = process.env } = {}) {
+  const stripped = cleanText(value, MESSAGE_LIMIT * 4);
+  const redacted = redactLocalPaths(redactSecrets(stripped), { cwd, env });
+  return redacted.slice(0, MESSAGE_LIMIT).trim();
+}
+
 function safeThreadId(value) {
   const cleaned = cleanText(value, THREAD_LIMIT).replace(/[^a-zA-Z0-9._-]+/g, "-");
   if (!cleaned) {
@@ -41,8 +51,23 @@ function now() {
 
 function writeJsonAtomic(file, payload) {
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  fs.renameSync(tmp, file);
+  const handle = fs.openSync(tmp, "w");
+  try {
+    fs.writeFileSync(handle, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+  try {
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // Best-effort cleanup of the orphaned temp file; surface the rename error.
+    }
+    throw error;
+  }
   return payload;
 }
 
@@ -104,19 +129,27 @@ function withFileLock(file, callback) {
 function readThread(thread, cwd = process.cwd(), env = process.env) {
   const id = safeThreadId(thread);
   const file = threadPath(id, cwd, env);
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    raw = fs.readFileSync(file, "utf8");
   } catch (error) {
     if (error.code === "ENOENT") {
       return { thread: id, messages: [], updatedAt: "" };
     }
     throw error;
   }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // Tolerate a corrupt/truncated thread file so show/post do not throw
+    // permanently; treat it as an empty thread (a post will overwrite it).
+    return { thread: id, messages: [], updatedAt: "" };
+  }
 }
 
 export function postMailboxMessage({ thread, message, role = "claude-code", cwd = process.cwd() }, env = process.env) {
   const id = safeThreadId(thread);
-  const body = cleanText(message);
+  const body = cleanBody(message, { cwd, env });
   if (!body) {
     throw new Error("Mailbox message is required.");
   }

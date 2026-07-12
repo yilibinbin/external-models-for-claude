@@ -1,6 +1,6 @@
 ---
 description: Render, initialize, or validate Antigravity GitHub Actions review workflow
-argument-hint: "<render|init|validate> [--force] [--model-provider gemini|claude] [--ref tag] [--path file]"
+argument-hint: "<render|init|validate> [--force] [--model-provider gemini|claude] [--ref tag] [--timeout-minutes n] [--path file]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
