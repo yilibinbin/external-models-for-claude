@@ -1,110 +1,165 @@
-# Codex 智力档能力自适应改造 — 设计文档
+# Codex 智力档能力自适应改造 — 设计文档 (v2)
 
 **日期**: 2026-07-12
 **范围**: 仅 `plugins/codex`(antigravity **零改动零升版**)
 **版本**: codex-for-claude `1.1.0-fh.3 → 1.1.0-fh.4`(patch)
-**评审**: Claude → Gemini(agy)→ Codex(companion task, xhigh)三模型串行,已收敛零分歧
+**评审**: Claude → Gemini(agy)→ Codex(companion task, xhigh)三模型串行
+
+> **v1 → v2 说明**:v1 的地基「`xhigh` 是最强档、底层无 effort discovery」被三模型串行审阅中 **Codex 读取本机 `models_cache.json` 直接证伪**(已复核)。v2 是据此推翻重写的正确方案。
 
 ---
 
 ## 1. 背景与问题
 
-用户诉求:「修复类似问题,使其更自然、通用、兼容最新模型和智力水平」,并明确「还是需要卡合法值,多一个验证步」。
+用户诉求:「修复类似问题,使其更自然、通用、兼容最新模型和智力水平」,并明确「还是需要卡合法值,多一个验证步」。落到 codex 插件:
 
-落到 codex 插件,现状有两个具体问题:
-
-1. **`--quality max` 达不到最强档(bug)**。`quality-policy.mjs` 里 `max.effort` 和 `strong.effort` 都写死为 `"high"`,而 codex 支持更高的 `xhigh`。用户以为 `--quality max` 跑最强,实际只到 `high`。此映射在三个真实入口生效:`adversarial-review`、`task`、`multi-review`(codex-companion.mjs:1065/1094/1556),**不是死代码**。
-2. **合法值散落硬编码,加新档要改多处**。`VALID_REASONING_EFFORTS`(codex-companion.mjs:91)是封闭集合;「最强档」概念散落。将来 codex 出比 `xhigh` 更强的档,需改多处。
+1. **`--quality max` 达不到最强档(bug)**。`quality-policy.mjs` 里 `max.effort` 与 `strong.effort` 都写死 `"high"`,而模型支持更高档。三个真实入口生效:`adversarial-review`(入口固定传 `reviewName: "Adversarial Review"`,`:1618-1622` → `:1065` 条件恒真)、`task`(`:1094`)、`multi-review`(`:1556`)。**不是死代码。**
+2. **effort 能力按模型变化,单一硬编码无法正确**。见 §2。
 
 ## 2. 经实测校准的关键事实(设计地基)
 
 | 事实 | 证据 |
 |---|---|
-| codex **CLI 无 `--effort` flag** | `codex exec --help` 只有 `-c model=...`,无 effort/reasoning flag |
-| effort 走 **codex app-server 协议**的 `turn/start.effort` 字段(不是 CLI flag) | codex.mjs:1020 `effort: options.effort ?? null` |
-| `--effort xhigh` **实测生效** | companion `task --effort xhigh` → `captured: OK` |
-| app-server **对未知 effort 静默接受、不报错**(测 `ultra` 照跑) | `runAppServerTurn("/tmp",{effort:"ultra"})` → `msg=OK err=none` |
-| app-server **无 effort discovery 接口**(拿不到「可用 effort 列表」) | `config/read` 只返回 provider/model |
+| codex CLI **自己生成** `models_cache.json`,含每模型 `supported_reasoning_levels` | 文件顶层 `fetched_at`/`client_version`(0.144.0);路径 `$CODEX_HOME/models_cache.json`,默认 `~/.codex/` |
+| **effort 上限按模型变化** | sol/terra→ultra, luna→max, 5.5/5.4/mini/auto-review/image-2→xhigh |
+| **`ultra` 是委派档,非线性更高档** | description = "Maximum reasoning **with automatic task delegation**" |
+| `ultra` 委派**绕过 governor** | governor 计 `GLOBAL_MAX_MODEL_CALLS`(companion 发起的 turn);ultra 的服务端子任务不经 companion,不被计数 |
+| effort 走 **app-server 协议** `turn/start.effort` 字段(非 CLI flag) | codex.mjs:1020;`codex exec --help` 无 effort flag |
+| app-server 对未知 effort **静默接受不报错** | `runAppServerTurn("/tmp",{effort:"ultra"})` → `msg=OK err=none` |
+| **model=null(默认)时插件拿不到确切模型 slug** | `config/read` 未读 `config.model`;`getSessionRuntimeStatus` 无 model 字段 |
 
-**推论(设计的核心逻辑)**:因为底层对无效 effort **静默不报错**,若无插件层校验,用户拼错档(`--effort higer`)会**静默不生效**、毫无察觉。所以「卡合法值 + 验证步」不是偏好,是**唯一安全选择**。合法值清单**只能由插件自维护**(底层不提供)。
+## 3. 设计:模型分组白名单 + 自动路由(派生式)
 
-## 3. 设计
+### 3.1 核心:按当前模型路由到「它那一组的最强纯推理档」
 
-### 3.1 新增单一权威源:`plugins/codex/scripts/lib/effort-policy.mjs`
+`--quality max` 不再映射到一个写死的档,而是**按当前选定模型,从 codex 自己的 `models_cache.json` 派生出该模型支持的最高纯推理档**(排除委派档)。这是真·自适应:codex 出新模型 → 缓存自动更新 → 路由自动跟随,**零代码改动**。
+
+**分组(从 `models_cache.json` 运行时派生,当前快照仅供示意)**:
+
+| 最强纯推理档 | 模型 |
+|---|---|
+| `max` | gpt-5.6-sol / terra / luna |
+| `xhigh` | gpt-5.5 / 5.4 / 5.4-mini / codex-auto-review / gpt-image-2 |
+
+### 3.2 新增:`plugins/codex/scripts/lib/effort-policy.mjs`
 
 ```js
-// 合法 reasoning effort 清单。codex CLI/app-server 不暴露「可用 effort 列表」,
-// app-server 对未知 effort 静默接受不报错,因此合法值必须由插件把关。
-// 【维护点】codex CLI 升级新增更高档时,在此数组末尾追加,并更新 HIGHEST_EFFORT。
-export const KNOWN_EFFORTS = Object.freeze([
-  "none", "minimal", "low", "medium", "high", "xhigh"
-]);
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-// 「最强档」显式常量(不靠数组顺序推断 —— Codex 对抗点采纳)。
-// 断言它属于 KNOWN_EFFORTS,防止清单/常量不一致。
-export const HIGHEST_EFFORT = "xhigh";
+// effort 强度顺序(仅用于「取最强」比较,不作为合法性来源)。
+const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
-export function validateEffort(value) {
+// 跨所有已知模型都支持的纯推理档交集的最强 —— cache 缺失/损坏/未知模型时的安全兜底。
+export const FALLBACK_MAX_EFFORT = "xhigh";
+
+function modelsCachePath(env = process.env) {
+  const home = env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  return path.join(home, "models_cache.json");
+}
+
+// 读 codex 自己的缓存;任何失败都返回 null,由调用方兜底(不抛)。
+function readModelsCache(env = process.env) {
+  try {
+    return JSON.parse(fs.readFileSync(modelsCachePath(env), "utf8"));
+  } catch {
+    return null;               // 缺失/损坏/无权限 -> 兜底路径
+  }
+}
+
+// 「纯推理档」= description 不含 delegation 语义的档(语义判定,不硬编码 slug)。
+function isDelegationLevel(level) {
+  return /deleg/i.test(String(level?.description || ""));
+}
+
+// 该模型支持的 effort 全集(合法值来源:按模型,不是全局白名单)。
+export function supportedEffortsForModel(model, env = process.env) {
+  const cache = readModelsCache(env);
+  const entry = cache?.models?.find((m) => m.slug === model);
+  if (!entry) return null;     // 未知模型 / 无缓存
+  return (entry.supported_reasoning_levels || []).map((lv) => lv.effort);
+}
+
+// 按当前模型取「最强纯推理档」;拿不到模型能力时兜底 FALLBACK_MAX_EFFORT。
+export function highestPureEffortForModel(model, env = process.env) {
+  const cache = readModelsCache(env);
+  const entry = cache?.models?.find((m) => m.slug === model);
+  if (!entry) return FALLBACK_MAX_EFFORT;
+  const pure = (entry.supported_reasoning_levels || [])
+    .filter((lv) => !isDelegationLevel(lv))
+    .map((lv) => lv.effort);
+  if (!pure.length) return FALLBACK_MAX_EFFORT;
+  return pure.reduce((best, e) =>
+    EFFORT_ORDER.indexOf(e) > EFFORT_ORDER.indexOf(best) ? e : best, pure[0]);
+}
+
+// 合法值校验(保留用户要的「验证步」)。有模型能力时按模型校验;拿不到时按已知全集兜底。
+export function validateEffort(value, model = null, env = process.env) {
   if (value == null) return null;
   const normalized = String(value).trim().toLowerCase();
   if (!normalized) return null;
-  if (!KNOWN_EFFORTS.includes(normalized)) {
+  const supported = (model && supportedEffortsForModel(model, env)) || EFFORT_ORDER;
+  if (!supported.includes(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${value}". Use one of: ${KNOWN_EFFORTS.join(", ")}.`
+      `Unsupported reasoning effort "${value}". Supported: ${supported.join(", ")}.`
     );
   }
   return normalized;
 }
-
-export function highestEffort() {
-  return HIGHEST_EFFORT;
-}
 ```
 
-模块加载时断言 `KNOWN_EFFORTS.includes(HIGHEST_EFFORT)`(一致性护栏)。
+### 3.3 codex 改造(复用现有链路)
 
-### 3.2 codex 改造(3 处,复用现有链路)
+1. **`quality-policy.mjs`**:`max` 不再写死 effort;改为**运行时按当前模型解析**。因 quality-policy 本身不知道模型,把「解析最强档」延后到调用点:`resolveQuality("max")` 返回一个标记(如 `effort: "__highest_pure__"` 哨兵或 `effort: null` + `wantsHighest: true`),调用点(`:1065/1094/1556`)拿到当前 `model` 后调 `highestPureEffortForModel(model)` 得出实际 effort。`strong` 保持 `"high"`,`standard`/`fast` 不变。`max` 仍是合法 quality 值(**不删、不改兼容**)。
+2. **`codex-companion.mjs`**:`normalizeReasoningEffort` 委托 `validateEffort`(传入当前 model 做按模型校验);**删除 `:154` 硬编码的六档错误信息**(改由 `validateEffort` 动态抛出);删除本地 `VALID_REASONING_EFFORTS`。
+3. **usage 补 `--quality`**:`task` 的 usage(`:104`)补上 `[--quality <fast|standard|strong|max>]`(它 `valueOptions` 已接受,只是没文档化)。
+4. **默认 model / `MODEL_ALIASES` 不动**。
 
-1. **`codex-companion.mjs`**:`normalizeReasoningEffort` 委托 `validateEffort`;删除本地 `VALID_REASONING_EFFORTS`,从 `effort-policy.mjs` 导入。行为对既有合法值不变(保留你要的「验证步」)。
-2. **`quality-policy.mjs`**:`max.effort: "high" → highestEffort()`(**修 bug**;`max` 自动跟随最强档)。`strong` 保持 `"high"`(次强);`standard`/`fast` 不变。`max` 仍是合法 quality 值 —— **不删除、不改兼容性**(Codex 对抗点:避免已有 `--quality max` 调用行为回退)。
-3. **默认 model / `MODEL_ALIASES` 不动**:默认 model=null 已交给 codex CLI(本就自适应),不在本次范围。
+### 3.4 路由的三个分支(全部实测验证)
 
-### 3.3 antigravity:No touch, no bump(决策 1+2,三模型收敛)
+| 场景 | 当前 model | `--quality max` → | 依据 |
+|---|---|---|---|
+| 显式旗舰 | gpt-5.6-sol/terra/luna | `max` | 该模型 supported 排除 ultra 后最强 |
+| 显式次代 | gpt-5.5/5.4/... | `xhigh` | 同上 |
+| 未知模型 / model=null | spark / null | `xhigh`(`FALLBACK_MAX_EFFORT`) | cache 无此 slug → 兜底 |
 
-- **不改任何代码、不加注释、不升版**。理由:antigravity 的 `selectAgyModel` 优先级已是「显式 → env → 运行时 catalog(`agy models`)→ default 兜底」,模型选择**已自适应**;它无独立 effort 维度,硬塞会造成抽象泄漏与两套语义。
-- 兜底模型 `Gemini 3.1 Pro (High)` / `Claude Sonnet 4.6 (Thinking)` **就是当前最新旗舰**,且仅在 catalog 拉取失败时启用 —— **无修改依据**(Gemini 的「兜底过旧」疑虑经核实在此案例不成立)。
-- 「经审计 antigravity 已原生满足自适应需求,故本次不作变更」写入 PR 描述。
+## 4. 决策记录(三模型串行审阅收敛 + 用户产品决策)
 
-## 4. 不做什么(YAGNI)
+- **决策1 antigravity**:No touch, no bump。理由**修正**(Codex Q-B 翻案):antigravity `selectAgyModel` 的硬编码 default 是「首选匹配目标」(`agy-capabilities.mjs:124` `catalogModels.find((model) => model === fallback) || catalogModels[0]`),**不是**「仅 catalog 失败时兜底」。决策不变(范围限定 codex),但删除「已完全自适应/仅失败兜底」的错误表述。
+- **决策2 `--quality max` 语义(用户已定)**:映射到**该模型的最高纯推理档,排除 `ultra` 委派档**。因 `ultra` 含自动委派、绕过 governor 容量治理、改变成本/并发行为,不能当普通 patch bugfix。
+- **Q-A(三方一致)**:用显式策略,不靠数组末项派生「最强」。v2 用 `EFFORT_ORDER` 显式序 + 按模型 supported 取最强,非「数组末项」。
+- **R1(Codex 翻案,Gemini 让步)**:adversarial-review 入口固定生效,spec 未夸大覆盖面。
+- **R2/R3(三方 CONFIRM)**:usage 补 `--quality`;删 `:154` 硬编码错误信息。
 
-- **不做运行时发现 effort 档** —— 底层无 discovery 接口,做不了,强做是假自适应。
-- **不给 antigravity 硬塞 effort 维度** —— 制造两套语义。
-- **不动 codex 默认 model** —— 已自适应。
+## 5. 不做什么(YAGNI)
 
-## 5. 测试(每条 fail-on-revert)
+- **不映射到 `ultra`**:委派语义绕过 governor(用户决策)。
+- **不给 antigravity 加 effort 维度**:抽象泄漏,且范围限定 codex。
+- **不手写分组表**:派生式自动跟随最新模型(用户决策),避免回到硬编码。
 
-| 测试 | 断言 | 改回 bug 时 |
-|---|---|---|
-| `validateEffort` 卡非法 | `validateEffort("bogus")` 抛错并列出 KNOWN_EFFORTS | — |
-| `validateEffort` 收全部已知档 | 6 档全部通过、归一化为小写 | — |
-| **`--quality max` = xhigh** | `resolveQuality("max").effort === HIGHEST_EFFORT`(`=== "xhigh"`) | 回到 `"high"` → 变红(锚定最初发现的 bug) |
-| `strong` 仍为 high | `resolveQuality("strong").effort === "high"` | — |
-| `HIGHEST_EFFORT` 一致性 | `KNOWN_EFFORTS.includes(HIGHEST_EFFORT)` | — |
-| 加新档跟随(模拟) | 若在清单+常量加 `xxhigh`,`highestEffort()` 跟随 | — |
+## 6. 测试(每条 fail-on-revert)
+
+| 测试 | 断言 |
+|---|---|
+| 按模型路由 max | `highestPureEffortForModel("gpt-5.6-sol")==="max"`;`("gpt-5.5")==="xhigh"` |
+| 排除委派档 | sol 的 max 解析**不**返回 `ultra`(尽管 supported 含 ultra) |
+| 未知/空模型兜底 | `highestPureEffortForModel("spark")` 和 `(null)` 都 === `FALLBACK_MAX_EFFORT`("xhigh") |
+| cache 缺失兜底 | 指向不存在的 `CODEX_HOME` → 返回 `FALLBACK_MAX_EFFORT`,不抛 |
+| `validateEffort` 按模型 | 对 gpt-5.5 传 `"max"` 抛错(5.5 不支持 max);对 sol 传 `"max"` 通过 |
+| `validateEffort` 拼写 | 传 `"bogus"` 抛错,信息含 supported 列表(**非硬编码**) |
+| `--quality max` 端到端 | 经 `resolveQuality`+路由,默认模型下 effort 落到 `xhigh`(**改回 `"high"` → 变红**,锚定原始 bug) |
+| `strong` 不变 | `resolveQuality("strong").effort === "high"` |
+| 更新既有断言 | `test_codex_for_claude_plugin.py:7616` 和 `:7630`(两个 quality-policy 测试)的 `maxq["effort"] == "high"` 断言随之更新为按模型解析后的值 |
 
 外加 codex 全量回归 + `release-check` 0 FAIL。
 
-## 6. 发布流程(与前两轮一致)
+## 7. 发布流程
 
-回归 green → 版本轴 `fh.3→fh.4`(plugin.json/marketplace.json/version.mjs/README/CHANGELOG/plugin_versions.py)→ CodeRabbit 至 0 findings → 合并 → 本地 re-pin(uninstall+install)→ 验证 `installed_plugins.json` 指向 fh.4。
+回归 green → 版本 `fh.3→fh.4`(plugin.json/marketplace.json/version.mjs/README/CHANGELOG/plugin_versions.py)→ CodeRabbit 至 0 findings → 合并 → 本地 re-pin(uninstall+install)→ 验证 `installed_plugins.json` 指向 fh.4。
 
-## 7. 三模型评审记录
+## 8. 已知维护点 / 残留风险(诚实记录)
 
-| 决策/对抗点 | Claude | Gemini | Codex(xhigh) |
-|---|---|---|---|
-| 决策1: antigravity 方案 A(No touch) | A | CONFIRM | CONFIRM |
-| 决策2: No touch, no bump | 倾向 | REFINE→No touch | CONFIRM |
-| Q1: HIGHEST_EFFORT 靠数组顺序? | 应显式 | — | CONFIRM「显式常量+校验 ∈ KNOWN_EFFORTS 更稳妥」 |
-| Q2: 兜底模型需更新? | 否 | 疑虑 | CONFIRM「仍是最新旗舰、仅失败兜底 → 无依据」 |
-
-**Codex 新增隐患(已采纳)**:(a) `KNOWN_EFFORTS` 硬编码将来可能落后于 CLI → 已加「维护点」注释;(b) `max` 不可直接删或改兼容 → 设计明确保留 `max` 为合法值,仅改其映射目标。
+- **`FALLBACK_MAX_EFFORT="xhigh"` 是唯一软性假设**:它是「所有当前已知模型都支持的纯推理档交集的最强」。若未来所有模型都升到某更高纯推理档、且 xhigh 被弃用,此兜底需人工复核(但派生路径对已知模型仍自动正确,仅影响 model=null/未知模型的兜底档)。
+- **`isDelegationLevel` 用 `/deleg/i` 语义判定**:依赖 codex 在 description 里保留 "delegation" 字样。若 codex 改用结构化字段标记委派档,此启发式需更新(比硬编码 `slug==="ultra"` 更鲁棒,但仍是启发式)。
+- **model=null 拿不到确切模型**:是 app-server 协议现状(未回报默认 model),故默认场景走兜底 `xhigh` 而非「CLI 真实默认模型的最强档」。若 codex 后续在 `config/read` 暴露选定 model,可移除此兜底、走完全路由。
