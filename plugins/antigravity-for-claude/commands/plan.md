@@ -1,6 +1,6 @@
 ---
 description: Ask Antigravity for an independent implementation plan
-argument-hint: "[--taskset] [--model-provider gemini|claude] [focus]"
+argument-hint: "[--taskset] [--background] [--wait] [--model-provider gemini|claude] [focus]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---

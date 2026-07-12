@@ -1,6 +1,9 @@
 import { spawnSync as nodeSpawnSync } from "node:child_process";
 
-const TRANSIENT_SPAWN_ERROR_CODES = new Set(["EAGAIN", "EMFILE", "ENFILE", "ENOBUFS"]);
+// ENOBUFS is intentionally excluded: it signals a maxBuffer overflow (the output
+// exceeded the buffer), which retrying cannot fix and which would discard a
+// large-but-valid result.
+const TRANSIENT_SPAWN_ERROR_CODES = new Set(["EAGAIN", "EMFILE", "ENFILE"]);
 const DEFAULT_ATTEMPTS = 4;
 const DEFAULT_BASE_DELAY_MS = 50;
 const MAX_ATTEMPTS = 10;

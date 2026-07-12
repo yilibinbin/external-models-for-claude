@@ -1,6 +1,6 @@
 ---
 description: Run a skeptical Antigravity adversarial review
-argument-hint: "[--scorecard] [--structured] [--json] [--model-provider gemini|claude] [focus]"
+argument-hint: "[--scorecard] [--structured] [--json] [--background] [--wait] [--model-provider gemini|claude] [focus]"
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---

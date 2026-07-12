@@ -165,7 +165,10 @@ function acquireMutex(root, env = process.env) {
   while (Date.now() <= deadline) {
     try {
       const handle = fs.openSync(file, "wx", 0o600);
+      // Write the full lock payload then fsync before returning, so a crash
+      // cannot leave a 0-byte lock that would deadlock later waiters.
       fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+      try { fs.fsyncSync(handle); } catch { /* best-effort durability */ }
       return { handle, file };
     } catch (error) {
       if (error.code !== "EEXIST") {
@@ -174,7 +177,14 @@ function acquireMutex(root, env = process.env) {
       try {
         const stat = fs.statSync(file);
         const lock = readLease(file);
-        if (lock && ((Date.now() - stat.mtimeMs) > lockStaleMs(env) || !processAlive(lock.pid))) {
+        const mtimeExpired = (Date.now() - stat.mtimeMs) > lockStaleMs(env);
+        // Reclaim when: a parseable lock is expired or its owner is dead, OR the
+        // lock is corrupt/0-byte (readLease returns null) AND old enough that it
+        // cannot be a concurrent writer mid-write. Without the null branch, a
+        // non-atomic write that crashed between openSync(wx) and writeFileSync
+        // leaves a 0-byte lock that deadlocks the mutex forever.
+        const stale = lock ? (mtimeExpired || !processAlive(lock.pid)) : mtimeExpired;
+        if (stale) {
           fs.rmSync(file, { force: true });
           continue;
         }

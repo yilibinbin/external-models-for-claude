@@ -66,16 +66,29 @@ export function extractRunBlocks(text) {
   const blocks = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
-    const match = line.match(/^(\s*)run:\s*\|/);
-    if (!match) continue;
-    const baseIndent = match[1].length;
-    const block = [];
-    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
-      const current = lines[cursor];
-      if (current.trim() && current.match(/^(\s*)/)[1].length <= baseIndent) break;
-      block.push(current);
+    // Block scalar: "run: |" or folded "run: >" with optional chomping/indent
+    // indicators in EITHER order (|-, >+, |2, >1-) and an optional trailing
+    // "# comment", allowing a leading "- " YAML sequence marker. Its body is
+    // the more-indented lines below.
+    const blockScalar = line.match(/^(\s*(?:-\s+)?)run:\s*[|>](?:[+-]?\d?|\d[+-]?)\s*(?:#.*)?$/);
+    if (blockScalar) {
+      const baseIndent = blockScalar[1].length;
+      const block = [];
+      for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+        const current = lines[cursor];
+        if (current.trim() && current.match(/^(\s*)/)[1].length <= baseIndent) break;
+        block.push(current);
+      }
+      blocks.push(block.join("\n"));
+      continue;
     }
-    blocks.push(block.join("\n"));
+    // Inline scalar: "run: echo ..." (also as a "- run: ..." sequence entry).
+    // Capture the single-line command body so the github-context injection check
+    // inspects it too.
+    const inline = line.match(/^\s*(?:-\s+)?run:\s*(\S.*)$/);
+    if (inline) {
+      blocks.push(inline[1]);
+    }
   }
   return blocks;
 }

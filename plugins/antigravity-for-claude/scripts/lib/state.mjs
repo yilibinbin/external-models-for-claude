@@ -100,8 +100,23 @@ export function stateDirForCwd(cwd = process.cwd(), env = process.env) {
 export function atomicWriteJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const tmpFile = `${filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
-  fs.writeFileSync(tmpFile, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  fs.renameSync(tmpFile, filePath);
+  const handle = fs.openSync(tmpFile, "w", 0o600);
+  try {
+    fs.writeFileSync(handle, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+  try {
+    fs.renameSync(tmpFile, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      // Best-effort cleanup of the orphaned temp file; surface the rename error.
+    }
+    throw error;
+  }
 }
 
 export function readJson(filePath, fallback = null) {

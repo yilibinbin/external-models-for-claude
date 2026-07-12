@@ -9,6 +9,16 @@ import { classifyJobLiveness } from "./job-lifecycle.mjs";
 export const TERMINAL_JOB_STATUSES = new Set(["succeeded", "failed", "cancelled", "cancel_failed"]);
 export const RESERVABLE_COMMANDS = new Set(["review", "adversarial-review", "multi-review", "plan", "rescue"]);
 
+// Distinguishes "could not acquire the job lock in time" from "job not found"
+// (a null return), so callers do not misreport a busy job as an unknown one.
+export class LockTimeoutError extends Error {
+  constructor(jobId) {
+    super(`Timed out acquiring lock for job "${jobId}".`);
+    this.name = "LockTimeoutError";
+    this.jobId = jobId;
+  }
+}
+
 const OUTPUT_CAP_BYTES = 256 * 1024;
 const TRUNCATION_MARKER = `\n[output truncated to ${OUTPUT_CAP_BYTES} bytes]`;
 const JOB_LOCK_WAIT_MS = 1000;
@@ -88,7 +98,7 @@ function releaseJobLock(lock) {
 
 function withJobLock(jobId, cwd = process.cwd(), env = process.env, callback) {
   const lock = acquireJobLock(jobId, cwd, env);
-  if (!lock) return null;
+  if (!lock) throw new LockTimeoutError(jobId);
   try {
     return callback();
   } finally {
@@ -107,8 +117,23 @@ function newJobId() {
 function writeJob(job, cwd = process.cwd(), env = process.env) {
   const file = jobPath(job.id, cwd, env);
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(job, null, 2)}\n`, "utf8");
-  fs.renameSync(tmp, file);
+  const handle = fs.openSync(tmp, "w");
+  try {
+    fs.writeFileSync(handle, `${JSON.stringify(job, null, 2)}\n`, "utf8");
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+  try {
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // Best-effort cleanup of the orphaned temp file; surface the rename error.
+    }
+    throw error;
+  }
   return job;
 }
 
@@ -217,12 +242,21 @@ export function updateJob(jobId, updater, cwd = process.cwd(), env = process.env
   if (env.ANTIGRAVITY_FOR_CLAUDE_TEST_UPDATE_JOB_FAILURE === "1") {
     return null;
   }
-  return withJobLock(jobId, cwd, env, () => {
-    const job = readJob(jobId, cwd, env);
-    if (!job) return null;
-    const updated = updater(job) || job;
-    return writeJob(updated, cwd, env);
-  });
+  // updateJob is a best-effort metadata mutation whose callers already tolerate a
+  // null return, so a busy lock is reported as null rather than thrown. The
+  // status-critical helpers (markJobRunning/finishJob/cancelJob/markJobViewed)
+  // let LockTimeoutError propagate so callers can distinguish it from missing job.
+  try {
+    return withJobLock(jobId, cwd, env, () => {
+      const job = readJob(jobId, cwd, env);
+      if (!job) return null;
+      const updated = updater(job) || job;
+      return writeJob(updated, cwd, env);
+    });
+  } catch (error) {
+    if (error instanceof LockTimeoutError) return null;
+    throw error;
+  }
 }
 
 export function findReusableJob({ command, args = [], cwd = process.cwd(), idempotencyKey = "" }, env = process.env) {
@@ -298,11 +332,19 @@ export function listJobs(cwd = process.cwd(), env = process.env) {
 
 export function readJob(jobId, cwd = process.cwd(), env = process.env) {
   const file = jobPath(jobId, cwd, env);
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    raw = fs.readFileSync(file, "utf8");
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw error;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // Tolerate a corrupt sidecar the same way listJobs does, so mutation helpers
+    // (updateJob/finishJob/cancelJob) do not throw on a truncated/garbled file.
+    return null;
   }
 }
 
