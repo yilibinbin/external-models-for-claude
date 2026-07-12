@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0-fh.4
+
+- Route `--quality max` to the current model's TRUE strongest reasoning tier (including `max`/`ultra`) instead of a hardcoded `high`, resolved per-model at session time from the app-server `model/list` capability table (`isDefault` model when `--model` is omitted).
+- Replace the global `VALID_REASONING_EFFORTS` whitelist with per-model capability validation: `--effort` is now checked against the current model's real `supportedReasoningEfforts`. **Behavior change:** an `--effort` value that the global whitelist previously let through, but that the resolved model does not actually support (e.g. `--effort xhigh` on a model whose ceiling is `high`), now fails loud within the session instead of being silently forwarded to the app-server. This is the intended capability verification, not a regression, but it can turn a command that previously "ran" into a hard error.
+- Degrade safely when `model/list` is unavailable: omit the reasoning-effort for all models and warn (run at the app-server default tier) rather than guessing a tier or failing the run.
+- Declare the `model/list` method in the app-server protocol contract; native `review` stays metadata-only (no effort channel), unaffected by this change.
+
 ## 1.1.0-fh.3
 
 - Reject the pending turn when the `codex app-server` transport dies mid-turn (crash/OOM/socket drop) instead of hanging `review`/`task` forever, and self-terminate the shared broker when its backing app-server child dies so a stale "ready" broker is not reused.

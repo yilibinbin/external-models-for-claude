@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, normalizeArgv } from "./lib/args.mjs";
 import { parseStrictCommandInput } from "./lib/command-policy.mjs";
+import { KNOWN_EFFORTS } from "./lib/effort-policy.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -88,7 +89,6 @@ const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json"
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const STALE_BACKGROUND_HANDOFF_MS = 30000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
@@ -141,7 +141,12 @@ function normalizeRequestedModel(model) {
   return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
 }
 
-function normalizeReasoningEffort(effort) {
+// CLI-layer SYNTAX pre-check only: reject obviously-bad values (e.g. "hyper") at parse time so a
+// governor lease + app-server spawn is not wasted. Per-model legality (does THIS model support the
+// tier?) is deferred to the session, where effort-policy.validateEffortForModel checks it against a
+// live model/list. This intentionally accepts union tiers like "max"/"ultra" that the old global
+// VALID_REASONING_EFFORTS set wrongly blocked (fixes problem #2).
+export function normalizeReasoningEffort(effort) {
   if (effort == null) {
     return null;
   }
@@ -149,9 +154,9 @@ function normalizeReasoningEffort(effort) {
   if (!normalized) {
     return null;
   }
-  if (!VALID_REASONING_EFFORTS.has(normalized)) {
+  if (!KNOWN_EFFORTS.has(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
+      `Unsupported reasoning effort "${effort}". Known efforts: ${[...KNOWN_EFFORTS].join(", ")}.`
     );
   }
   return normalized;
@@ -326,6 +331,8 @@ export function buildAdversarialReviewTurnOptions(context, request, focusText) {
     prompt: buildAdversarialReviewPrompt(context, focusText),
     model: request.model,
     effort: request.effort,
+    // N4 copy hop: highest-tier intent must reach runAppServerTurn's per-model resolver.
+    wantsHighestEffort: request.wantsHighestEffort === true,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
@@ -564,6 +571,8 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
+    // N4 copy hop: highest-tier intent must reach runAppServerTurn's per-model resolver.
+    wantsHighestEffort: request.wantsHighestEffort === true,
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     persistThread: request.persistThread !== false,
@@ -717,11 +726,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, wantsHighestEffort, prompt, write, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
+    wantsHighestEffort: wantsHighestEffort === true,
     prompt,
     write,
     resumeLast,
@@ -1063,6 +1073,9 @@ async function handleReviewCommand(argv, config) {
           focusText,
           reviewName: config.reviewName,
           effort: config.reviewName === "Adversarial Review" ? quality.effort : null,
+          // Adversarial Review runs a turn (per-model resolver applies); native Review has no effort
+          // channel, so highest-tier intent is suppressed there.
+          wantsHighestEffort: config.reviewName === "Adversarial Review" && quality.wantsHighestEffort === true,
           onProgress: progress
         }),
       { json: options.json }
@@ -1091,7 +1104,10 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const quality = resolveQuality(options.quality || "standard");
+  // Keep `|| quality.effort` so non-max presets retain their default tier (low/medium/high);
+  // for max, quality.effort is null and the highest-tier intent travels via wantsHighestEffort.
   const effort = normalizeReasoningEffort(options.effort || quality.effort);
+  const wantsHighestEffort = quality.wantsHighestEffort === true;
   const prompt = readTaskPrompt(cwd, options, positionals);
   const stopGateChild = verifyStopGateChildTask();
 
@@ -1129,6 +1145,7 @@ async function handleTask(argv) {
       cwd,
       model,
       effort,
+      wantsHighestEffort,
       prompt,
       write,
       resumeLast,
@@ -1148,6 +1165,7 @@ async function handleTask(argv) {
           cwd,
           model,
           effort,
+          wantsHighestEffort,
           prompt,
           write,
           resumeLast,
@@ -1554,6 +1572,7 @@ async function handleMultiReview(argv) {
               prompt,
               model,
               effort: quality.effort,
+              wantsHighestEffort: quality.wantsHighestEffort === true,
               write: false,
               resumeLast: false,
               persistThread: false,

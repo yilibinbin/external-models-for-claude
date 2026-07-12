@@ -35,6 +35,7 @@
  * }} TurnCaptureState
  */
 import { readJsonFile } from "./fs.mjs";
+import { resolveTurnEffort } from "./effort-policy.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
@@ -1009,6 +1010,30 @@ export async function runAppServerTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
+    // N1 fix (spec v6 §3.1/§3.3): resolve reasoning effort HERE — the only layer holding the
+    // app-server client. Query model/list for per-model capability, then route via the single
+    // resolver. On model/list failure, resolveTurnEffort omits effort (degrades safely).
+    let resolvedEffort = options.effort ?? null;
+    if (options.wantsHighestEffort || options.effort != null) {
+      let models = null;
+      try {
+        const listing = await client.request("model/list", {});
+        models = listing?.data ?? null;
+      } catch {
+        models = null; // omit-for-all + warning below
+      }
+      const resolution = resolveTurnEffort({
+        models,
+        requestedModel: options.model ?? null,
+        effort: options.effort ?? null,
+        wantsHighestEffort: options.wantsHighestEffort === true,
+      });
+      resolvedEffort = resolution.effort;
+      if (resolution.warning) {
+        emitProgress(options.onProgress, resolution.warning, "starting");
+      }
+    }
+
     const turnState = await captureTurn(
       client,
       threadId,
@@ -1017,7 +1042,7 @@ export async function runAppServerTurn(cwd, options = {}) {
           threadId,
           input: buildTurnInput(prompt),
           model: options.model ?? null,
-          effort: options.effort ?? null,
+          effort: resolvedEffort,
           outputSchema: options.outputSchema ?? null
         }),
       { onProgress: options.onProgress }
