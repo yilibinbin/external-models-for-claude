@@ -19,7 +19,11 @@ const POLICIES = {
   },
   max: {
     quality: "max",
-    effort: "high",
+    // effort is resolved per-model at session time (highest tier the current model supports).
+    // Kept null here so the sentinel object never reaches normalizeReasoningEffort/turn/start;
+    // the highest-tier intent travels via the wantsHighestEffort boolean instead.
+    effort: null,
+    wantsHighestEffort: true,
     nativeReviewEffect: "metadata-only",
     explanation: "Maximum-effort Codex turn for release-critical work."
   }

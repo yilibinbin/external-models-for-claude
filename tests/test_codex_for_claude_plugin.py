@@ -429,7 +429,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.3" in notices
+    assert "Local extended version: 1.1.0-fh.4" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -7613,7 +7613,9 @@ def test_codex_quality_policy_is_available_before_multi_review_wiring():
     fast, standard, maxq = json.loads(result.stdout)
     assert fast["effort"] == "low"
     assert standard["effort"] == "medium"
-    assert maxq["effort"] == "high"
+    # max no longer hardcodes effort; it carries a boolean sentinel resolved per-model at session time.
+    assert maxq["effort"] is None
+    assert maxq["wantsHighestEffort"] is True
     assert maxq["nativeReviewEffect"] == "metadata-only"
 
 
@@ -7627,7 +7629,9 @@ def test_codex_quality_policy_maps_presets_to_effort_and_model():
     fast, standard, maxq = json.loads(result.stdout)
     assert fast["effort"] == "low"
     assert standard["effort"] == "medium"
-    assert maxq["effort"] == "high"
+    # max no longer hardcodes effort; it carries a boolean sentinel resolved per-model at session time.
+    assert maxq["effort"] is None
+    assert maxq["wantsHighestEffort"] is True
     assert maxq["nativeReviewEffect"] == "metadata-only"
 
 
@@ -7857,7 +7861,7 @@ def test_codex_github_actions_module_has_no_top_level_side_effects():
 
 
 def test_codex_github_actions_plugin_root_resolves_template_from_installed_cache_layout(tmp_path):
-    installed = tmp_path / "cache" / "external-models-for-claude" / "codex" / "1.1.0-fh.3"
+    installed = tmp_path / "cache" / "external-models-for-claude" / "codex" / "1.1.0-fh.4"
     shutil.copytree(PLUGIN, installed)
     module_url = (installed / "scripts" / "lib" / "github-actions.mjs").as_uri()
     script = (
@@ -8657,3 +8661,849 @@ def test_codex_summary_is_sanitized():
     # The ANSI escape is stripped but its visible payload survives.
     assert "RED" in output
     assert "AB" in output
+
+
+# ===== effort-policy.mjs (codex intelligence-tier capability adaptation, spec v6) =====
+
+def _run_effort_policy(body):
+    script = (
+        "const p = await import('./plugins/codex/scripts/lib/effort-policy.mjs');"
+        + body
+    )
+    return subprocess.run(
+        [NODE, "--input-type=module", "-e", script],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+
+# Fixture mirrors the REAL app-server model/list shape probed at implementation time:
+# element field is `reasoningEffort` (NOT models_cache's `effort`); model key `id`; `isDefault` bool.
+_SOL = ("{id:'gpt-5.6-sol',isDefault:true,supportedReasoningEfforts:"
+        "[{reasoningEffort:'low'},{reasoningEffort:'medium'},{reasoningEffort:'high'},"
+        "{reasoningEffort:'xhigh'},{reasoningEffort:'max'},{reasoningEffort:'ultra'}]}")
+_LUNA = ("{id:'gpt-5.6-luna',isDefault:false,supportedReasoningEfforts:"
+         "[{reasoningEffort:'low'},{reasoningEffort:'medium'},{reasoningEffort:'high'},"
+         "{reasoningEffort:'xhigh'},{reasoningEffort:'max'}]}")
+_G55 = ("{id:'gpt-5.5',isDefault:false,supportedReasoningEfforts:"
+        "[{reasoningEffort:'low'},{reasoningEffort:'medium'},{reasoningEffort:'high'},"
+        "{reasoningEffort:'xhigh'}]}")
+_MODELS = "[" + _SOL + "," + _LUNA + "," + _G55 + "]"
+
+
+def test_effort_policy_supported_efforts_extracts_reasoning_effort_field():
+    # Uses the REAL app-server field name reasoningEffort, not cache's `effort`.
+    r = _run_effort_policy(
+        "process.stdout.write(JSON.stringify(p.supportedEffortsOf(" + _SOL + ")));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == ["low", "medium", "high", "xhigh", "max", "ultra"]
+
+
+def test_effort_policy_resolve_model_entry_by_explicit_id():
+    r = _run_effort_policy(
+        "const m=p.resolveModelEntry(" + _MODELS + ",'gpt-5.6-luna');"
+        "process.stdout.write(m ? m.id : 'null');"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "gpt-5.6-luna"
+
+
+def test_effort_policy_resolve_model_entry_defaults_to_isdefault_when_null():
+    r = _run_effort_policy(
+        "const m=p.resolveModelEntry(" + _MODELS + ",null);"
+        "process.stdout.write(m ? m.id : 'null');"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "gpt-5.6-sol"
+
+
+def test_effort_policy_resolve_model_entry_unknown_returns_null():
+    r = _run_effort_policy(
+        "const m=p.resolveModelEntry(" + _MODELS + ",'bogus');"
+        "process.stdout.write(m===null ? 'null' : 'hit');"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "null"
+
+
+def test_effort_policy_highest_known_effort_picks_ultra_regardless_of_order():
+    # Order-independence: proves it uses EFFORT_ORDER, not array position.
+    r = _run_effort_policy(
+        "process.stdout.write(p.highestKnownEffort(['ultra','low','high']));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "ultra"
+
+
+def test_effort_policy_highest_known_effort_luna_tops_at_max():
+    r = _run_effort_policy(
+        "process.stdout.write(p.highestKnownEffort(['low','medium','high','xhigh','max']));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "max"
+
+
+def test_effort_policy_highest_known_effort_empty_list_fails_loud():
+    r = _run_effort_policy(
+        "try{p.highestKnownEffort([]);process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write('THREW');}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW"
+
+
+def test_effort_policy_highest_known_effort_unknown_tier_fails_loud():
+    r = _run_effort_policy(
+        "try{p.highestKnownEffort(['low','hyper']);process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write('THREW:'+(e.message.includes('hyper')));}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW:true"
+
+
+def test_effort_policy_validate_effort_accepts_supported():
+    r = _run_effort_policy(
+        "process.stdout.write(p.validateEffortForModel('ultra',['low','high','ultra']));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "ultra"
+
+
+def test_effort_policy_validate_effort_rejects_unsupported_for_model():
+    r = _run_effort_policy(
+        "try{p.validateEffortForModel('max',['low','medium','high','xhigh']);process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write('THREW');}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW"
+
+
+def test_effort_policy_validate_effort_undefined_supported_fails_loud():
+    # N2 guard: caller must never pass undefined supported (model/list-failure path).
+    r = _run_effort_policy(
+        "try{p.validateEffortForModel('xhigh',undefined);process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write('THREW:'+e.message.includes('caller must guard'));}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW:true"
+
+
+def test_effort_policy_validate_effort_null_value_returns_null():
+    r = _run_effort_policy(
+        "process.stdout.write(String(p.validateEffortForModel(null,['low','high'])));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "null"
+
+
+# ===== quality-policy.mjs sentinel (spec v6 §3.3) =====
+
+def _run_quality_policy(body):
+    script = (
+        "const q = await import('./plugins/codex/scripts/lib/quality-policy.mjs');"
+        + body
+    )
+    return subprocess.run(
+        [NODE, "--input-type=module", "-e", script],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+
+def test_quality_policy_max_carries_boolean_sentinel_not_object():
+    # N3/N4: max.effort must be null (scalar), highest-tier intent via a separate boolean.
+    r = _run_quality_policy(
+        "const m=q.resolveQuality('max');"
+        "process.stdout.write(JSON.stringify({effort:m.effort, wants:m.wantsHighestEffort, quality:m.quality}));"
+    )
+    assert r.returncode == 0, r.stderr
+    m = json.loads(r.stdout)
+    assert m["effort"] is None
+    assert m["wants"] is True
+    assert m["quality"] == "max"
+
+
+def test_quality_policy_non_max_presets_keep_their_default_effort():
+    # v5-regression guard: fast/standard/strong must retain their default tier (not become null).
+    r = _run_quality_policy(
+        "process.stdout.write(JSON.stringify(["
+        "q.resolveQuality('fast').effort,"
+        "q.resolveQuality('standard').effort,"
+        "q.resolveQuality('strong').effort]));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == ["low", "medium", "high"]
+
+
+def test_quality_policy_non_max_presets_do_not_set_highest_sentinel():
+    r = _run_quality_policy(
+        "process.stdout.write(JSON.stringify(["
+        "!!q.resolveQuality('fast').wantsHighestEffort,"
+        "!!q.resolveQuality('standard').wantsHighestEffort,"
+        "!!q.resolveQuality('strong').wantsHighestEffort]));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == [False, False, False]
+
+
+# ===== codex-companion wantsHighestEffort transport (spec v6 §3.3 N4 copy hops) =====
+
+def test_companion_adversarial_options_forward_wants_highest_effort():
+    # N4 copy hop: buildAdversarialReviewTurnOptions must thread request.wantsHighestEffort.
+    script = (
+        "const c = await import('./plugins/codex/scripts/codex-companion.mjs');"
+        "const context = {repoRoot:process.cwd(), branch:'main', summary:'1 file changed', target:{label:'working tree', mode:'working-tree'}, content:'diff --git a/src/demo.js b/src/demo.js', changedFiles:['src/demo.js'], inputMode:'inline-diff', collectionGuidance:'x', fileCount:1, diffBytes:42};"
+        "const opts = c.buildAdversarialReviewTurnOptions(context, {model:'gpt-5', effort:null, wantsHighestEffort:true}, 'focus');"
+        "process.stdout.write(JSON.stringify({effort:opts.effort, wants:opts.wantsHighestEffort}));"
+    )
+    r = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert r.returncode == 0, r.stderr
+    payload = json.loads(r.stdout)
+    assert payload["effort"] is None
+    assert payload["wants"] is True
+
+
+def test_companion_adversarial_options_default_wants_highest_false():
+    # Non-max path: wantsHighestEffort absent/false, effort carries the scalar.
+    script = (
+        "const c = await import('./plugins/codex/scripts/codex-companion.mjs');"
+        "const context = {repoRoot:process.cwd(), branch:'main', summary:'x', target:{label:'wt', mode:'working-tree'}, content:'diff', changedFiles:['a.js'], inputMode:'inline-diff', collectionGuidance:'x', fileCount:1, diffBytes:4};"
+        "const opts = c.buildAdversarialReviewTurnOptions(context, {model:'gpt-5', effort:'high'}, 'focus');"
+        "process.stdout.write(JSON.stringify({effort:opts.effort, wants:!!opts.wantsHighestEffort}));"
+    )
+    r = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert r.returncode == 0, r.stderr
+    payload = json.loads(r.stdout)
+    assert payload == {"effort": "high", "wants": False}
+
+
+def test_companion_normalize_reasoning_effort_syntax_precheck_only():
+    # After removing the global VALID_REASONING_EFFORTS set, normalizeReasoningEffort keeps a
+    # STATIC syntax pre-check against the EFFORT_ORDER union (rejects garbage like 'hyper'),
+    # but per-model legality is deferred to the session. It must NO LONGER hardcode the 6-tier
+    # message, and must accept union tiers like 'ultra'/'max' that the old set wrongly blocked.
+    script = (
+        "const c = await import('./plugins/codex/scripts/codex-companion.mjs');"
+        "const out = {};"
+        "out.ultra = c.normalizeReasoningEffort('ultra');"        # was blocked by old global set
+        "out.max = c.normalizeReasoningEffort('max');"            # was blocked by old global set
+        "try{ c.normalizeReasoningEffort('hyper'); out.hyper='NO_THROW'; }catch(e){ out.hyper='THREW'; out.msg=e.message; }"
+        "out.nullv = c.normalizeReasoningEffort(null);"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+    r = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["ultra"] == "ultra"           # no longer blocked (fixes problem #2)
+    assert out["max"] == "max"               # no longer blocked (fixes problem #2)
+    assert out["hyper"] == "THREW"           # garbage still rejected at parse (syntax pre-check)
+    assert out["nullv"] is None
+    # The old hardcoded 6-tier message (ending at xhigh) must be gone; the new message lists the
+    # full known union (…, xhigh, max, ultra). Match the OLD sentence exactly, not a prefix substring.
+    assert 'Use one of: none, minimal, low, medium, high, xhigh.' not in out.get("msg", "")
+
+
+def test_companion_no_global_valid_reasoning_efforts_set():
+    # Problem #2/#4: the global whitelist DECLARATION must be deleted (a historical mention in a
+    # comment is fine; what must not exist is the const Set that blocked max/ultra).
+    source = (ROOT / "plugins/codex/scripts/codex-companion.mjs").read_text()
+    assert "const VALID_REASONING_EFFORTS" not in source
+    assert "new Set([\"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\"])" not in source
+
+
+# ===== effort-policy.resolveTurnEffort — the single session-time resolver (spec v6 §3.3/§3.4) =====
+# Signature: resolveTurnEffort({ models, requestedModel, effort, wantsHighestEffort })
+#   models === null  -> model/list FAILED (§3.4 omit-for-all)
+#   returns { effort: <string|null>, warning: <string|null> }
+
+def _run_resolver(args_js):
+    return _run_effort_policy(
+        "const r = p.resolveTurnEffort(" + args_js + ");"
+        "process.stdout.write(JSON.stringify(r));"
+    )
+
+
+def test_resolver_max_sentinel_default_model_resolves_to_ultra():
+    # model=null -> isDefault sol -> highest = ultra (main-path fix for v3-refuted B).
+    r = _run_resolver("{models:" + _MODELS + ",requestedModel:null,effort:null,wantsHighestEffort:true}")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["effort"] == "ultra"
+    assert out["warning"] is None
+
+
+def test_resolver_max_sentinel_luna_resolves_to_max():
+    r = _run_resolver("{models:" + _MODELS + ",requestedModel:'gpt-5.6-luna',effort:null,wantsHighestEffort:true}")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["effort"] == "max"
+
+
+def test_resolver_max_sentinel_gpt55_resolves_to_xhigh():
+    r = _run_resolver("{models:" + _MODELS + ",requestedModel:'gpt-5.5',effort:null,wantsHighestEffort:true}")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["effort"] == "xhigh"
+
+
+def test_resolver_explicit_effort_validated_and_passed_through():
+    # Non-max path: explicit --effort xhigh on sol (supported) -> xhigh, per-model validated.
+    r = _run_resolver("{models:" + _MODELS + ",requestedModel:'gpt-5.6-sol',effort:'xhigh',wantsHighestEffort:false}")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["effort"] == "xhigh"
+
+
+def test_resolver_explicit_effort_takes_precedence_over_sentinel():
+    # --effort high --quality max: explicit high must win over the highest-tier sentinel.
+    r = _run_resolver("{models:" + _MODELS + ",requestedModel:'gpt-5.6-sol',effort:'high',wantsHighestEffort:true}")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["effort"] == "high"
+
+
+def test_resolver_explicit_effort_unsupported_for_model_fails_loud():
+    # --effort max on gpt-5.5 (which tops at xhigh) -> throw.
+    r = _run_effort_policy(
+        "try{p.resolveTurnEffort({models:" + _MODELS + ",requestedModel:'gpt-5.5',effort:'max',wantsHighestEffort:false});"
+        "process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write(e.message.includes('does not support')?'THREW_REAL':'THREW_OTHER:'+e.message);}"
+    )
+    assert r.returncode == 0, r.stderr
+    # THREW_REAL (not just any throw) rules out the false pass where the function is simply missing.
+    assert r.stdout == "THREW_REAL"
+
+
+def test_resolver_non_max_preset_effort_not_dropped():
+    # standard preset passes effort='medium' (from quality.effort) with wantsHighestEffort false
+    # -> must resolve to medium, NOT null (the v5 regression guard at the resolver level).
+    r = _run_resolver("{models:" + _MODELS + ",requestedModel:null,effort:'medium',wantsHighestEffort:false}")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["effort"] == "medium"
+
+
+def test_resolver_unknown_explicit_model_fails_loud():
+    r = _run_effort_policy(
+        "try{p.resolveTurnEffort({models:" + _MODELS + ",requestedModel:'bogus',effort:null,wantsHighestEffort:true});"
+        "process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write(e.message.toLowerCase().includes('unknown model')?'THREW_REAL':'THREW_OTHER:'+e.message);}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW_REAL"
+
+
+def test_resolver_no_default_model_max_fails_loud():
+    # model=null and NO isDefault entry + max sentinel -> fail loud (can't define 'strongest').
+    no_default = "[{id:'x',isDefault:false,supportedReasoningEfforts:[{reasoningEffort:'low'}]}]"
+    r = _run_effort_policy(
+        "try{p.resolveTurnEffort({models:" + no_default + ",requestedModel:null,effort:null,wantsHighestEffort:true});"
+        "process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write(e.message.toLowerCase().includes('default')?'THREW_REAL':'THREW_OTHER:'+e.message);}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW_REAL"
+
+
+def test_resolver_no_default_model_non_max_omits():
+    # model=null and no isDefault + non-max -> omit (null), no throw.
+    no_default = "[{id:'x',isDefault:false,supportedReasoningEfforts:[{reasoningEffort:'low'}]}]"
+    r = _run_resolver("{models:" + no_default + ",requestedModel:null,effort:null,wantsHighestEffort:false}")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["effort"] is None
+
+
+def test_resolver_no_default_model_explicit_effort_omits_not_forwarded():
+    # Codex Stage-3 MEDIUM: model/list SUCCEEDED but has no isDefault entry and requestedModel is
+    # null, yet an explicit --effort is present. The effort was NEVER validated against any model's
+    # supportedReasoningEfforts (no entry was resolved), so it must be OMITTED (spec §3.4 line 145:
+    # "otherwise omit effort"), NOT forwarded unverified. Forwarding 'xhigh' here would break the
+    # per-model verification guarantee and could cause a late turn/start failure on a model that
+    # tops out below xhigh. A warning is emitted so the silent drop of an explicit tier is surfaced.
+    no_default = "[{id:'x',isDefault:false,supportedReasoningEfforts:[{reasoningEffort:'low'}]}]"
+    r = _run_resolver("{models:" + no_default + ",requestedModel:null,effort:'xhigh',wantsHighestEffort:false}")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["effort"] is None, "explicit effort must be omitted (never resolved a model to validate against)"
+    assert out["warning"] is not None, "silently dropping an explicit --effort must be surfaced via a warning"
+
+
+def test_resolver_modellist_failure_max_omits_with_warning():
+    # C3 converged: model/list failure (models===null) + max -> omit effort + warning (no xhigh, no throw).
+    r = _run_resolver("{models:null,requestedModel:'gpt-5.6-sol',effort:null,wantsHighestEffort:true}")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["effort"] is None
+    assert out["warning"] is not None
+    assert "xhigh" not in out["warning"].lower()
+
+
+def test_resolver_modellist_failure_explicit_effort_omits_with_warning():
+    # N2/C3: model/list failure + explicit --effort -> omit (never call validateEffortForModel), warn.
+    r = _run_resolver("{models:null,requestedModel:'gpt-5.6-sol',effort:'xhigh',wantsHighestEffort:false}")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["effort"] is None
+    assert out["warning"] is not None
+
+
+# ===== END-TO-END: runAppServerTurn drives model/list -> resolveTurnEffort -> turn/start (spec v6 §6) =====
+# These exercise the REAL N1 wiring inside codex.mjs (not just the pure resolver): a fake app-server
+# answers model/list with the sol fixture (tops at ultra) and echoes back the effort turn/start receives.
+# Imports resolve against ROOT (cwd) so the repo-under-test's codex.mjs is exercised — NOT the stale
+# /tmp/codex-fix clone some older integration tests hardcode.
+
+# Fake app-server that records what turn/start received into a marker FILE (the child's stderr is
+# captured by the app-server client, so a file is the reliable side channel). The model/list reply
+# carries a single isDefault=sol model whose highest supported tier is `ultra`. The marker path is
+# read from the CODEX_E2E_MARKER env var.
+_E2E_APP_SERVER = (
+    "import readline from 'node:readline';\n"
+    "import fs from 'node:fs';\n"
+    "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+    "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+    "const rl = readline.createInterface({ input: process.stdin });\n"
+    "const send = (m) => console.log(JSON.stringify(m));\n"
+    "rl.on('line', (line) => {\n"
+    "  if (!line.trim()) return;\n"
+    "  const m = JSON.parse(line);\n"
+    "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+    "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+    "  if (m.method === 'model/list') {\n"
+    "    mark('MODEL_LIST_CALLED', true);\n"
+    "    send({ id: m.id, result: { data: [\n"
+    "      { id: 'gpt-5.6-sol', isDefault: true, supportedReasoningEfforts: [\n"
+    "        {reasoningEffort:'low'},{reasoningEffort:'medium'},{reasoningEffort:'high'},\n"
+    "        {reasoningEffort:'xhigh'},{reasoningEffort:'max'},{reasoningEffort:'ultra'} ] }\n"
+    "    ], nextCursor: null } });\n"
+    "    return;\n"
+    "  }\n"
+    "  if (m.method === 'turn/start') {\n"
+    "    mark('TURN_EFFORT', m.params.effort ?? null);\n"
+    "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+    "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+    "    return;\n"
+    "  }\n"
+    "  send({ id: m.id, result: {} });\n"
+    "});\n"
+)
+
+
+def _run_turn_e2e(tmp_path, options_js, server_js=None):
+    """Drive runAppServerTurn end-to-end against the fake app-server. Returns (result, marker_text).
+    The fake server appends TURN_EFFORT=<json> / MODEL_LIST_CALLED=<json> lines to a marker file."""
+    marker = tmp_path / "e2e-marker.txt"
+    marker.write_text("", encoding="utf8")
+    bin_dir = write_fake_app_server(tmp_path, server_js or _E2E_APP_SERVER)
+    script = (
+        "import { runAppServerTurn } from './plugins/codex/scripts/lib/codex.mjs';\n"
+        "const res = await runAppServerTurn(process.cwd(), " + options_js + ");\n"
+        "process.stdout.write(JSON.stringify({ status: res.status }));\n"
+        "process.exit(0);\n"
+    )
+    env = app_server_env(tmp_path, bin_dir)
+    env["CODEX_E2E_MARKER"] = str(marker)
+    result = run_node_inline(script, env, timeout=30)
+    return result, marker.read_text(encoding="utf8")
+
+
+def _marker_value(marker_text, key):
+    """Extract a JSON value recorded under `key` in the marker file (last occurrence)."""
+    matches = re.findall(rf"^{re.escape(key)}=(.+)$", marker_text, re.MULTILINE)
+    assert matches, f"marker never recorded {key!r}; marker={marker_text!r}"
+    return json.loads(matches[-1])
+
+
+def test_e2e_task_entrypoint_max_reaches_ultra(tmp_path):
+    # Task path (executeTaskRun -> runAppServerTurn): --quality max sets wantsHighestEffort:true,
+    # effort:null. The wiring must query model/list, resolve sol's highest tier, and send `ultra`.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
+    )
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+
+
+def test_e2e_max_without_wants_highest_effort_does_not_reach_ultra(tmp_path):
+    # N4 anchor: if a copy hop DROPS wantsHighestEffort (effort stays null, boolean false),
+    # the turn must NOT silently reach ultra — it omits effort (null). This is what turns RED
+    # if any entry point fails to forward the boolean.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: false }",
+    )
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") is None
+
+
+def test_e2e_explicit_effort_validated_against_model_and_sent(tmp_path):
+    # Explicit --effort xhigh (supported by sol) must pass per-model validation and reach turn/start.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: 'gpt-5.6-sol', effort: 'xhigh', wantsHighestEffort: false }",
+    )
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") == "xhigh"
+
+
+def test_e2e_no_effort_and_no_sentinel_skips_model_list(tmp_path):
+    # Guard: neither an explicit effort nor the highest-tier sentinel -> the wiring must NOT query
+    # model/list at all (fast path), and turn/start receives null.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: false }",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "MODEL_LIST_CALLED" not in marker
+    assert _marker_value(marker, "TURN_EFFORT") is None
+
+
+# A paginating fake app-server: model/list page 1 returns a filler model + nextCursor; page 2
+# (requested with cursor) returns the isDefault sol model (tops at ultra) and no nextCursor. The
+# resolver must follow nextCursor to find the default model, else it treats it as "no default".
+_E2E_PAGINATED_APP_SERVER = (
+    "import readline from 'node:readline';\n"
+    "import fs from 'node:fs';\n"
+    "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+    "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+    "const rl = readline.createInterface({ input: process.stdin });\n"
+    "const send = (m) => console.log(JSON.stringify(m));\n"
+    "rl.on('line', (line) => {\n"
+    "  if (!line.trim()) return;\n"
+    "  const m = JSON.parse(line);\n"
+    "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+    "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+    "  if (m.method === 'model/list') {\n"
+    "    const cursor = m.params && m.params.cursor;\n"
+    "    mark('MODEL_LIST_CURSOR', cursor ?? null);\n"
+    "    if (!cursor) {\n"
+    "      // Page 1: a non-default filler model only, plus a nextCursor pointing at page 2.\n"
+    "      send({ id: m.id, result: { data: [\n"
+    "        { id: 'filler', isDefault: false, supportedReasoningEfforts: [{reasoningEffort:'low'}] }\n"
+    "      ], nextCursor: 'PAGE2' } });\n"
+    "    } else {\n"
+    "      // Page 2: the isDefault sol model (tops at ultra); no further pages.\n"
+    "      send({ id: m.id, result: { data: [\n"
+    "        { id: 'gpt-5.6-sol', isDefault: true, supportedReasoningEfforts: [\n"
+    "          {reasoningEffort:'low'},{reasoningEffort:'high'},{reasoningEffort:'ultra'} ] }\n"
+    "      ], nextCursor: null } });\n"
+    "    }\n"
+    "    return;\n"
+    "  }\n"
+    "  if (m.method === 'turn/start') {\n"
+    "    mark('TURN_EFFORT', m.params.effort ?? null);\n"
+    "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+    "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+    "    return;\n"
+    "  }\n"
+    "  send({ id: m.id, result: {} });\n"
+    "});\n"
+)
+
+
+def test_e2e_model_list_pagination_follows_next_cursor(tmp_path):
+    # CodeRabbit Major: model/list is paginated (limit/cursor/nextCursor per the codex MCP spec).
+    # The default (isDefault) model lives on page 2. The resolver must follow nextCursor to find it,
+    # otherwise --quality max sees "no default model" and cannot reach ultra. Reaching ultra proves
+    # the second page was fetched and merged.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
+        server_js=_E2E_PAGINATED_APP_SERVER,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+    # The second page must actually have been requested with the opaque cursor from page 1.
+    cursors = re.findall(r"^MODEL_LIST_CURSOR=(.+)$", marker, re.MULTILINE)
+    assert json.loads(cursors[-1]) == "PAGE2", f"resolver did not page with nextCursor; cursors={cursors}"
+
+
+# A fake app-server whose model/list NEVER terminates pagination: every page returns a filler model
+# and a fresh non-null nextCursor. Represents an unconfirmable/incomplete listing (huge list beyond
+# the page cap, or a looping cursor). The resolver must NOT treat the partial pages as authoritative.
+_E2E_ENDLESS_PAGINATION_APP_SERVER = (
+    "import readline from 'node:readline';\n"
+    "import fs from 'node:fs';\n"
+    "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+    "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+    "let page = 0;\n"
+    "const rl = readline.createInterface({ input: process.stdin });\n"
+    "const send = (m) => console.log(JSON.stringify(m));\n"
+    "rl.on('line', (line) => {\n"
+    "  if (!line.trim()) return;\n"
+    "  const m = JSON.parse(line);\n"
+    "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+    "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+    "  if (m.method === 'model/list') {\n"
+    "    page += 1;\n"
+    "    mark('MODEL_LIST_PAGE', page);\n"
+    "    // Always a fresh, distinct, non-null cursor -> pagination never terminates.\n"
+    "    send({ id: m.id, result: { data: [\n"
+    "      { id: 'filler-' + page, isDefault: false, supportedReasoningEfforts: [{reasoningEffort:'low'}] }\n"
+    "    ], nextCursor: 'C' + page } });\n"
+    "    return;\n"
+    "  }\n"
+    "  if (m.method === 'turn/start') {\n"
+    "    mark('TURN_EFFORT', m.params.effort ?? null);\n"
+    "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+    "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+    "    return;\n"
+    "  }\n"
+    "  send({ id: m.id, result: {} });\n"
+    "});\n"
+)
+
+
+def test_e2e_incomplete_pagination_degrades_to_omit_not_failure(tmp_path):
+    # Codex delta MEDIUM: if the page cap is exhausted while nextCursor is still present, the listing
+    # is INCOMPLETE and must NOT be treated as authoritative. --quality max on an unconfirmable list
+    # must degrade to omit-for-all (turn completes with effort omitted), NOT fail loud with
+    # "no default model". The turn completing at all (status 0) proves the degraded path was taken.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
+        server_js=_E2E_ENDLESS_PAGINATION_APP_SERVER,
+    )
+    assert result.returncode == 0, result.stderr
+    # Degraded: effort omitted (null), turn still ran — not a hard failure.
+    assert _marker_value(marker, "TURN_EFFORT") is None
+    # Bounded: the loop stopped paging (either a page cap or a repeated-cursor short-circuit); it did
+    # not fire an unbounded number of RPCs. A generous ceiling still proves boundedness.
+    pages = [int(x) for x in re.findall(r"^MODEL_LIST_PAGE=(\d+)$", marker, re.MULTILINE)]
+    assert pages, "model/list was never called"
+    assert max(pages) <= 20, f"pagination did not stop at the cap; reached page {max(pages)}"
+
+
+# A fake app-server: valid first page (with a real model + nextCursor), then a MALFORMED terminal
+# page that omits `data` entirely. A partial/corrupt listing must not be treated as authoritative.
+_E2E_MALFORMED_PAGE_APP_SERVER = (
+    "import readline from 'node:readline';\n"
+    "import fs from 'node:fs';\n"
+    "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+    "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+    "let page = 0;\n"
+    "const rl = readline.createInterface({ input: process.stdin });\n"
+    "const send = (m) => console.log(JSON.stringify(m));\n"
+    "rl.on('line', (line) => {\n"
+    "  if (!line.trim()) return;\n"
+    "  const m = JSON.parse(line);\n"
+    "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+    "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+    "  if (m.method === 'model/list') {\n"
+    "    page += 1;\n"
+    "    if (page === 1) {\n"
+    "      // Valid first page: the isDefault sol model (tops at ultra) + a nextCursor.\n"
+    "      send({ id: m.id, result: { data: [\n"
+    "        { id: 'gpt-5.6-sol', isDefault: true, supportedReasoningEfforts: [\n"
+    "          {reasoningEffort:'low'},{reasoningEffort:'ultra'} ] }\n"
+    "      ], nextCursor: 'P2' } });\n"
+    "    } else {\n"
+    "      // Malformed terminal page: NO data array, but ends pagination.\n"
+    "      send({ id: m.id, result: { nextCursor: null } });\n"
+    "    }\n"
+    "    return;\n"
+    "  }\n"
+    "  if (m.method === 'turn/start') {\n"
+    "    mark('TURN_EFFORT', m.params.effort ?? null);\n"
+    "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+    "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+    "    return;\n"
+    "  }\n"
+    "  send({ id: m.id, result: {} });\n"
+    "});\n"
+)
+
+
+def test_e2e_malformed_page_degrades_to_omit_not_authoritative(tmp_path):
+    # Codex confirm-2 MEDIUM: a valid first page followed by a malformed page (missing `data`) must
+    # NOT yield an authoritative partial list. Even though page 1 alone contains the isDefault sol
+    # model (which WOULD resolve to ultra), the malformed page 2 makes the listing unconfirmable, so
+    # the resolver must degrade to omit-for-all (effort null), not confidently route to ultra off a
+    # partial list. Reaching ultra here would prove the partial list was wrongly treated as complete.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
+        server_js=_E2E_MALFORMED_PAGE_APP_SERVER,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") is None, "malformed page must force omit, not an authoritative partial list"
+
+
+# A fake app-server: valid first page (sol + a non-null but MALFORMED nextCursor that is not a
+# string — schema drift the declared `string | null` contract forbids). The listing cannot be
+# confirmed complete, so it must NOT be treated as authoritative.
+_E2E_MALFORMED_CURSOR_APP_SERVER = (
+    "import readline from 'node:readline';\n"
+    "import fs from 'node:fs';\n"
+    "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+    "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+    "const rl = readline.createInterface({ input: process.stdin });\n"
+    "const send = (m) => console.log(JSON.stringify(m));\n"
+    "rl.on('line', (line) => {\n"
+    "  if (!line.trim()) return;\n"
+    "  const m = JSON.parse(line);\n"
+    "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+    "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+    "  if (m.method === 'model/list') {\n"
+    "    // Valid data, but a falsy non-null cursor (false) that the string|null contract forbids.\n"
+    "    send({ id: m.id, result: { data: [\n"
+    "      { id: 'gpt-5.6-sol', isDefault: true, supportedReasoningEfforts: [\n"
+    "        {reasoningEffort:'low'},{reasoningEffort:'ultra'} ] }\n"
+    "    ], nextCursor: false } });\n"
+    "    return;\n"
+    "  }\n"
+    "  if (m.method === 'turn/start') {\n"
+    "    mark('TURN_EFFORT', m.params.effort ?? null);\n"
+    "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+    "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+    "    return;\n"
+    "  }\n"
+    "  send({ id: m.id, result: {} });\n"
+    "});\n"
+)
+
+
+def test_e2e_malformed_cursor_degrades_to_omit_not_authoritative(tmp_path):
+    # Codex confirm-3 MEDIUM: nextCursor is declared `string | null`. A falsy non-null value (false,
+    # 0, ...) is schema drift; the code must not treat it as clean termination and return the partial
+    # page as authoritative. Only null/absent terminates; only a non-empty string continues; anything
+    # else -> unconfirmable -> omit-for-all. Reaching ultra here would prove the partial page was
+    # wrongly treated as a complete listing off a malformed cursor.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
+        server_js=_E2E_MALFORMED_CURSOR_APP_SERVER,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") is None, "malformed non-string cursor must force omit, not an authoritative partial list"
+
+
+# ===== HANDLER-LEVEL end-to-end: drive the real command copy hops, not runAppServerTurn directly =====
+# CodeRabbit Major: the tests above call runAppServerTurn directly, so they stay green even if
+# executeTaskRun / executeReviewRun (the companion copy hops) drop wantsHighestEffort. These drive
+# the actual companion functions against the fake app-server and assert turn/start receives ultra.
+
+def _run_command_e2e(tmp_path, import_and_call_js, need_git=False):
+    """Drive a real codex-companion command function end to end against the fake app-server.
+    Returns (result, marker_text). import_and_call_js awaits the companion call; the fake server
+    records TURN_EFFORT to the marker file."""
+    marker = tmp_path / "cmd-marker.txt"
+    marker.write_text("", encoding="utf8")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    bin_dir = write_fake_app_server(tmp_path, _E2E_APP_SERVER)
+    if need_git:
+        # executeReviewRun requires a git repo with a diff to collect review context from.
+        subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=workdir, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=workdir, check=True)
+        (workdir / "demo.js").write_text("const a = 1;\n", encoding="utf8")
+        subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=workdir, check=True)
+        (workdir / "demo.js").write_text("const a = 2;\n", encoding="utf8")
+    script = (
+        "import * as c from './plugins/codex/scripts/codex-companion.mjs';\n"
+        "const WORK = process.argv[1];\n"
+        + import_and_call_js
+        + "\nprocess.exit(0);\n"
+    )
+    env = app_server_env(tmp_path, bin_dir)
+    env["CODEX_E2E_MARKER"] = str(marker)
+    result = run_node_inline(script, env, args=[str(workdir)], timeout=40)
+    return result, marker.read_text(encoding="utf8")
+
+
+def test_e2e_task_command_hop_preserves_wants_highest_effort(tmp_path):
+    # Drives executeTaskRun (the task command's copy hop into runAppServerTurn) with a request that
+    # carries wantsHighestEffort:true (what resolveQuality('max') + handleTask produce). If the hop
+    # drops the flag, turn/start gets null and this goes RED.
+    call = (
+        "await c.__testHooks.executeTaskRun({"
+        "  cwd: WORK, model: null, effort: null, wantsHighestEffort: true,"
+        "  prompt: 'do the thing', write: false, resumeLast: false, persistThread: false, jobId: null"
+        "});"
+    )
+    result, marker = _run_command_e2e(tmp_path, call)
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+
+
+def test_e2e_task_command_hop_without_flag_omits_effort(tmp_path):
+    # Same path, wantsHighestEffort:false + effort:null -> omit (null). Anchors that the ultra above
+    # is caused by the flag, not by executeTaskRun hardcoding a tier.
+    call = (
+        "await c.__testHooks.executeTaskRun({"
+        "  cwd: WORK, model: null, effort: null, wantsHighestEffort: false,"
+        "  prompt: 'do the thing', write: false, resumeLast: false, persistThread: false, jobId: null"
+        "});"
+    )
+    result, marker = _run_command_e2e(tmp_path, call)
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") is None
+
+
+def test_e2e_adversarial_review_command_hop_preserves_wants_highest_effort(tmp_path):
+    # Drives executeReviewRun (adversarial) end to end: request.wantsHighestEffort must survive
+    # through buildAdversarialReviewTurnOptions into runAppServerTurn and reach turn/start as ultra.
+    call = (
+        "await c.__testHooks.executeReviewRun({"
+        "  cwd: WORK, reviewName: 'Adversarial Review', model: null,"
+        "  effort: null, wantsHighestEffort: true, focusText: 'focus'"
+        "});"
+    )
+    result, marker = _run_command_e2e(tmp_path, call, need_git=True)
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+
+
+# ===== §9 hard gate: model/list must be a declared method in the app-server protocol contract =====
+
+def test_app_server_protocol_declares_model_list_method():
+    # spec v6 §9: the model/list RPC the resolver depends on must be declared in the plugin's
+    # AppServerMethodMap contract (was undeclared in v4 — Gemini HIGH -> Codex MED converged fix).
+    source = read_text(PLUGIN / "scripts" / "lib" / "app-server-protocol.d.ts")
+    assert '"model/list"' in source
+    # And it must carry the capability fields the resolver reads (documents the probed real shape).
+    assert "supportedReasoningEfforts" in source
+    assert "isDefault" in source
+
+
+# ===== §6: native review (review/start) is deliberately EXCLUDED from effort discovery =====
+
+def test_native_review_start_has_no_effort_channel(tmp_path):
+    # spec v6 §2.4/§3.5: runAppServerReview / review/start stays metadata-only. It must NOT query
+    # model/list and must NOT send an effort to review/start. A fake server records both to a file.
+    marker = tmp_path / "review-marker.txt"
+    marker.write_text("", encoding="utf8")
+    review_server = (
+        "import readline from 'node:readline';\n"
+        "import fs from 'node:fs';\n"
+        "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+        "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "const send = (m) => console.log(JSON.stringify(m));\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const m = JSON.parse(line);\n"
+        "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+        "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+        "  if (m.method === 'model/list') { mark('MODEL_LIST_CALLED', true); send({ id: m.id, result: { data: [] } }); return; }\n"
+        "  if (m.method === 'review/start') {\n"
+        "    mark('REVIEW_HAS_EFFORT', 'effort' in m.params);\n"
+        "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+        "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+        "    return;\n"
+        "  }\n"
+        "  send({ id: m.id, result: {} });\n"
+        "});\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, review_server)
+    script = (
+        "import { runAppServerReview } from './plugins/codex/scripts/lib/codex.mjs';\n"
+        "const res = await runAppServerReview(process.cwd(), { target: { mode: 'working-tree' } });\n"
+        "process.stdout.write(JSON.stringify({ status: res.status }));\n"
+        "process.exit(0);\n"
+    )
+    env = app_server_env(tmp_path, bin_dir)
+    env["CODEX_E2E_MARKER"] = str(marker)
+    result = run_node_inline(script, env, timeout=30)
+    assert result.returncode == 0, result.stderr
+    marker_text = marker.read_text(encoding="utf8")
+    # metadata-only: never queries model/list, never sends effort to review/start.
+    assert "MODEL_LIST_CALLED" not in marker_text
+    assert _marker_value(marker_text, "REVIEW_HAS_EFFORT") is False

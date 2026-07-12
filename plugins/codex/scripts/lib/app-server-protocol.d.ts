@@ -45,6 +45,33 @@ export type {
 export type ThreadStartParams = Omit<RawThreadStartParams, "persistExtendedHistory">;
 export type ThreadResumeParams = Omit<RawThreadResumeParams, "persistExtendedHistory">;
 
+// `model/list` is not exported by the generated app-server types, so its contract is declared
+// locally here. Field names mirror the REAL app-server response probed at implementation time
+// (spec v6 §9): model key `id`; per-model `supportedReasoningEfforts` with `{reasoningEffort}`
+// elements; `defaultReasoningEffort`; `isDefault`. The effort resolver (effort-policy.mjs) reads
+// exactly these fields, so this is the authoritative capability contract it depends on.
+export interface ModelReasoningEffort {
+  reasoningEffort: string;
+  description?: string;
+}
+export interface ModelListEntry {
+  id: string;
+  model?: string;
+  isDefault?: boolean;
+  supportedReasoningEfforts: ModelReasoningEffort[];
+  defaultReasoningEffort?: string;
+}
+export interface ModelListParams {
+  // Pagination (codex MCP interface): opaque `cursor` from a prior response's `nextCursor`,
+  // optional server-side `limit`. Omit both to fetch the first page with the server default size.
+  cursor?: string;
+  limit?: number;
+}
+export interface ModelListResponse {
+  data: ModelListEntry[];
+  nextCursor?: string | null;
+}
+
 export interface CodexAppServerClientOptions {
   env?: NodeJS.ProcessEnv;
   clientInfo?: ClientInfo;
@@ -60,6 +87,7 @@ export interface AppServerMethodMap {
   "thread/resume": { params: ThreadResumeParams; result: ThreadResumeResponse };
   "thread/name/set": { params: ThreadSetNameParams; result: ThreadSetNameResponse };
   "thread/list": { params: ThreadListParams; result: ThreadListResponse };
+  "model/list": { params: ModelListParams; result: ModelListResponse };
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };
   "turn/start": { params: TurnStartParams; result: TurnStartResponse };
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResponse };
