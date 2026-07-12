@@ -61,7 +61,12 @@ export interface ModelListEntry {
   supportedReasoningEfforts: ModelReasoningEffort[];
   defaultReasoningEffort?: string;
 }
-export interface ModelListParams {}
+export interface ModelListParams {
+  // Pagination (codex MCP interface): opaque `cursor` from a prior response's `nextCursor`,
+  // optional server-side `limit`. Omit both to fetch the first page with the server default size.
+  cursor?: string;
+  limit?: number;
+}
 export interface ModelListResponse {
   data: ModelListEntry[];
   nextCursor?: string | null;

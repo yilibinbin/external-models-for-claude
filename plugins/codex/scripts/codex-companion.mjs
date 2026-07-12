@@ -1104,9 +1104,11 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const quality = resolveQuality(options.quality || "standard");
-  // Keep `|| quality.effort` so non-max presets retain their default tier (low/medium/high);
-  // for max, quality.effort is null and the highest-tier intent travels via wantsHighestEffort.
-  const effort = normalizeReasoningEffort(options.effort || quality.effort);
+  // Keep `?? quality.effort` so non-max presets retain their default tier (low/medium/high); for max,
+  // quality.effort is null and the highest-tier intent travels via wantsHighestEffort. `??` (not `||`)
+  // so an explicit empty `--effort` maps through normalizeReasoningEffort to null rather than being
+  // silently replaced by the preset default (spec §3.3.2).
+  const effort = normalizeReasoningEffort(options.effort ?? quality.effort);
   const wantsHighestEffort = quality.wantsHighestEffort === true;
   const prompt = readTaskPrompt(cwd, options, positionals);
   const stopGateChild = verifyStopGateChildTask();
@@ -1697,5 +1699,9 @@ if (isDirectEntrypoint()) {
 export const __testHooks = {
   enqueueBackgroundTask,
   handleCancel,
-  shouldReclaimBackgroundLease
+  shouldReclaimBackgroundLease,
+  // Exposed so tests can drive the real command->runAppServerTurn copy hops end to end (proving
+  // wantsHighestEffort survives executeTaskRun / executeReviewRun, not just the option builders).
+  executeTaskRun,
+  executeReviewRun
 };

@@ -973,6 +973,44 @@ export async function runAppServerReview(cwd, options = {}) {
   });
 }
 
+// model/list is paginated (opaque `nextCursor` -> `cursor`, per the codex MCP interface). Follow it
+// so a requested/default model on a later page is not misread as "unknown/no default".
+//
+// Returns the FULLY-enumerated `data` array only when EVERY page was well-formed AND pagination
+// terminated normally. Returns null — so the caller applies the same omit-for-all degradation as a
+// model/list transport failure — whenever the listing cannot be confirmed complete: any page with a
+// missing/non-array `data`, a `nextCursor` that is neither null/absent nor a non-empty string
+// (schema drift: false/0/""/object all forbidden by the `string | null` contract), a repeated cursor
+// (server loop), or the page cap reached while a nextCursor is still pending. Returning a PARTIAL
+// list as if it were authoritative would make resolveTurnEffort false-fail-loud ("unknown model" /
+// "no default") on models that merely live on an unfetched/dropped page (Codex).
+const MODEL_LIST_MAX_PAGES = 20;
+async function listAllModels(client) {
+  const all = [];
+  const seenCursors = new Set();
+  let cursor;
+  for (let page = 0; page < MODEL_LIST_MAX_PAGES; page++) {
+    const listing = await client.request("model/list", cursor ? { cursor } : {});
+    if (!Array.isArray(listing?.data)) {
+      return null; // malformed/missing data on any page -> unconfirmable, degrade
+    }
+    all.push(...listing.data);
+    const nextCursor = listing?.nextCursor;
+    if (nextCursor == null) {
+      return all; // null/absent cursor: normal termination, fully enumerated
+    }
+    if (typeof nextCursor !== "string" || nextCursor === "") {
+      return null; // cursor not a non-empty string (schema drift) -> unconfirmable, degrade
+    }
+    if (seenCursors.has(nextCursor)) {
+      return null; // server looped the same cursor -> unconfirmable, degrade
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  return null; // page cap hit with a nextCursor still pending -> incomplete, degrade
+}
+
 export async function runAppServerTurn(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1017,8 +1055,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     if (options.wantsHighestEffort || options.effort != null) {
       let models = null;
       try {
-        const listing = await client.request("model/list", {});
-        models = listing?.data ?? null;
+        models = await listAllModels(client);
       } catch {
         models = null; // omit-for-all + warning below
       }

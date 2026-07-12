@@ -9153,6 +9153,304 @@ def test_e2e_no_effort_and_no_sentinel_skips_model_list(tmp_path):
     assert _marker_value(marker, "TURN_EFFORT") is None
 
 
+# A paginating fake app-server: model/list page 1 returns a filler model + nextCursor; page 2
+# (requested with cursor) returns the isDefault sol model (tops at ultra) and no nextCursor. The
+# resolver must follow nextCursor to find the default model, else it treats it as "no default".
+_E2E_PAGINATED_APP_SERVER = (
+    "import readline from 'node:readline';\n"
+    "import fs from 'node:fs';\n"
+    "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+    "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+    "const rl = readline.createInterface({ input: process.stdin });\n"
+    "const send = (m) => console.log(JSON.stringify(m));\n"
+    "rl.on('line', (line) => {\n"
+    "  if (!line.trim()) return;\n"
+    "  const m = JSON.parse(line);\n"
+    "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+    "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+    "  if (m.method === 'model/list') {\n"
+    "    const cursor = m.params && m.params.cursor;\n"
+    "    mark('MODEL_LIST_CURSOR', cursor ?? null);\n"
+    "    if (!cursor) {\n"
+    "      // Page 1: a non-default filler model only, plus a nextCursor pointing at page 2.\n"
+    "      send({ id: m.id, result: { data: [\n"
+    "        { id: 'filler', isDefault: false, supportedReasoningEfforts: [{reasoningEffort:'low'}] }\n"
+    "      ], nextCursor: 'PAGE2' } });\n"
+    "    } else {\n"
+    "      // Page 2: the isDefault sol model (tops at ultra); no further pages.\n"
+    "      send({ id: m.id, result: { data: [\n"
+    "        { id: 'gpt-5.6-sol', isDefault: true, supportedReasoningEfforts: [\n"
+    "          {reasoningEffort:'low'},{reasoningEffort:'high'},{reasoningEffort:'ultra'} ] }\n"
+    "      ], nextCursor: null } });\n"
+    "    }\n"
+    "    return;\n"
+    "  }\n"
+    "  if (m.method === 'turn/start') {\n"
+    "    mark('TURN_EFFORT', m.params.effort ?? null);\n"
+    "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+    "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+    "    return;\n"
+    "  }\n"
+    "  send({ id: m.id, result: {} });\n"
+    "});\n"
+)
+
+
+def test_e2e_model_list_pagination_follows_next_cursor(tmp_path):
+    # CodeRabbit Major: model/list is paginated (limit/cursor/nextCursor per the codex MCP spec).
+    # The default (isDefault) model lives on page 2. The resolver must follow nextCursor to find it,
+    # otherwise --quality max sees "no default model" and cannot reach ultra. Reaching ultra proves
+    # the second page was fetched and merged.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
+        server_js=_E2E_PAGINATED_APP_SERVER,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+    # The second page must actually have been requested with the opaque cursor from page 1.
+    cursors = re.findall(r"^MODEL_LIST_CURSOR=(.+)$", marker, re.MULTILINE)
+    assert json.loads(cursors[-1]) == "PAGE2", f"resolver did not page with nextCursor; cursors={cursors}"
+
+
+# A fake app-server whose model/list NEVER terminates pagination: every page returns a filler model
+# and a fresh non-null nextCursor. Represents an unconfirmable/incomplete listing (huge list beyond
+# the page cap, or a looping cursor). The resolver must NOT treat the partial pages as authoritative.
+_E2E_ENDLESS_PAGINATION_APP_SERVER = (
+    "import readline from 'node:readline';\n"
+    "import fs from 'node:fs';\n"
+    "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+    "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+    "let page = 0;\n"
+    "const rl = readline.createInterface({ input: process.stdin });\n"
+    "const send = (m) => console.log(JSON.stringify(m));\n"
+    "rl.on('line', (line) => {\n"
+    "  if (!line.trim()) return;\n"
+    "  const m = JSON.parse(line);\n"
+    "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+    "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+    "  if (m.method === 'model/list') {\n"
+    "    page += 1;\n"
+    "    mark('MODEL_LIST_PAGE', page);\n"
+    "    // Always a fresh, distinct, non-null cursor -> pagination never terminates.\n"
+    "    send({ id: m.id, result: { data: [\n"
+    "      { id: 'filler-' + page, isDefault: false, supportedReasoningEfforts: [{reasoningEffort:'low'}] }\n"
+    "    ], nextCursor: 'C' + page } });\n"
+    "    return;\n"
+    "  }\n"
+    "  if (m.method === 'turn/start') {\n"
+    "    mark('TURN_EFFORT', m.params.effort ?? null);\n"
+    "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+    "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+    "    return;\n"
+    "  }\n"
+    "  send({ id: m.id, result: {} });\n"
+    "});\n"
+)
+
+
+def test_e2e_incomplete_pagination_degrades_to_omit_not_failure(tmp_path):
+    # Codex delta MEDIUM: if the page cap is exhausted while nextCursor is still present, the listing
+    # is INCOMPLETE and must NOT be treated as authoritative. --quality max on an unconfirmable list
+    # must degrade to omit-for-all (turn completes with effort omitted), NOT fail loud with
+    # "no default model". The turn completing at all (status 0) proves the degraded path was taken.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
+        server_js=_E2E_ENDLESS_PAGINATION_APP_SERVER,
+    )
+    assert result.returncode == 0, result.stderr
+    # Degraded: effort omitted (null), turn still ran — not a hard failure.
+    assert _marker_value(marker, "TURN_EFFORT") is None
+    # Bounded: the loop stopped paging (either a page cap or a repeated-cursor short-circuit); it did
+    # not fire an unbounded number of RPCs. A generous ceiling still proves boundedness.
+    pages = [int(x) for x in re.findall(r"^MODEL_LIST_PAGE=(\d+)$", marker, re.MULTILINE)]
+    assert pages, "model/list was never called"
+    assert max(pages) <= 20, f"pagination did not stop at the cap; reached page {max(pages)}"
+
+
+# A fake app-server: valid first page (with a real model + nextCursor), then a MALFORMED terminal
+# page that omits `data` entirely. A partial/corrupt listing must not be treated as authoritative.
+_E2E_MALFORMED_PAGE_APP_SERVER = (
+    "import readline from 'node:readline';\n"
+    "import fs from 'node:fs';\n"
+    "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+    "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+    "let page = 0;\n"
+    "const rl = readline.createInterface({ input: process.stdin });\n"
+    "const send = (m) => console.log(JSON.stringify(m));\n"
+    "rl.on('line', (line) => {\n"
+    "  if (!line.trim()) return;\n"
+    "  const m = JSON.parse(line);\n"
+    "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+    "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+    "  if (m.method === 'model/list') {\n"
+    "    page += 1;\n"
+    "    if (page === 1) {\n"
+    "      // Valid first page: the isDefault sol model (tops at ultra) + a nextCursor.\n"
+    "      send({ id: m.id, result: { data: [\n"
+    "        { id: 'gpt-5.6-sol', isDefault: true, supportedReasoningEfforts: [\n"
+    "          {reasoningEffort:'low'},{reasoningEffort:'ultra'} ] }\n"
+    "      ], nextCursor: 'P2' } });\n"
+    "    } else {\n"
+    "      // Malformed terminal page: NO data array, but ends pagination.\n"
+    "      send({ id: m.id, result: { nextCursor: null } });\n"
+    "    }\n"
+    "    return;\n"
+    "  }\n"
+    "  if (m.method === 'turn/start') {\n"
+    "    mark('TURN_EFFORT', m.params.effort ?? null);\n"
+    "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+    "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+    "    return;\n"
+    "  }\n"
+    "  send({ id: m.id, result: {} });\n"
+    "});\n"
+)
+
+
+def test_e2e_malformed_page_degrades_to_omit_not_authoritative(tmp_path):
+    # Codex confirm-2 MEDIUM: a valid first page followed by a malformed page (missing `data`) must
+    # NOT yield an authoritative partial list. Even though page 1 alone contains the isDefault sol
+    # model (which WOULD resolve to ultra), the malformed page 2 makes the listing unconfirmable, so
+    # the resolver must degrade to omit-for-all (effort null), not confidently route to ultra off a
+    # partial list. Reaching ultra here would prove the partial list was wrongly treated as complete.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
+        server_js=_E2E_MALFORMED_PAGE_APP_SERVER,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") is None, "malformed page must force omit, not an authoritative partial list"
+
+
+# A fake app-server: valid first page (sol + a non-null but MALFORMED nextCursor that is not a
+# string — schema drift the declared `string | null` contract forbids). The listing cannot be
+# confirmed complete, so it must NOT be treated as authoritative.
+_E2E_MALFORMED_CURSOR_APP_SERVER = (
+    "import readline from 'node:readline';\n"
+    "import fs from 'node:fs';\n"
+    "const MARKER = process.env.CODEX_E2E_MARKER;\n"
+    "const mark = (k, v) => fs.appendFileSync(MARKER, k + '=' + JSON.stringify(v) + '\\n');\n"
+    "const rl = readline.createInterface({ input: process.stdin });\n"
+    "const send = (m) => console.log(JSON.stringify(m));\n"
+    "rl.on('line', (line) => {\n"
+    "  if (!line.trim()) return;\n"
+    "  const m = JSON.parse(line);\n"
+    "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+    "  if (m.method === 'thread/start') { send({ id: m.id, result: { thread: { id: 'thread-1' } } }); return; }\n"
+    "  if (m.method === 'model/list') {\n"
+    "    // Valid data, but a falsy non-null cursor (false) that the string|null contract forbids.\n"
+    "    send({ id: m.id, result: { data: [\n"
+    "      { id: 'gpt-5.6-sol', isDefault: true, supportedReasoningEfforts: [\n"
+    "        {reasoningEffort:'low'},{reasoningEffort:'ultra'} ] }\n"
+    "    ], nextCursor: false } });\n"
+    "    return;\n"
+    "  }\n"
+    "  if (m.method === 'turn/start') {\n"
+    "    mark('TURN_EFFORT', m.params.effort ?? null);\n"
+    "    send({ id: m.id, result: { turn: { id: 't1', status: 'inProgress' } } });\n"
+    "    send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 't1', status: 'completed' } } });\n"
+    "    return;\n"
+    "  }\n"
+    "  send({ id: m.id, result: {} });\n"
+    "});\n"
+)
+
+
+def test_e2e_malformed_cursor_degrades_to_omit_not_authoritative(tmp_path):
+    # Codex confirm-3 MEDIUM: nextCursor is declared `string | null`. A falsy non-null value (false,
+    # 0, ...) is schema drift; the code must not treat it as clean termination and return the partial
+    # page as authoritative. Only null/absent terminates; only a non-empty string continues; anything
+    # else -> unconfirmable -> omit-for-all. Reaching ultra here would prove the partial page was
+    # wrongly treated as a complete listing off a malformed cursor.
+    result, marker = _run_turn_e2e(
+        tmp_path,
+        "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
+        server_js=_E2E_MALFORMED_CURSOR_APP_SERVER,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") is None, "malformed non-string cursor must force omit, not an authoritative partial list"
+
+
+# ===== HANDLER-LEVEL end-to-end: drive the real command copy hops, not runAppServerTurn directly =====
+# CodeRabbit Major: the tests above call runAppServerTurn directly, so they stay green even if
+# executeTaskRun / executeReviewRun (the companion copy hops) drop wantsHighestEffort. These drive
+# the actual companion functions against the fake app-server and assert turn/start receives ultra.
+
+def _run_command_e2e(tmp_path, import_and_call_js, need_git=False):
+    """Drive a real codex-companion command function end to end against the fake app-server.
+    Returns (result, marker_text). import_and_call_js awaits the companion call; the fake server
+    records TURN_EFFORT to the marker file."""
+    marker = tmp_path / "cmd-marker.txt"
+    marker.write_text("", encoding="utf8")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    bin_dir = write_fake_app_server(tmp_path, _E2E_APP_SERVER)
+    if need_git:
+        # executeReviewRun requires a git repo with a diff to collect review context from.
+        subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=workdir, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=workdir, check=True)
+        (workdir / "demo.js").write_text("const a = 1;\n", encoding="utf8")
+        subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=workdir, check=True)
+        (workdir / "demo.js").write_text("const a = 2;\n", encoding="utf8")
+    script = (
+        "import * as c from './plugins/codex/scripts/codex-companion.mjs';\n"
+        "const WORK = process.argv[1];\n"
+        + import_and_call_js
+        + "\nprocess.exit(0);\n"
+    )
+    env = app_server_env(tmp_path, bin_dir)
+    env["CODEX_E2E_MARKER"] = str(marker)
+    result = run_node_inline(script, env, args=[str(workdir)], timeout=40)
+    return result, marker.read_text(encoding="utf8")
+
+
+def test_e2e_task_command_hop_preserves_wants_highest_effort(tmp_path):
+    # Drives executeTaskRun (the task command's copy hop into runAppServerTurn) with a request that
+    # carries wantsHighestEffort:true (what resolveQuality('max') + handleTask produce). If the hop
+    # drops the flag, turn/start gets null and this goes RED.
+    call = (
+        "await c.__testHooks.executeTaskRun({"
+        "  cwd: WORK, model: null, effort: null, wantsHighestEffort: true,"
+        "  prompt: 'do the thing', write: false, resumeLast: false, persistThread: false, jobId: null"
+        "});"
+    )
+    result, marker = _run_command_e2e(tmp_path, call)
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+
+
+def test_e2e_task_command_hop_without_flag_omits_effort(tmp_path):
+    # Same path, wantsHighestEffort:false + effort:null -> omit (null). Anchors that the ultra above
+    # is caused by the flag, not by executeTaskRun hardcoding a tier.
+    call = (
+        "await c.__testHooks.executeTaskRun({"
+        "  cwd: WORK, model: null, effort: null, wantsHighestEffort: false,"
+        "  prompt: 'do the thing', write: false, resumeLast: false, persistThread: false, jobId: null"
+        "});"
+    )
+    result, marker = _run_command_e2e(tmp_path, call)
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") is None
+
+
+def test_e2e_adversarial_review_command_hop_preserves_wants_highest_effort(tmp_path):
+    # Drives executeReviewRun (adversarial) end to end: request.wantsHighestEffort must survive
+    # through buildAdversarialReviewTurnOptions into runAppServerTurn and reach turn/start as ultra.
+    call = (
+        "await c.__testHooks.executeReviewRun({"
+        "  cwd: WORK, reviewName: 'Adversarial Review', model: null,"
+        "  effort: null, wantsHighestEffort: true, focusText: 'focus'"
+        "});"
+    )
+    result, marker = _run_command_e2e(tmp_path, call, need_git=True)
+    assert result.returncode == 0, result.stderr
+    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+
+
 # ===== §9 hard gate: model/list must be a declared method in the app-server protocol contract =====
 
 def test_app_server_protocol_declares_model_list_method():
