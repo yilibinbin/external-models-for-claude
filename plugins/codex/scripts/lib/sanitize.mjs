@@ -1,8 +1,7 @@
 import { redactMachinePaths } from "./path-hygiene.mjs";
 
 // Secret shapes worth redacting from Codex-derived text before it is persisted
-// to job state and re-displayed (e.g. in /codex:status and /codex:result). Kept
-// in parity with the sibling claude-for-claude sanitize.mjs.
+// to job state and re-displayed (e.g. in /codex:status and /codex:result).
 const SECRET_PATTERNS = [
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
