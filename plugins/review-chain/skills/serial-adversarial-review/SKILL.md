@@ -37,8 +37,7 @@ The codified panel order is:
 4. **You synthesize** — consolidate the surviving findings into the final verdict.
 
 Enumerate reports every review-capable plugin (so a future plugin auto-joins the panel). The
-Gemini stage runs through Antigravity per the governing rule; `gemini-for-claude`, if present,
-is not part of the codified chain unless you are explicitly asked to add it.
+Gemini stage runs through Antigravity per the governing rule.
 
 ## Procedure
 

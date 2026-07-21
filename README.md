@@ -2,12 +2,11 @@
 
 Claude Code marketplace for external model workflows.
 
-This repository packages three Claude Code plugins:
+This repository packages these Claude Code plugins:
 
 | Plugin | Source | Purpose |
 |--------|--------|---------|
 | `codex` | OpenAI official plugin from `openai/codex-plugin-cc` | Use Codex from Claude Code for review and task delegation. |
-| `gemini-for-claude` | This repository | Use Gemini CLI from Claude Code for read-only review, planning, scorecards, role-pack review teams, jobs, and opt-in stop gates. |
 | `antigravity-for-claude` | This repository | Use Antigravity CLI from Claude Code for read-only review, planning, scorecards, jobs, and explicit Gemini or Claude provider selection. |
 
 ## Install
@@ -22,7 +21,6 @@ Install one or more plugins:
 
 ```bash
 claude plugin install codex@external-models-for-claude --scope user
-claude plugin install gemini-for-claude@external-models-for-claude --scope user
 claude plugin install antigravity-for-claude@external-models-for-claude --scope user
 ```
 
@@ -47,7 +45,6 @@ The `codex` plugin in this marketplace is a local Apache-2.0 extension of the Op
 - Claude Code with plugin support.
 - Node.js 18.18 or later.
 - For `codex`: Codex CLI authentication as documented by OpenAI's official plugin.
-- For `gemini-for-claude`: Gemini CLI installed and authenticated.
 - For `antigravity-for-claude`: Antigravity CLI (`agy`) installed and authenticated for the selected provider.
 
 ## Common Commands
@@ -57,10 +54,6 @@ The `codex` plugin in this marketplace is a local Apache-2.0 extension of the Op
 /codex:review
 /codex:rescue investigate the failing test
 
-/gemini-for-claude:setup
-/gemini-for-claude:review
-/gemini-for-claude:multi-review --roles correctness,security,tests
-
 /antigravity-for-claude:setup
 /antigravity-for-claude:review --model-provider gemini
 /antigravity-for-claude:review --model-provider claude
@@ -69,12 +62,12 @@ The `codex` plugin in this marketplace is a local Apache-2.0 extension of the Op
 ## Notes
 
 - The `codex` plugin is OpenAI's official Apache-2.0 plugin copied from `openai/codex-plugin-cc`; its license and notice files remain under `plugins/codex`.
-- The root MIT license covers the marketplace files and the `gemini-for-claude` and `antigravity-for-claude` plugins maintained here.
+- The root MIT license covers the marketplace files and the `antigravity-for-claude` plugin maintained here.
 - Hooks are opt-in where the individual plugin documents them. Codex Stop review gates fail closed by default; check each plugin's documentation for its own gate posture.
 
 ## 中文说明
 
-这是一个面向 Claude Code 的外部模型插件市场，集中提供 Codex、Gemini CLI、Antigravity CLI 三类互补工作流。
+这是一个面向 Claude Code 的外部模型插件市场，集中提供 Codex、Antigravity CLI 等互补工作流。
 
 安装市场：
 
@@ -86,11 +79,10 @@ claude plugin marketplace add yilibinbin/external-models-for-claude --scope user
 
 ```bash
 claude plugin install codex@external-models-for-claude --scope user
-claude plugin install gemini-for-claude@external-models-for-claude --scope user
 claude plugin install antigravity-for-claude@external-models-for-claude --scope user
 ```
 
-安装后重载 Claude Code 插件。`codex` 是 OpenAI 官方 Claude Code 插件的本地扩展版本；`gemini-for-claude` 和 `antigravity-for-claude` 是本仓库维护的 Claude 原生外部模型审阅、规划和协作流程。
+安装后重载 Claude Code 插件。`codex` 是 OpenAI 官方 Claude Code 插件的本地扩展版本；`antigravity-for-claude` 是本仓库维护的 Claude 原生外部模型审阅、规划和协作流程。
 
 ### Codex for Claude
 

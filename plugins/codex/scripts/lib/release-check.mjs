@@ -12,7 +12,7 @@ import {
 } from "./github-actions.mjs";
 import { hasMachinePath, MACHINE_PATH_PATTERN_SOURCE } from "./path-hygiene.mjs";
 
-export const MARKETPLACE_VERSION = "0.4.0";
+export const MARKETPLACE_VERSION = "0.5.0";
 export const CODEX_VERSION = "1.1.0-fh.4";
 export const MARKETPLACE_CODEX_AUTHOR = {
   name: "OpenAI",

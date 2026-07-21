@@ -111,7 +111,7 @@ def test_claude_marketplace_lists_antigravity_for_claude():
     assert plugins["antigravity-for-claude"]["source"] == "./plugins/antigravity-for-claude"
     assert plugins["antigravity-for-claude"]["version"] == ANTIGRAVITY_FOR_CLAUDE_VERSION
     assert plugins["antigravity-for-claude"]["category"] == "Productivity"
-    assert {"gemini-for-claude", "antigravity-for-claude"} <= set(plugins)
+    assert "antigravity-for-claude" in set(plugins)
     assert len(plugins) == len(marketplace["plugins"])
 
 

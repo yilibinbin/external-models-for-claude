@@ -5,7 +5,6 @@
 ## Included Plugins
 
 - `codex`: OpenAI's official Claude Code plugin for Codex review and delegation.
-- `gemini-for-claude`: Gemini CLI review, planning, scorecards, role packs, tracked jobs, GitHub Actions workflow rendering, and opt-in stop gates.
 - `antigravity-for-claude`: Antigravity CLI review, planning, scorecards, tracked jobs, GitHub Actions workflow rendering, and explicit Gemini/Claude provider selection.
 
 ## Installation
@@ -13,7 +12,6 @@
 ```bash
 claude plugin marketplace add yilibinbin/external-models-for-claude --scope user
 claude plugin install codex@external-models-for-claude --scope user
-claude plugin install gemini-for-claude@external-models-for-claude --scope user
 claude plugin install antigravity-for-claude@external-models-for-claude --scope user
 ```
 
@@ -39,7 +37,6 @@ Run the setup command for the plugin you install:
 
 ```bash
 /codex:setup
-/gemini-for-claude:setup
 /antigravity-for-claude:setup
 ```
 
@@ -59,7 +56,6 @@ Before release, this repository is expected to pass:
 ```bash
 claude plugin validate --strict .claude-plugin/marketplace.json
 claude plugin validate --strict plugins/codex
-claude plugin validate --strict plugins/gemini-for-claude
 claude plugin validate --strict plugins/antigravity-for-claude
 python3 -m pytest -q
 ```
@@ -70,4 +66,4 @@ Live provider smoke tests are opt-in because they consume provider quota and dep
 
 `plugins/codex` is OpenAI's official plugin, licensed under Apache-2.0. See `plugins/codex/LICENSE` and `plugins/codex/NOTICE`.
 
-The marketplace files plus `gemini-for-claude` and `antigravity-for-claude` are MIT licensed unless a file states otherwise.
+The marketplace files plus `antigravity-for-claude` are MIT licensed unless a file states otherwise.
