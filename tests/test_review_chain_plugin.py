@@ -397,6 +397,41 @@ def test_registry_accepts_plugins_object_and_root_variants():
     assert out[0]["root"] == "/x/codex"
 
 
+def test_registry_skips_disabled_plugins():
+    # A retired plugin stays in the version-pinned cache after it leaves the marketplace,
+    # and `claude plugin list --json` still reports it with enabled:false. Auto-join must
+    # not resurrect it: enumerating a disabled plugin would silently add a stale reviewer
+    # to the panel (duplicate quota, wrong verdict set) or fail once its CLI is gone.
+    source = (
+        "import { listInstalledPlugins } from './plugins/review-chain/scripts/lib/registry.mjs';"
+        "const runner = () => JSON.stringify(["
+        "  { id: 'codex@external-models-for-claude', installPath: '/x/codex', enabled: true },"
+        "  { id: 'retired@external-models-for-claude', installPath: '/x/retired', enabled: false }"
+        "]);"
+        "const out = listInstalledPlugins({ runner });"
+        "process.stdout.write(JSON.stringify(out.map(e => e.id)));"
+    )
+    result = run_module(source)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["codex@external-models-for-claude"]
+
+
+def test_registry_keeps_plugins_without_an_enabled_field():
+    # Only an explicit enabled:false disqualifies. A CLI shape that omits `enabled`
+    # must still auto-join, otherwise the whole panel silently empties.
+    source = (
+        "import { listInstalledPlugins } from './plugins/review-chain/scripts/lib/registry.mjs';"
+        "const runner = () => JSON.stringify(["
+        "  { id: 'codex@external-models-for-claude', installPath: '/x/codex' }"
+        "]);"
+        "const out = listInstalledPlugins({ runner });"
+        "process.stdout.write(JSON.stringify(out.map(e => e.id)));"
+    )
+    result = run_module(source)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["codex@external-models-for-claude"]
+
+
 def test_dispatch_env_unset_keys_off_canonical_name_not_raw_id():
     # F6: passing the accepted plugin-ID form must still unset the codex session env
     # (and keep --quality). Keying off raw input would silently skip the liveness fix.
