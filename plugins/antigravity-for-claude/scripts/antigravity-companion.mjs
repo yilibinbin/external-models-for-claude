@@ -17,7 +17,6 @@ import {
   selectedModel
 } from "./lib/antigravity-runtime.mjs";
 import { classifyAgyOutcome } from "./lib/agy-outcome.mjs";
-import { modelCatalogConfirmation } from "./lib/agy-capabilities.mjs";
 import {
   cancelJob,
   claimReservedJob,
@@ -1618,15 +1617,6 @@ function runDoctor(rawArgs) {
     modelProvider: args.modelProvider,
     model: args.model
   });
-  // Computed BEFORE the --json branch: `doctor --json` is the machine interface, so
-  // automation must be able to see an unconfirmed selection too. Reported, never gated
-  // (see modelCatalogConfirmation) — gating would fail every run under the current
-  // slug-vs-display-name split.
-  const catalogAll = [...(payload.models.gemini || []), ...(payload.models.claude || [])];
-  payload.modelCatalogConfirmation = modelCatalogConfirmation(
-    payload.selected.current.model,
-    catalogAll
-  );
   if (args.json) {
     writeJson(payload);
     return;
@@ -1649,16 +1639,6 @@ function runDoctor(rawArgs) {
   }
   if (!payload.models.available) {
     lines.push(`Models error: ${conciseDiagnostic(payload.models.error) || `models exited ${payload.models.status}`}`);
-  }
-  // Fail-loud: an unusable --model value otherwise reaches agy and surfaces only as an
-  // empty review.
-  const confirmation = payload.modelCatalogConfirmation;
-  if (confirmation.checked && !confirmation.confirmed) {
-    lines.push(
-      `Model not confirmed by the agy model catalog: "${payload.selected.current.model}" ` +
-      `is absent from the ${catalogAll.length} model(s) agy reported. If reviews return empty, ` +
-      `set ANTIGRAVITY_FOR_CLAUDE_GEMINI_MODEL / ANTIGRAVITY_FOR_CLAUDE_CLAUDE_MODEL to a model agy accepts.`
-    );
   }
   for (const [provider, selection] of Object.entries(payload.selected.providers)) {
     if (!selection.ok) {

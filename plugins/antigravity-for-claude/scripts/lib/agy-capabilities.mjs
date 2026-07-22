@@ -90,20 +90,6 @@ function validateOptionalEnvModelForProvider(model, provider) {
   }
 }
 
-// Does the value we will pass to `agy --model` appear in the catalog `agy models` reported?
-// Today it never does — the catalog emits slugs ("gemini-3.1-pro-high") while `--model`
-// takes display names — which is precisely how an unusable selection reached the CLI and
-// surfaced only as an empty review. Callers report this; they must NOT gate on it, because
-// gating would fail every run under the current slug/display-name split. An absent or empty
-// catalog proves nothing, so it is reported as unchecked rather than unconfirmed.
-export function modelCatalogConfirmation(model, catalogModels) {
-  const models = Array.isArray(catalogModels) ? catalogModels : [];
-  if (!model || models.length === 0) {
-    return { checked: false, confirmed: false };
-  }
-  return { checked: true, confirmed: models.includes(model) };
-}
-
 export function selectAgyModel({ provider = "gemini", explicitModel = "", env = {}, models = null } = {}) {
   const normalizedProvider = normalizeAgyProvider(provider);
   if (explicitModel) {
