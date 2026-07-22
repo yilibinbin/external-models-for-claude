@@ -18,6 +18,7 @@ never be reused for a second set of bytes.**
 
 import json
 import pathlib
+import re
 import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -251,6 +252,71 @@ def test_every_plugin_version_maps_to_exactly_one_byte_tree():
             + "\n".join(f"    {path}" for path in paths)
             for name, (version, paths) in sorted(violations.items())
         )
+    )
+
+
+def _local_tags():
+    tags = [t for t in _git("tag", "--list").splitlines() if t.strip()]
+    # No tags at all almost always means they were never fetched, and treating that
+    # as "nothing is tagged" would turn this guard into a rubber stamp.
+    assert tags, (
+        "no git tags are present, so release tags cannot be verified. Fetch them "
+        "(git fetch --tags) — an untagged clone must not pass this check silently."
+    )
+    return set(tags)
+
+
+def _release_ref_pattern(plugin_dir):
+    """The tag name a plugin pins in its CI template, or None if it pins nothing.
+
+    Only plugins that declare RELEASE_REF have their workflows fetch a tag, so only
+    they owe one. Parsed from the source rather than executed: this is a test, and
+    the declaration is a one-line template literal.
+    """
+    version_mjs = plugin_dir / "scripts" / "lib" / "version.mjs"
+    if not version_mjs.exists():
+        return None
+    match = re.search(r"RELEASE_REF\s*=\s*`([^`]*)`", version_mjs.read_text(encoding="utf8"))
+    if not match:
+        return None
+    return match.group(1)
+
+
+def test_published_versions_have_the_release_tags_their_workflows_fetch():
+    """A published version that pins a tag must have that tag, or CI cannot install it.
+
+    The generated GitHub Actions workflows run
+    ``git fetch --depth 1 origin "$..._RELEASE_REF"``. That ref went unpublished for
+    every antigravity release before 0.1.3, so those workflows could never resolve
+    it. Only versions already on the base ref are required to be tagged: a bump
+    still in review is not released yet, and tagging happens after the merge.
+    """
+    published = _published_ref()
+    tags = _local_tags()
+    missing = {}
+
+    marketplace_ref = f"{published}:.claude-plugin/marketplace.json"
+    published_marketplace = json.loads(_git("show", marketplace_ref))
+    marketplace_version = published_marketplace["metadata"]["version"]
+    if f"v{marketplace_version}" not in tags:
+        missing["marketplace"] = f"v{marketplace_version}"
+
+    published_entries = {item["name"]: item["version"] for item in published_marketplace["plugins"]}
+    for plugin_dir in _plugin_dirs():
+        pattern = _release_ref_pattern(plugin_dir)
+        if pattern is None:
+            continue
+        published_version = published_entries.get(plugin_dir.name)
+        if published_version is None:
+            continue
+        expected = pattern.replace("${PLUGIN_VERSION}", published_version)
+        if expected not in tags:
+            missing[plugin_dir.name] = expected
+
+    assert not missing, (
+        "these versions are published but carry no release tag, so the workflows that "
+        "fetch them cannot resolve the ref — tag the release commit and push it:\n"
+        + "\n".join(f"  {name}: expected tag {tag}" for name, tag in sorted(missing.items()))
     )
 
 
