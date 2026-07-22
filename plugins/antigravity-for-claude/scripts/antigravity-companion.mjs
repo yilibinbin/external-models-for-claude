@@ -17,6 +17,7 @@ import {
   selectedModel
 } from "./lib/antigravity-runtime.mjs";
 import { classifyAgyOutcome } from "./lib/agy-outcome.mjs";
+import { modelCatalogConfirmation } from "./lib/agy-capabilities.mjs";
 import {
   cancelJob,
   claimReservedJob,
@@ -1639,6 +1640,17 @@ function runDoctor(rawArgs) {
   }
   if (!payload.models.available) {
     lines.push(`Models error: ${conciseDiagnostic(payload.models.error) || `models exited ${payload.models.status}`}`);
+  }
+  // Fail-loud: an unusable --model value otherwise reaches agy and surfaces only as an
+  // empty review. Reported, never gated — see modelCatalogConfirmation.
+  const catalogAll = [...(payload.models.gemini || []), ...(payload.models.claude || [])];
+  const confirmation = modelCatalogConfirmation(payload.selected.current.model, catalogAll);
+  if (confirmation.checked && !confirmation.confirmed) {
+    lines.push(
+      `Model not confirmed by the agy model catalog: "${payload.selected.current.model}" ` +
+      `is absent from the ${catalogAll.length} model(s) agy reported. If reviews return empty, ` +
+      `set ANTIGRAVITY_FOR_CLAUDE_GEMINI_MODEL / ANTIGRAVITY_FOR_CLAUDE_CLAUDE_MODEL to a model agy accepts.`
+    );
   }
   for (const [provider, selection] of Object.entries(payload.selected.providers)) {
     if (!selection.ok) {

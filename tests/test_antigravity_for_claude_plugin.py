@@ -315,6 +315,46 @@ def test_agy_model_selection_still_prefers_a_catalog_confirmed_default():
     assert out["source"] == "catalog"
 
 
+def test_agy_model_catalog_confirmation_reports_unconfirmed_selection():
+    # The model handed to `agy --model` may not appear in the catalog `agy models` reports
+    # (today it never does: slugs vs display names). That must be VISIBLE, because an
+    # unusable selection otherwise reaches the CLI and surfaces only as an empty review.
+    # It must not become a hard gate: `ok` gating on it would fail every run today.
+    source = (
+        "const m = await import('./plugins/antigravity-for-claude/scripts/lib/agy-capabilities.mjs');"
+        "const out = {"
+        "  mismatch: m.modelCatalogConfirmation('Gemini 3.1 Pro (High)', ['gemini-3.1-pro-high']),"
+        "  confirmed: m.modelCatalogConfirmation('Gemini 3.1 Pro (High)', ['Gemini 3.1 Pro (High)']),"
+        "  noCatalog: m.modelCatalogConfirmation('Gemini 3.1 Pro (High)', [])"
+        "};"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", source],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["mismatch"] == {"checked": True, "confirmed": False}
+    assert out["confirmed"] == {"checked": True, "confirmed": True}
+    # An empty/unavailable catalog proves nothing either way, so it must not be reported
+    # as an unconfirmed selection.
+    assert out["noCatalog"] == {"checked": False, "confirmed": False}
+
+
+def test_antigravity_doctor_surfaces_an_unconfirmed_model_selection():
+    # Fail-loud: doctor must say so when the selected model is absent from the catalog.
+    companion = read_text(PLUGIN / "scripts" / "antigravity-companion.mjs")
+
+    assert "modelCatalogConfirmation" in companion
+    assert "not confirmed by the agy model catalog" in companion
+
+
 def test_antigravity_real_smoke_quick_default_timeout_matches_live_provider_latency():
     companion = read_text(PLUGIN / "scripts" / "antigravity-companion.mjs")
 
