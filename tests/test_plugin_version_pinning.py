@@ -148,14 +148,17 @@ def _published_ref():
     )
 
 
-def _published_commit_for_version(plugin_dir, version, published):
-    """Newest published commit whose manifest already carried ``version``."""
+def _published_commits_for_version(plugin_dir, version, published):
+    """EVERY published commit whose manifest carried ``version``.
+
+    All of them, not just the newest: a published history of v1/X -> v1/Y -> v1/X
+    ends with an empty diff against the newest anchor, yet whoever installed while
+    Y was current still holds different bytes under v1. Checking one snapshot would
+    not establish the invariant this test claims.
+    """
     manifest_rel = _manifest_rel(plugin_dir)
     commits = [c for c in _git("log", "--format=%H", published, "--", manifest_rel).splitlines() if c.strip()]
-    for commit in commits:
-        if _version_at(commit, manifest_rel) == version:
-            return commit
-    return None
+    return [c for c in commits if _version_at(c, manifest_rel) == version]
 
 
 def test_every_plugin_version_maps_to_exactly_one_byte_tree():
@@ -170,6 +173,13 @@ def test_every_plugin_version_maps_to_exactly_one_byte_tree():
     Only *published* history constrains us. A version that does not yet appear on
     the base ref is new, so a branch is free to bump once and then keep editing —
     that is one release unit and squash-merges into a single commit.
+
+    Known limitation, stated rather than papered over: two branches cut from the
+    same base can independently pick the same new version, and each sees it as
+    unpublished. Whichever merges second changes the bytes behind a key the first
+    already published. A local test cannot see the other branch; closing that race
+    needs a merge-time check (branch protection requiring the branch to be current,
+    or a merge queue), which this repository does not have today.
     """
     plugin_dirs = _plugin_dirs()
     assert plugin_dirs, "no plugins discovered — the guard would pass vacuously"
@@ -177,27 +187,41 @@ def test_every_plugin_version_maps_to_exactly_one_byte_tree():
     published = _published_ref()
     violations = {}
     for plugin_dir in plugin_dirs:
-        version = _version_of(plugin_dir)
         relative = str(plugin_dir.relative_to(ROOT))
-        anchor = _published_commit_for_version(plugin_dir, version, published)
-        if anchor is None:
+        manifest_rel = _manifest_rel(plugin_dir)
+
+        # Both states are checked, because they can disagree and only one gets
+        # pushed. A working-tree bump to v2 sitting on top of COMMITTED payload
+        # edits still tagged v1 would otherwise pass locally and then ship v1 with
+        # changed bytes, since `git push` carries the commits and not the edit.
+        states = {
+            "HEAD": (_version_at("HEAD", manifest_rel), ["diff", "--name-only", published, "HEAD"]),
+            "working tree": (_version_of(plugin_dir), ["diff", "--name-only", published]),
+        }
+        for label, (version, _) in states.items():
+            if version == ABSENT:
+                continue
             # This version was never published: nothing is cached under it anywhere.
-            continue
-        # `git diff <commit> -- <path>` compares the WORKING TREE to that commit, so
-        # committed and uncommitted edits are both covered; untracked files are not
-        # in the diff, hence the separate probe.
-        changed = [line for line in _git("diff", "--name-only", anchor, "--", relative).splitlines() if line.strip()]
-        changed += _uncommitted_payload_changes(plugin_dir)
-        if changed:
-            violations[plugin_dir.name] = (version, anchor, sorted(set(changed)))
+            anchors = _published_commits_for_version(plugin_dir, version, published)
+            changed = []
+            for anchor in anchors:
+                if label == "HEAD":
+                    diff = _git("diff", "--name-only", anchor, "HEAD", "--", relative)
+                else:
+                    diff = _git("diff", "--name-only", anchor, "--", relative)
+                changed += [f"{line} (vs published {anchor[:8]})" for line in diff.splitlines() if line.strip()]
+            if label == "working tree" and anchors:
+                changed += _uncommitted_payload_changes(plugin_dir)
+            if changed:
+                violations[f"{plugin_dir.name} [{label}]"] = (version, sorted(set(changed)))
 
     assert not violations, (
         "these bytes differ from what the same version already published — bump the "
         "version, or every existing install keeps the old bytes under this cache key:\n"
         + "\n".join(
-            f"  {name}: version {version} was published at {anchor[:8]}, but now differs:\n"
+            f"  {name}: version {version} was already published, but these differ:\n"
             + "\n".join(f"    {path}" for path in paths)
-            for name, (version, anchor, paths) in sorted(violations.items())
+            for name, (version, paths) in sorted(violations.items())
         )
     )
 
