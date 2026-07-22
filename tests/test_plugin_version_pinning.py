@@ -95,6 +95,21 @@ def _version_at(commit, manifest_rel):
         ) from error
 
 
+def _version_in_index(plugin_dir):
+    """Manifest version as the index has it — what the next commit would record."""
+    manifest_rel = _manifest_rel(plugin_dir)
+    listing = _git("ls-files", "--", manifest_rel)
+    if not listing:
+        return ABSENT
+    blob = _git("show", f":{manifest_rel}")
+    if not blob:
+        raise GitUnavailable(f"index entry for {manifest_rel} read back empty")
+    try:
+        return json.loads(blob)["version"]
+    except (json.JSONDecodeError, KeyError) as error:
+        raise GitUnavailable(f"index copy of {manifest_rel} is unreadable ({error})") from error
+
+
 def _uncommitted_payload_changes(plugin_dir):
     """Tracked-or-untracked working-tree changes under the plugin, manifest aside.
 
@@ -155,9 +170,17 @@ def _published_commits_for_version(plugin_dir, version, published):
     ends with an empty diff against the newest anchor, yet whoever installed while
     Y was current still holds different bytes under v1. Checking one snapshot would
     not establish the invariant this test claims.
+
+    Anchors are found by walking the whole plugin directory, not just the manifest.
+    A payload-only release changes the published tree without touching
+    ``plugin.json``, so a manifest-only walk would never make it an anchor and a
+    later rollback could match the *other* tree that shipped under the same version.
+    This happened here: ``772e961`` changed two shipped review-chain files while the
+    manifest stayed at ``0.1.0``.
     """
     manifest_rel = _manifest_rel(plugin_dir)
-    commits = [c for c in _git("log", "--format=%H", published, "--", manifest_rel).splitlines() if c.strip()]
+    relative = str(plugin_dir.relative_to(ROOT))
+    commits = [c for c in _git("log", "--format=%H", published, "--", relative).splitlines() if c.strip()]
     return [c for c in commits if _version_at(c, manifest_rel) == version]
 
 
@@ -190,15 +213,18 @@ def test_every_plugin_version_maps_to_exactly_one_byte_tree():
         relative = str(plugin_dir.relative_to(ROOT))
         manifest_rel = _manifest_rel(plugin_dir)
 
-        # Both states are checked, because they can disagree and only one gets
-        # pushed. A working-tree bump to v2 sitting on top of COMMITTED payload
-        # edits still tagged v1 would otherwise pass locally and then ship v1 with
-        # changed bytes, since `git push` carries the commits and not the edit.
+        # All THREE shippable states are checked, because they can disagree and each
+        # can be what actually ships. A working-tree bump to v2 sitting on committed
+        # payload edits still tagged v1 passes a HEAD-only check, then `git push`
+        # carries the commits without the edit. Staging payload under v1 while the
+        # v2 bump stays unstaged fools both HEAD and the working tree, yet
+        # `git commit` records the index. Each is judged on its own version.
         states = {
-            "HEAD": (_version_at("HEAD", manifest_rel), ["diff", "--name-only", published, "HEAD"]),
-            "working tree": (_version_of(plugin_dir), ["diff", "--name-only", published]),
+            "HEAD": _version_at("HEAD", manifest_rel),
+            "index": _version_in_index(plugin_dir),
+            "working tree": _version_of(plugin_dir),
         }
-        for label, (version, _) in states.items():
+        for label, version in states.items():
             if version == ABSENT:
                 continue
             # This version was never published: nothing is cached under it anywhere.
@@ -207,6 +233,8 @@ def test_every_plugin_version_maps_to_exactly_one_byte_tree():
             for anchor in anchors:
                 if label == "HEAD":
                     diff = _git("diff", "--name-only", anchor, "HEAD", "--", relative)
+                elif label == "index":
+                    diff = _git("diff", "--cached", "--name-only", anchor, "--", relative)
                 else:
                     diff = _git("diff", "--name-only", anchor, "--", relative)
                 changed += [f"{line} (vs published {anchor[:8]})" for line in diff.splitlines() if line.strip()]
