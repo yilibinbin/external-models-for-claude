@@ -111,7 +111,11 @@ def test_claude_marketplace_lists_antigravity_for_claude():
     assert plugins["antigravity-for-claude"]["source"] == "./plugins/antigravity-for-claude"
     assert plugins["antigravity-for-claude"]["version"] == ANTIGRAVITY_FOR_CLAUDE_VERSION
     assert plugins["antigravity-for-claude"]["category"] == "Productivity"
-    assert {"gemini-for-claude", "antigravity-for-claude"} <= set(plugins)
+    # Pin the exact marketplace membership. Presence of antigravity-for-claude is already
+    # covered above (the lookups would KeyError), so this instead guards the set itself:
+    # a retired plugin silently reappearing, or a shipped one silently vanishing, both fail
+    # here. Adding or removing a plugin is a deliberate act and must update this line.
+    assert set(plugins) == {"codex", "antigravity-for-claude", "review-chain"}
     assert len(plugins) == len(marketplace["plugins"])
 
 

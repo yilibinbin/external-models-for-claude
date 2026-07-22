@@ -8276,7 +8276,7 @@ def test_codex_captureTurn_rejects_on_transport_death(tmp_path):
     )
     bin_dir = write_fake_app_server(tmp_path, server_js)
     script = """
-        import { CodexAppServerClient } from '/tmp/codex-fix/plugins/codex/scripts/lib/app-server.mjs';
+        import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';
         const client = await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });
         client.request('turn/start', { threadId: 'thread-1' }).catch(() => {});
         const start = Date.now();
@@ -8321,7 +8321,7 @@ def test_codex_appserver_client_close_timeout_escalates(tmp_path):
     )
     bin_dir = write_fake_app_server(tmp_path, server_js)
     script = """
-        import { CodexAppServerClient } from '/tmp/codex-fix/plugins/codex/scripts/lib/app-server.mjs';
+        import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';
         const client = await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });
         const t0 = Date.now();
         await client.close();
@@ -8354,7 +8354,7 @@ def test_codex_appserver_initialize_timeout(tmp_path):
     )
     bin_dir = write_fake_app_server(tmp_path, server_js)
     script = """
-        import { CodexAppServerClient } from '/tmp/codex-fix/plugins/codex/scripts/lib/app-server.mjs';
+        import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';
         const t0 = Date.now();
         let outcome = 'connected';
         let message = null;
@@ -8390,7 +8390,7 @@ def test_codex_appserver_malformed_jsonl_rejects_pending(tmp_path):
     )
     bin_dir = write_fake_app_server(tmp_path, server_js)
     script = """
-        import { CodexAppServerClient } from '/tmp/codex-fix/plugins/codex/scripts/lib/app-server.mjs';
+        import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';
         const client = await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });
         const t0 = Date.now();
         let outcome = 'resolved', message = null;
@@ -8471,7 +8471,7 @@ def test_codex_broker_shutdown_is_bounded(tmp_path):
         import fs from 'node:fs';
         import os from 'node:os';
         import path from 'node:path';
-        import { sendBrokerShutdown } from '/tmp/codex-fix/plugins/codex/scripts/lib/broker-lifecycle.mjs';
+        import { sendBrokerShutdown } from './plugins/codex/scripts/lib/broker-lifecycle.mjs';
         const sockPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cxc-sd-')), 's.sock');
         const server = net.createServer(() => { /* accept, never reply */ });
         await new Promise((resolve) => server.listen(sockPath, resolve));
@@ -8498,7 +8498,7 @@ def test_codex_governor_reclaims_corrupt_lock(tmp_path, variant):
     script = """
         import fs from 'node:fs';
         import path from 'node:path';
-        import { acquireResourceLease } from '/tmp/codex-fix/plugins/codex/scripts/lib/resource-governor.mjs';
+        import { acquireResourceLease } from './plugins/codex/scripts/lib/resource-governor.mjs';
         const lockDir = process.env.CODEX_FOR_CLAUDE_RESOURCE_LOCK_DIR;
         fs.mkdirSync(lockDir, { recursive: true });
         const lockFile = path.join(lockDir, '.governor.lock');
@@ -8575,7 +8575,7 @@ def test_codex_cancel_status_result_commands_are_argv_safe():
 def _enable_stop_gate(repo_dir, plugin_data):
     run_node_inline(
         """
-        import { setConfig } from '/tmp/codex-fix/plugins/codex/scripts/lib/state.mjs';
+        import { setConfig } from './plugins/codex/scripts/lib/state.mjs';
         setConfig(process.argv[1], 'stopReviewGate', true);
         console.log('ok');
         """,
@@ -9044,8 +9044,7 @@ def test_resolver_modellist_failure_explicit_effort_omits_with_warning():
 # ===== END-TO-END: runAppServerTurn drives model/list -> resolveTurnEffort -> turn/start (spec v6 §6) =====
 # These exercise the REAL N1 wiring inside codex.mjs (not just the pure resolver): a fake app-server
 # answers model/list with the sol fixture (tops at ultra) and echoes back the effort turn/start receives.
-# Imports resolve against ROOT (cwd) so the repo-under-test's codex.mjs is exercised — NOT the stale
-# /tmp/codex-fix clone some older integration tests hardcode.
+# Imports resolve against ROOT (cwd) so the repo-under-test's codex.mjs is exercised.
 
 # Fake app-server that records what turn/start received into a marker FILE (the child's stderr is
 # captured by the app-server client, so a file is the reliable side channel). The model/list reply

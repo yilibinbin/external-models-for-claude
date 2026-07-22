@@ -35,7 +35,6 @@ jobs:
           git -C "$marketplace_dir" config core.sparseCheckout true
           {
             echo ".claude-plugin"
-            echo "plugins/gemini-for-claude"
             echo "plugins/antigravity-for-claude"
           } > "$marketplace_dir/.git/info/sparse-checkout"
           git -C "$marketplace_dir" fetch --depth 1 origin "$ANTIGRAVITY_FOR_CLAUDE_RELEASE_REF"

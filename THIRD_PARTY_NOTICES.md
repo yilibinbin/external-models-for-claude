@@ -15,4 +15,4 @@ The Codex global resource governor core at `plugins/codex/scripts/lib/resource-g
 
 ## Local Marketplace Code
 
-The `gemini-for-claude` and `antigravity-for-claude` plugins are maintained in this repository under the root MIT license unless a file states otherwise.
+The `antigravity-for-claude` plugin is maintained in this repository under the root MIT license unless a file states otherwise.

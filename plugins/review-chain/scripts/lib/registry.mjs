@@ -62,6 +62,11 @@ function normalizeInstallPath(entry) {
 // Read `claude plugin list --json` -> installed plugins under this marketplace. Accepts
 // both a top-level array and a `{plugins:[...]}` envelope, and normalizes the root field,
 // so the auto-join contract holds across the known CLI output shapes.
+//
+// Disabled plugins are excluded. A retired plugin survives in the version-pinned cache
+// after it leaves the marketplace and is still listed with `enabled:false`; auto-joining
+// it would put a stale reviewer back on the panel. Only an EXPLICIT false disqualifies —
+// a CLI shape that omits `enabled` must still join, or the panel silently empties.
 export function listInstalledPlugins(options = {}) {
   const runner = options.runner ?? defaultPluginListRunner;
   const raw = runner();
@@ -75,7 +80,7 @@ export function listInstalledPlugins(options = {}) {
   return entries
     .filter((entry) => {
       const id = typeof entry?.id === "string" ? entry.id : "";
-      return id.endsWith(`@${MARKETPLACE}`);
+      return id.endsWith(`@${MARKETPLACE}`) && entry?.enabled !== false;
     })
     .map((entry) => ({ ...entry, installPath: normalizeInstallPath(entry) }));
 }
