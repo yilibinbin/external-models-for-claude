@@ -120,8 +120,15 @@ export function selectAgyModel({ provider = "gemini", explicitModel = "", env = 
   }
   const fallback = normalizedProvider === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_GEMINI_MODEL;
   const catalogModels = normalizedProvider === "claude" ? models?.claude : models?.gemini;
+  // Use a catalog entry ONLY when it confirms the curated default verbatim. `agy models`
+  // reports slugs ("gemini-3.1-pro-high") while `agy --model` takes the display names this
+  // plugin curates ("Gemini 3.1 Pro (High)") and rejects those slugs outright, so the two
+  // never compare equal today. Substituting the catalog's first entry on that mismatch
+  // shipped an unusable --model value and every headless review died with
+  // `invalid model selection`. An unconfirmed default is still the better bet than an
+  // arbitrary catalog entry, so fall through to it.
   const catalogModel = Array.isArray(catalogModels)
-    ? (catalogModels.find((model) => model === fallback) || catalogModels[0])
+    ? (catalogModels.find((model) => model === fallback) || "")
     : "";
   return {
     modelProvider: normalizedProvider,

@@ -1,2 +1,2 @@
-export const PLUGIN_VERSION = "0.1.2";
+export const PLUGIN_VERSION = "0.1.3";
 export const RELEASE_REF = `antigravity-for-claude-v${PLUGIN_VERSION}`;

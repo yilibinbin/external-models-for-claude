@@ -267,6 +267,54 @@ def test_antigravity_capacity_blocked_message_omits_lock_root():
     assert "/tmp/private-lock-root" not in result.stdout
 
 
+def _select_agy_model_source(provider, catalog_js):
+    return (
+        "const m = await import('./plugins/antigravity-for-claude/scripts/lib/agy-capabilities.mjs');"
+        f"const out = m.selectAgyModel({{ provider: '{provider}', env: {{}}, models: {catalog_js} }});"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+
+
+def _run_select_agy_model(provider, catalog_js):
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", _select_agy_model_source(provider, catalog_js)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_agy_model_selection_never_substitutes_an_arbitrary_catalog_entry():
+    # `agy models` emits slugs ("gemini-3.1-pro-high"); `agy --model` accepts the display
+    # names the plugin curates ("Gemini 3.1 Pro (High)") and REJECTS those slugs outright:
+    #   agy --model gemini-3.6-flash-high
+    #     -> invalid model selection: not recognized as a known model
+    # So the curated default never compares equal to a catalog entry, and falling back to
+    # the catalog's FIRST entry silently ships an unusable --model value. Reproduced live:
+    # every headless review died with "invalid model selection (gemini-3.6-flash-high)".
+    # When the catalog cannot confirm the default, keep the default.
+    catalog = "{ gemini: ['gemini-3.6-flash-high', 'gemini-3.1-pro-high'], claude: [] }"
+    out = _run_select_agy_model("gemini", catalog)
+
+    assert out["model"] == "Gemini 3.1 Pro (High)"
+    assert out["source"] == "default"
+
+
+def test_agy_model_selection_still_prefers_a_catalog_confirmed_default():
+    # The catalog is not ignored: when it does list the curated default verbatim, that
+    # confirmation is still recorded, so a future agy that reports display names keeps
+    # the original behaviour.
+    catalog = "{ gemini: ['Gemini 3.1 Pro (High)', 'Gemini 3.5 Flash (Low)'], claude: [] }"
+    out = _run_select_agy_model("gemini", catalog)
+
+    assert out["model"] == "Gemini 3.1 Pro (High)"
+    assert out["source"] == "catalog"
+
+
 def test_antigravity_real_smoke_quick_default_timeout_matches_live_provider_latency():
     companion = read_text(PLUGIN / "scripts" / "antigravity-companion.mjs")
 
