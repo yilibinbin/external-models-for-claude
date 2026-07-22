@@ -12,8 +12,14 @@ import {
 } from "./github-actions.mjs";
 import { hasMachinePath, MACHINE_PATH_PATTERN_SOURCE } from "./path-hygiene.mjs";
 
-export const MARKETPLACE_VERSION = "0.5.0";
-export const CODEX_VERSION = "1.1.0-fh.4";
+// The marketplace's own metadata.version is deliberately NOT pinned here. Doing so made
+// every marketplace bump edit a file *inside* this plugin, which changed codex's shipped
+// bytes under an unchanged CODEX_VERSION — the exact stale-cache drift that
+// tests/test_plugin_version_pinning.py now guards. The check was circular anyway: it only
+// asserted that marketplace.json matched a constant whose sole purpose was to be compared
+// against marketplace.json. The marketplace version is asserted in tests/, which ships in
+// no plugin. Codex's own version coupling (manifest <-> marketplace entry) stays below.
+export const CODEX_VERSION = "1.1.0-fh.5";
 export const MARKETPLACE_CODEX_AUTHOR = {
   name: "OpenAI",
   url: "https://github.com/openai/codex-plugin-cc"
@@ -443,10 +449,6 @@ export function runReleaseCheck(start = null, options = {}) {
         (versionConfirmation.validatorAvailable || versionConfirmation.validatorUnavailable),
       versionConfirmation
     ),
-    check("marketplace-version", marketplace.metadata?.version === MARKETPLACE_VERSION, {
-      expected: MARKETPLACE_VERSION,
-      actual: marketplace.metadata?.version
-    }),
     check("manifest-version", manifest.version === CODEX_VERSION, {
       expected: CODEX_VERSION,
       actual: manifest.version

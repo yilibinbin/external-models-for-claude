@@ -74,7 +74,6 @@ def load_release_check_exports():
     script = """
         import * as mod from './plugins/codex/scripts/lib/release-check.mjs';
         const keys = [
-          'MARKETPLACE_VERSION',
           'CODEX_VERSION',
           'MARKETPLACE_CODEX_AUTHOR',
           'PLUGIN_CODEX_AUTHOR',
@@ -429,7 +428,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.4" in notices
+    assert "Local extended version: 1.1.0-fh.5" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 

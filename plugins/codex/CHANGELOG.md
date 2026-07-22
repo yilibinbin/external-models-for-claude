@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0-fh.5
+
+- Stop pinning the marketplace's `metadata.version` inside this plugin. The constant existed only to be compared against `marketplace.json`, so the check was circular, and its real effect was that **every** marketplace bump edited a file inside `plugins/codex` while `CODEX_VERSION` stayed put — shipping changed codex bytes under an unchanged version key, which a version-pinned install never picks up. Three merged PRs (#7, #8, #9) drifted this way. The marketplace version is now asserted only in `tests/`, which ships in no plugin, and `tests/test_plugin_version_pinning.py` guards the drift class repo-wide.
+
 ## 1.1.0-fh.4
 
 - Route `--quality max` to the current model's TRUE strongest reasoning tier (including `max`/`ultra`) instead of a hardcoded `high`, resolved per-model at session time from the app-server `model/list` capability table (`isDefault` model when `--model` is omitted).
