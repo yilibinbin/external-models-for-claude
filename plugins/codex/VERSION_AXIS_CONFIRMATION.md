@@ -35,3 +35,5 @@ validatorUnavailable: false
 Fallback decision: no fallback needed. Use marketplace tag/version `v0.2.0` / `0.2.0` and Codex local extension version `1.1.0-fh.4`.
 
 fh.4 re-validation (2026-07-12): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.4` manifests and both exited 0 ("Validation passed"). The version-axis assertions above are verified for fh.4, not inherited from the fh.3 run.
+
+fh.5 re-validation (2026-07-22): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.5` manifests and both exited 0 ("Validation passed"). The version-axis assertions above are verified for fh.5, not inherited from the fh.4 run.
