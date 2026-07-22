@@ -347,12 +347,73 @@ def test_agy_model_catalog_confirmation_reports_unconfirmed_selection():
     assert out["noCatalog"] == {"checked": False, "confirmed": False}
 
 
-def test_antigravity_doctor_surfaces_an_unconfirmed_model_selection():
-    # Fail-loud: doctor must say so when the selected model is absent from the catalog.
-    companion = read_text(PLUGIN / "scripts" / "antigravity-companion.mjs")
+def _write_fake_agy(tmp_path, catalog_lines):
+    fake = tmp_path / "agy"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "models" ]; then\n'
+        f"  printf '%s\\n' {' '.join(repr(m) for m in catalog_lines)}\n"
+        "  exit 0\n"
+        "fi\n"
+        "echo '--prompt --model --print-timeout --print --sandbox --add-dir --log-file models plugin'\n"
+        "exit 0\n",
+        encoding="utf8",
+    )
+    fake.chmod(0o755)
+    return fake
 
-    assert "modelCatalogConfirmation" in companion
-    assert "not confirmed by the agy model catalog" in companion
+
+def test_antigravity_doctor_json_reports_an_unconfirmed_model_selection(tmp_path):
+    # Fail-loud, and it must reach AUTOMATION too: `doctor --json` is the supported
+    # machine interface, so a JSON consumer must be able to see that the model heading for
+    # `agy --model` is absent from the catalog. A text-only warning would let scripts walk
+    # straight into the empty-review failure this diagnostic exists to expose.
+    fake = _write_fake_agy(tmp_path, ["gemini-3.1-pro-high", "gemini-3.5-flash-low"])
+    result = run_node(
+        ROOT,
+        "plugins/antigravity-for-claude/scripts/antigravity-companion.mjs",
+        ["doctor", "--json"],
+        env={"AGY_CLI_PATH": str(fake)},
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    # The curated default is a display name; this catalog only has slugs -> unconfirmed.
+    assert payload["selected"]["current"]["model"] == "Gemini 3.1 Pro (High)"
+    confirmation = payload["modelCatalogConfirmation"]
+    assert confirmation["checked"] is True
+    assert confirmation["confirmed"] is False
+
+
+def test_antigravity_doctor_json_confirms_a_catalog_listed_model(tmp_path):
+    # And it must not cry wolf when the catalog does list the selected model.
+    fake = _write_fake_agy(tmp_path, ["Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (Low)"])
+    result = run_node(
+        ROOT,
+        "plugins/antigravity-for-claude/scripts/antigravity-companion.mjs",
+        ["doctor", "--json"],
+        env={"AGY_CLI_PATH": str(fake)},
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["modelCatalogConfirmation"] == {"checked": True, "confirmed": True}
+
+
+def test_antigravity_doctor_text_surfaces_an_unconfirmed_model_selection(tmp_path):
+    fake = _write_fake_agy(tmp_path, ["gemini-3.1-pro-high"])
+    result = run_node(
+        ROOT,
+        "plugins/antigravity-for-claude/scripts/antigravity-companion.mjs",
+        ["doctor"],
+        env={"AGY_CLI_PATH": str(fake)},
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "not confirmed by the agy model catalog" in result.stdout
 
 
 def test_antigravity_real_smoke_quick_default_timeout_matches_live_provider_latency():

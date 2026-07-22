@@ -1618,6 +1618,15 @@ function runDoctor(rawArgs) {
     modelProvider: args.modelProvider,
     model: args.model
   });
+  // Computed BEFORE the --json branch: `doctor --json` is the machine interface, so
+  // automation must be able to see an unconfirmed selection too. Reported, never gated
+  // (see modelCatalogConfirmation) — gating would fail every run under the current
+  // slug-vs-display-name split.
+  const catalogAll = [...(payload.models.gemini || []), ...(payload.models.claude || [])];
+  payload.modelCatalogConfirmation = modelCatalogConfirmation(
+    payload.selected.current.model,
+    catalogAll
+  );
   if (args.json) {
     writeJson(payload);
     return;
@@ -1642,9 +1651,8 @@ function runDoctor(rawArgs) {
     lines.push(`Models error: ${conciseDiagnostic(payload.models.error) || `models exited ${payload.models.status}`}`);
   }
   // Fail-loud: an unusable --model value otherwise reaches agy and surfaces only as an
-  // empty review. Reported, never gated — see modelCatalogConfirmation.
-  const catalogAll = [...(payload.models.gemini || []), ...(payload.models.claude || [])];
-  const confirmation = modelCatalogConfirmation(payload.selected.current.model, catalogAll);
+  // empty review.
+  const confirmation = payload.modelCatalogConfirmation;
   if (confirmation.checked && !confirmation.confirmed) {
     lines.push(
       `Model not confirmed by the agy model catalog: "${payload.selected.current.model}" ` +
