@@ -3,6 +3,7 @@
 ## 0.1.3 - 2026-07-22
 
 - Stop selecting a model `agy` will refuse. `agy models` reports slugs (`gemini-3.1-pro-high`) while `agy --model` takes the display names this plugin curates (`Gemini 3.1 Pro (High)`) and rejects those slugs outright, so the curated default never matched a catalog entry and selection fell through to the catalog's *first* entry — `gemini-3.6-flash-high`, which `agy` then rejected with `invalid model selection`, failing every headless review with an empty result. Both providers were affected (gemini picked `gemini-3.6-flash-high`, claude picked `claude-sonnet-4-6`). A catalog entry is now used only when it confirms the curated default verbatim; otherwise the default stands.
+- If a future `agy` retires a curated default, set `ANTIGRAVITY_FOR_CLAUDE_GEMINI_MODEL` or `ANTIGRAVITY_FOR_CLAUDE_CLAUDE_MODEL` to a model it accepts; those overrides take priority over both the catalog and the default. The catalog cannot be used to pick a replacement automatically, because catalog membership does not indicate that `agy --model` will accept the value (it currently indicates the opposite).
 
 ## 0.1.2 - 2026-07-11
 
