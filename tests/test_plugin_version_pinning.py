@@ -144,28 +144,36 @@ def test_no_plugin_version_is_ever_reused_for_a_second_set_of_bytes():
     """
     reused = {}
     for plugin_dir in _plugin_dirs():
-        version = _version_of(plugin_dir)
         seen_versions = [v for _, v in _manifest_version_history(plugin_dir) if v is not None]
         # Collapse consecutive duplicates: one contiguous run is normal, two are reuse.
         runs = [v for i, v in enumerate(seen_versions) if i == 0 or seen_versions[i - 1] != v]
-        if runs.count(version) > 1:
-            reused[plugin_dir.name] = version
+        # Every version ever published is a cache key, not just the current one:
+        # 0.1.0 -> 0.1.1 -> 0.1.0 -> 0.1.2 already stranded two trees under 0.1.0
+        # even though 0.1.2 is what ships today.
+        offenders = sorted({v for v in runs if runs.count(v) > 1})
+        if offenders:
+            reused[plugin_dir.name] = offenders
 
     assert not reused, "a version string was reused after being replaced — pick a new version:\n" + "\n".join(
-        f"  {name}: {version} appears in more than one run of its manifest history"
-        for name, version in sorted(reused.items())
+        f"  {name}: {', '.join(versions)} each appear in more than one run of its manifest history"
+        for name, versions in sorted(reused.items())
     )
 
 
 def test_marketplace_entry_versions_match_each_plugin_manifest():
     """A bump must reach the marketplace entry too, or installs resolve the old key."""
     marketplace = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf8"))
-    entries = {item["name"]: item for item in marketplace["plugins"]}
 
     for plugin_dir in _plugin_dirs():
         name = plugin_dir.name
-        assert name in entries, f"{name} ships in plugins/ but has no marketplace entry"
-        assert entries[name]["version"] == _version_of(plugin_dir), (
-            f"{name}: marketplace entry says {entries[name]['version']} but its manifest says "
+        # Collect rather than index by name: a dict would keep only the last
+        # duplicate, so a stale second entry could hide behind a matching one.
+        matching = [item for item in marketplace["plugins"] if item["name"] == name]
+        assert len(matching) == 1, (
+            f"{name}: expected exactly one marketplace entry, found {len(matching)} "
+            f"(versions: {[item.get('version') for item in matching]})"
+        )
+        assert matching[0]["version"] == _version_of(plugin_dir), (
+            f"{name}: marketplace entry says {matching[0]['version']} but its manifest says "
             f"{_version_of(plugin_dir)}"
         )

@@ -20,11 +20,16 @@ Throwaway version-axis commands:
 - `claude plugin validate --strict "$tmp_repo/repo/plugins/codex"` with codex manifest `version = "1.1.0-fh.4"` exited 0.
 - `claude plugin validate --strict "$tmp_repo/repo/.claude-plugin/marketplace.json"` after setting codex entry `version = { "invalid": true }` exited 1 with `plugins.0.version: Invalid input: expected string, received object`.
 
-Accepted marketplace metadata version: `0.2.0`
+The three "Accepted ..." values immediately below record the version axis **as probed at the
+time of the original run**; they are historical evidence, not a statement of what ships today.
+The current shipping values are listed under "Current version axis" at the end of this file and
+are what `release-check` compares against.
 
-Accepted codex marketplace entry version: `1.1.0-fh.4`
+Accepted marketplace metadata version (original probe): `0.2.0`
 
-Accepted codex plugin manifest version: `1.1.0-fh.4`
+Accepted codex marketplace entry version (original probe): `1.1.0-fh.4`
+
+Accepted codex plugin manifest version (original probe): `1.1.0-fh.4`
 
 Negative invalid-entry-version probe result: rejected by strict validation with exit code 1.
 
@@ -32,8 +37,20 @@ marketplaceEntryVersionSupported: true
 
 validatorUnavailable: false
 
-Fallback decision: no fallback needed. Use marketplace tag/version `v0.2.0` / `0.2.0` and Codex local extension version `1.1.0-fh.4`.
+Fallback decision (original probe): no fallback needed. Use marketplace tag/version `v0.2.0` / `0.2.0` and Codex local extension version `1.1.0-fh.4`.
 
 fh.4 re-validation (2026-07-12): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.4` manifests and both exited 0 ("Validation passed"). The version-axis assertions above are verified for fh.4, not inherited from the fh.3 run.
 
 fh.5 re-validation (2026-07-22): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.5` manifests and both exited 0 ("Validation passed"). The version-axis assertions above are verified for fh.5, not inherited from the fh.4 run.
+
+## Current version axis
+
+These are the values that ship today, each verified by the fh.5 re-validation above.
+
+- Marketplace metadata version: `0.5.0`
+- Codex marketplace entry version: `1.1.0-fh.5`
+- Codex plugin manifest version: `1.1.0-fh.5`
+
+The marketplace metadata version is no longer pinned inside this plugin (see the `1.1.0-fh.5`
+changelog entry): pinning it here made every marketplace bump edit codex's shipped bytes under
+an unchanged `CODEX_VERSION`. It is asserted in `tests/`, which ships in no plugin.
