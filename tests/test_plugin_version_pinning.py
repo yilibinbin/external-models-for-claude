@@ -72,12 +72,20 @@ ABSENT = "<absent>"
 
 
 def _version_at(commit, manifest_rel):
-    # A missing path is a legitimate answer (the plugin did not exist yet, or was
-    # deleted), so this is the one place a git failure is allowed — and it is
-    # still distinguished from a malformed manifest below.
-    blob = _git("show", f"{commit}:{manifest_rel}", allow_failure=True)
-    if blob is None or not blob:
+    # "The plugin did not exist at this commit" is a real answer, but it must be
+    # established POSITIVELY -- by asking the tree what it contains -- and never
+    # inferred from a failed read. A corrupt object or a partial clone would
+    # otherwise make an existing released plugin look newly added, which exempts
+    # it from enforcement.
+    listing = _git("ls-tree", "--name-only", commit, "--", manifest_rel)
+    if not listing:
         return ABSENT
+    blob = _git("show", f"{commit}:{manifest_rel}")
+    if not blob:
+        raise GitUnavailable(
+            f"{commit[:8]}:{manifest_rel} is listed in the tree but read back empty; "
+            "the version-pinning guard cannot judge this history"
+        )
     try:
         return json.loads(blob)["version"]
     except (json.JSONDecodeError, KeyError) as error:
@@ -85,35 +93,6 @@ def _version_at(commit, manifest_rel):
             f"manifest at {commit[:8]}:{manifest_rel} is unreadable ({error}); "
             "the version-pinning guard cannot judge this history"
         ) from error
-
-
-def _released_ref():
-    """The ref representing already-released bytes.
-
-    Drift only matters once bytes are published, and a branch's own commits are a
-    single release unit: bumping in one commit and editing the payload in the next
-    is normal and squash-merges into one commit on main. So history is judged
-    against ``origin/main`` and the branch is judged as a whole against it. Falls
-    back to HEAD when there is no remote (fresh clone, detached CI checkout), which
-    degrades to judging local history only — never to skipping the check.
-    """
-    for ref in ("origin/main", "main"):
-        if _git("rev-parse", "--verify", "--quiet", ref, allow_failure=True):
-            return ref
-    return "HEAD"
-
-
-def _manifest_version_history(plugin_dir, ref="HEAD"):
-    """[(commit, version)] newest-first, for every commit touching the manifest.
-
-    Reading the version *value* at each commit is deliberate. ``git log -S`` was
-    tried first and is wrong here: it matches any change to how often a string
-    occurs, so a rollback (0.1.1 -> 0.1.2 -> 0.1.1) or a reformat of the version
-    line becomes the newest match and silently rebases the baseline onto it.
-    """
-    manifest_rel = _manifest_rel(plugin_dir)
-    commits = [c for c in _git("log", "--format=%H", ref, "--", manifest_rel).splitlines() if c.strip()]
-    return [(c, _version_at(c, manifest_rel)) for c in commits]
 
 
 def _uncommitted_payload_changes(plugin_dir):
@@ -153,67 +132,73 @@ def test_repository_history_is_deep_enough_to_judge_version_pinning():
     )
 
 
-def test_every_plugin_version_covers_its_shipped_bytes():
-    plugin_dirs = _plugin_dirs()
-    assert plugin_dirs, "no plugins discovered — the guard would pass vacuously"
+def _published_ref():
+    """The ref whose bytes are already installed on other machines.
 
-    released = _released_ref()
-    stale = {}
-    for plugin_dir in plugin_dirs:
-        version = _version_of(plugin_dir)
-        relative = str(plugin_dir.relative_to(ROOT))
-        released_version = _version_at(released, _manifest_rel(plugin_dir))
-
-        # Everything not yet on the released ref -- this branch's commits plus the
-        # working tree -- is one release unit. It only has to carry a version that
-        # differs from what is already published.
-        pending = _git("diff", "--name-only", released, "--", relative).splitlines()
-        pending += _uncommitted_payload_changes(plugin_dir)
-        if pending and released_version != ABSENT and version == released_version:
-            stale[plugin_dir.name] = (
-                version,
-                [f"(pending vs {released}) {p.strip()}" for p in sorted(set(pending)) if p.strip()],
-            )
-
-    assert not stale, (
-        "plugin bytes changed but the version did not — bump it, or installs keep the "
-        "stale bytes under the same cache key:\n"
-        + "\n".join(
-            f"  {name} (still {version}) changed:\n"
-            + "\n".join(f"    {line}" for line in changes)
-            for name, (version, changes) in sorted(stale.items())
-        )
+    This comparison has no meaning without it, so a missing base ref FAILS rather
+    than falling back to HEAD: `git diff HEAD` is empty for committed work, which
+    silently disables the whole guard on a detached checkout.
+    """
+    for ref in ("origin/main", "main"):
+        if _git("rev-parse", "--verify", "--quiet", ref, allow_failure=True):
+            return ref
+    raise GitUnavailable(
+        "no origin/main or main to compare against; the version-pinning guard needs a "
+        "published base ref (git fetch origin main) and refuses to pass vacuously"
     )
 
 
-def test_no_plugin_version_is_ever_reused_for_a_second_set_of_bytes():
-    """A version key must map to one set of bytes for all time.
+def _published_commit_for_version(plugin_dir, version, published):
+    """Newest published commit whose manifest already carried ``version``."""
+    manifest_rel = _manifest_rel(plugin_dir)
+    commits = [c for c in _git("log", "--format=%H", published, "--", manifest_rel).splitlines() if c.strip()]
+    for commit in commits:
+        if _version_at(commit, manifest_rel) == version:
+            return commit
+    return None
 
-    Rolling a version back (0.1.1 -> 0.1.2 -> 0.1.1) leaves the cache key 0.1.1
-    pointing at two different trees, and whoever installed the first 0.1.1 keeps
-    it forever. The newest run is checked above; this catches the reuse itself.
+
+def test_every_plugin_version_maps_to_exactly_one_byte_tree():
+    """One version key, one tree — for all time.
+
+    A published version is a cache key on every machine that installed it, so the
+    bytes it names can never change. That single invariant subsumes the whole
+    family of failures found here: shipping edits without a bump, rolling a version
+    back, deleting and re-adding a plugin at an old version, and doing any of those
+    in the working tree rather than in a commit.
+
+    Only *published* history constrains us. A version that does not yet appear on
+    the base ref is new, so a branch is free to bump once and then keep editing —
+    that is one release unit and squash-merges into a single commit.
     """
-    reused = {}
-    for plugin_dir in _plugin_dirs():
-        # ABSENT is kept in the sequence on purpose: a plugin that was deleted and
-        # later re-added at the same version is reuse of that cache key, and
-        # dropping the gap would weld the two runs into one and hide it. This repo
-        # has already removed two plugins, so the path is not theoretical.
-        seen_versions = [v for _, v in _manifest_version_history(plugin_dir)]
-        # Collapse consecutive duplicates: one contiguous run is normal, two are reuse.
-        runs = [v for i, v in enumerate(seen_versions) if i == 0 or seen_versions[i - 1] != v]
-        # Every version ever published is a cache key, not just the current one:
-        # 0.1.0 -> 0.1.1 -> 0.1.0 -> 0.1.2 already stranded two trees under 0.1.0
-        # even though 0.1.2 is what ships today.
-        # ABSENT recurring just means the plugin was removed more than once; only a
-        # real version string recurring strands a cache key.
-        offenders = sorted({v for v in runs if v != ABSENT and runs.count(v) > 1})
-        if offenders:
-            reused[plugin_dir.name] = offenders
+    plugin_dirs = _plugin_dirs()
+    assert plugin_dirs, "no plugins discovered — the guard would pass vacuously"
 
-    assert not reused, "a version string was reused after being replaced — pick a new version:\n" + "\n".join(
-        f"  {name}: {', '.join(versions)} each appear in more than one run of its manifest history"
-        for name, versions in sorted(reused.items())
+    published = _published_ref()
+    violations = {}
+    for plugin_dir in plugin_dirs:
+        version = _version_of(plugin_dir)
+        relative = str(plugin_dir.relative_to(ROOT))
+        anchor = _published_commit_for_version(plugin_dir, version, published)
+        if anchor is None:
+            # This version was never published: nothing is cached under it anywhere.
+            continue
+        # `git diff <commit> -- <path>` compares the WORKING TREE to that commit, so
+        # committed and uncommitted edits are both covered; untracked files are not
+        # in the diff, hence the separate probe.
+        changed = [line for line in _git("diff", "--name-only", anchor, "--", relative).splitlines() if line.strip()]
+        changed += _uncommitted_payload_changes(plugin_dir)
+        if changed:
+            violations[plugin_dir.name] = (version, anchor, sorted(set(changed)))
+
+    assert not violations, (
+        "these bytes differ from what the same version already published — bump the "
+        "version, or every existing install keeps the old bytes under this cache key:\n"
+        + "\n".join(
+            f"  {name}: version {version} was published at {anchor[:8]}, but now differs:\n"
+            + "\n".join(f"    {path}" for path in paths)
+            for name, (version, anchor, paths) in sorted(violations.items())
+        )
     )
 
 
