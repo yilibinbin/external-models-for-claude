@@ -41,7 +41,7 @@ Fallback decision (original probe): no fallback needed. Use marketplace tag/vers
 
 fh.4 re-validation (2026-07-12): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.4` manifests and both exited 0 ("Validation passed"). The version-axis assertions above are verified for fh.4, not inherited from the fh.3 run.
 
-fh.5 re-validation (2026-07-22): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.5` manifests and both exited 0 ("Validation passed"). The version-axis assertions above are verified for fh.5, not inherited from the fh.4 run.
+fh.5 re-validation (2026-07-22): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.5` manifests and both exited 0 ("Validation passed"). What this re-run verifies for fh.5 — rather than inheriting from fh.4 — is the axis itself: `marketplaceEntryVersionSupported: true` and `validatorUnavailable: false` still hold, and the values now shipping are the ones under "Current version axis" below. The `(original probe)` lines above remain historical and are not re-asserted here.
 
 ## Current version axis
 
