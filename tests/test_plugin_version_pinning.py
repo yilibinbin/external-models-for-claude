@@ -266,17 +266,31 @@ def _local_tags():
     return set(tags)
 
 
-def _release_ref_pattern(plugin_dir):
-    """The tag name a plugin pins in its CI template, or None if it pins nothing.
+def _published_release_ref_pattern(plugin_name, published):
+    """The tag pattern a plugin pinned *as published*, or None if it pinned nothing.
 
-    Only plugins that declare RELEASE_REF have their workflows fetch a tag, so only
-    they owe one. Parsed from the source rather than executed: this is a test, and
-    the declaration is a one-line template literal.
+    Read from the published snapshot, never the working tree. Both halves of this
+    check — which version is released, and which tag that release promised to
+    publish — must come from the same commit, or the check contradicts itself:
+
+      * a PR that REMOVES `RELEASE_REF` would silence the check for a release that
+        still needs its tag (fail-open — the very PR that should be caught turns the
+        guard off), and
+      * a PR that ADDS `RELEASE_REF` would demand a tag for an already-published
+        version that never promised one (false failure).
+
+    Both were reproduced before this was written.
+
+    Parsed rather than executed: it is a one-line template literal, and running
+    plugin code from an arbitrary historical commit inside the test suite is not
+    something to invite.
     """
-    version_mjs = plugin_dir / "scripts" / "lib" / "version.mjs"
-    if not version_mjs.exists():
+    path = f"plugins/{plugin_name}/scripts/lib/version.mjs"
+    # Absence is legitimate (most plugins pin no ref), so this read may fail.
+    source = _git("show", f"{published}:{path}", allow_failure=True)
+    if not source:
         return None
-    match = re.search(r"RELEASE_REF\s*=\s*`([^`]*)`", version_mjs.read_text(encoding="utf8"))
+    match = re.search(r"RELEASE_REF\s*=\s*`([^`]*)`", source)
     if not match:
         return None
     return match.group(1)
@@ -301,17 +315,17 @@ def test_published_versions_have_the_release_tags_their_workflows_fetch():
     if f"v{marketplace_version}" not in tags:
         missing["marketplace"] = f"v{marketplace_version}"
 
-    published_entries = {item["name"]: item["version"] for item in published_marketplace["plugins"]}
-    for plugin_dir in _plugin_dirs():
-        pattern = _release_ref_pattern(plugin_dir)
+    # Iterate the PUBLISHED entries, not the working tree: a release that this PR
+    # deletes still shipped, and its promised tag is still owed. Enumerating the
+    # working tree would let a deletion skip the check.
+    for entry in published_marketplace["plugins"]:
+        name = entry["name"]
+        pattern = _published_release_ref_pattern(name, published)
         if pattern is None:
             continue
-        published_version = published_entries.get(plugin_dir.name)
-        if published_version is None:
-            continue
-        expected = pattern.replace("${PLUGIN_VERSION}", published_version)
+        expected = pattern.replace("${PLUGIN_VERSION}", entry["version"])
         if expected not in tags:
-            missing[plugin_dir.name] = expected
+            missing[name] = expected
 
     assert not missing, (
         "these versions are published but carry no release tag, so the workflows that "
