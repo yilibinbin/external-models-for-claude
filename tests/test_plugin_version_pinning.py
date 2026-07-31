@@ -18,6 +18,7 @@ never be reused for a second set of bytes.**
 
 import json
 import pathlib
+import re
 import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -254,6 +255,141 @@ def test_every_plugin_version_maps_to_exactly_one_byte_tree():
     )
 
 
+def _local_tags():
+    tags = [t for t in _git("tag", "--list").splitlines() if t.strip()]
+    # No tags at all almost always means they were never fetched, and treating that
+    # as "nothing is tagged" would turn this guard into a rubber stamp.
+    assert tags, (
+        "no git tags are present, so release tags cannot be verified. Fetch them "
+        "(git fetch --tags) — an untagged clone must not pass this check silently."
+    )
+    return set(tags)
+
+
+def _published_release_ref_pattern(plugin_source, published):
+    """The tag pattern a plugin pinned *as published*, or None if it pinned nothing.
+
+    Read from the published snapshot, never the working tree. Both halves of this
+    check — which version is released, and which tag that release promised to
+    publish — must come from the same commit, or the check contradicts itself:
+
+      * a PR that REMOVES `RELEASE_REF` would silence the check for a release that
+        still needs its tag (fail-open — the very PR that should be caught turns the
+        guard off), and
+      * a PR that ADDS `RELEASE_REF` would demand a tag for an already-published
+        version that never promised one (false failure).
+
+    Both were reproduced before this was written.
+
+    Parsed rather than executed: it is a one-line template literal, and running
+    plugin code from an arbitrary historical commit inside the test suite is not
+    something to invite.
+
+    ``plugin_source`` is the marketplace entry's own ``source`` (e.g. ``./plugins/codex``)
+    rather than an assumed ``plugins/<name>`` layout: the marketplace decides where a
+    plugin lives, and guessing would silently skip one that moved.
+    """
+    path = f"{plugin_source.rstrip('/')}/scripts/lib/version.mjs".lstrip("./")
+    # "This plugin pins no ref" is a real answer, but — as with _version_at — it must
+    # be established POSITIVELY. Treating any `git show` failure as absence would let a
+    # corrupt object or a partial clone silently exempt a release from needing its tag,
+    # which is the fail-open direction.
+    listing = _git("ls-tree", "--name-only", published, "--", path)
+    if not listing:
+        return None
+    source = _git("show", f"{published}:{path}")
+    if not source:
+        raise GitUnavailable(
+            f"{published}:{path} is listed in the tree but read back empty; "
+            "the release-tag guard cannot judge this plugin"
+        )
+    match = re.search(r"RELEASE_REF\s*=\s*`([^`]*)`", source)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _published_default_release_ref(plugin_source, published):
+    """A release ref declared as a renderer DEFAULT rather than in version.mjs.
+
+    codex has no version.mjs: its workflow template carries `{{RELEASE_REF}}` and the
+    renderer substitutes `String(value ?? "v0.2.0")`. Keying discovery on version.mjs
+    alone therefore exempted codex entirely, so a missing tag there was invisible.
+
+    Only a literal default is read — a rendered workflow can override the ref at
+    render time, and this guard is about what ships unconfigured.
+    """
+    path = f"{plugin_source.rstrip('/')}/scripts/lib/github-actions.mjs".lstrip("./")
+    listing = _git("ls-tree", "--name-only", published, "--", path)
+    if not listing:
+        return None
+    source = _git("show", f"{published}:{path}")
+    if not source:
+        raise GitUnavailable(
+            f"{published}:{path} is listed in the tree but read back empty; "
+            "the release-tag guard cannot judge this plugin"
+        )
+    match = re.search(r"""\?\?\s*["'`]([^"'`]+)["'`]\s*\)\s*\.trim\(\)""", source)
+    return match.group(1) if match else None
+
+
+def test_published_versions_have_the_release_tags_their_workflows_fetch():
+    """A published version that pins a tag must have that tag, or CI cannot install it.
+
+    The generated GitHub Actions workflows run
+    ``git fetch --depth 1 origin "$..._RELEASE_REF"``. That ref went unpublished for
+    every antigravity release before 0.1.3, so those workflows could never resolve
+    it. Only versions already on the base ref are required to be tagged: a bump
+    still in review is not released yet, and tagging happens after the merge.
+
+    Two limits, stated rather than papered over:
+
+    * Only the CURRENTLY published version is required to have its tag. Earlier
+      antigravity releases (0.1.0-0.1.2) also declared a ref and were never tagged, so
+      workflows rendered by them still cannot fetch. Fixing that means tagging release
+      points after the fact, which manufactures a release history that did not exist;
+      the gap is left visible instead.
+    * A tag is matched by NAME against the local tag list. That does not prove the
+      remote has it, nor that it points at the released bytes. Proving either needs
+      network access, which does not belong in a unit suite — the merge-time story for
+      that is a release step, not a test.
+    """
+    published = _published_ref()
+    tags = _local_tags()
+    missing = {}
+
+    marketplace_ref = f"{published}:.claude-plugin/marketplace.json"
+    published_marketplace = json.loads(_git("show", marketplace_ref))
+    marketplace_version = published_marketplace["metadata"]["version"]
+    if f"v{marketplace_version}" not in tags:
+        missing["marketplace"] = f"v{marketplace_version}"
+
+    # Iterate the PUBLISHED entries, not the working tree: a release that this PR
+    # deletes still shipped, and its promised tag is still owed. Enumerating the
+    # working tree would let a deletion skip the check.
+    for entry in published_marketplace["plugins"]:
+        name = entry["name"]
+        # Resolve version.mjs from the entry's own `source`, not an assumed
+        # plugins/<name> layout — the marketplace is what decides where a plugin lives.
+        source = entry.get("source") or f"plugins/{name}"
+        pattern = _published_release_ref_pattern(source, published)
+        if pattern is not None:
+            expected = pattern.replace("${PLUGIN_VERSION}", entry["version"])
+        else:
+            # Second mechanism: a renderer default, with no version.mjs (codex).
+            expected = _published_default_release_ref(source, published)
+        if not expected:
+            continue
+        if expected not in tags:
+            missing[name] = expected
+
+    assert not missing, (
+        "these versions are published but carry no release tag, so the workflows that "
+        "fetch them cannot resolve the ref — tag the release commit and push it:\n"
+        + "\n".join(f"  {name}: expected tag {tag}" for name, tag in sorted(missing.items()))
+    )
+
+
 def test_marketplace_entry_versions_match_each_plugin_manifest():
     """A bump must reach the marketplace entry too, or installs resolve the old key."""
     marketplace = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf8"))
@@ -271,3 +407,28 @@ def test_marketplace_entry_versions_match_each_plugin_manifest():
             f"{name}: marketplace entry says {matching[0]['version']} but its manifest says "
             f"{_version_of(plugin_dir)}"
         )
+
+
+def test_release_ref_discovery_covers_every_declaration_mechanism():
+    """Two plugins declare a fetched ref two different ways; the guard must know both.
+
+    antigravity exports ``RELEASE_REF`` from ``scripts/lib/version.mjs``. codex has no
+    such file — its renderer defaults the ref in ``scripts/lib/github-actions.mjs``
+    (``String(value ?? "v0.2.0")``) and the workflow fetches
+    ``refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF``. Keying discovery on ``version.mjs``
+    alone silently exempted codex, so a missing ``v0.2.0`` would not have been caught.
+
+    This asserts the mechanisms themselves still exist, so that renaming or removing one
+    fails here rather than quietly shrinking what the tag check covers.
+    """
+    published = _published_ref()
+    mechanisms = {}
+    for entry in json.loads(_git("show", f"{published}:.claude-plugin/marketplace.json"))["plugins"]:
+        source = (entry.get("source") or f"plugins/{entry['name']}").rstrip("/").lstrip("./")
+        if _published_release_ref_pattern(source, published):
+            mechanisms[entry["name"]] = "version.mjs"
+        elif _published_default_release_ref(source, published):
+            mechanisms[entry["name"]] = "github-actions default"
+
+    assert mechanisms.get("antigravity-for-claude") == "version.mjs", mechanisms
+    assert mechanisms.get("codex") == "github-actions default", mechanisms
