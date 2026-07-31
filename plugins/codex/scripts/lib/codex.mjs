@@ -1120,11 +1120,18 @@ export async function runAppServerTurn(cwd, options = {}) {
       { onProgress: options.onProgress }
     );
 
+    // lastAgentMessage is overwritten by EVERY main-thread agent message, while
+    // final_answer completion is tracked separately. On a failed or interrupted
+    // turn the last message is therefore intermediate commentary, not the
+    // deliverable -- so it does not get the deliverable's byte-identical
+    // exemption, and must not be persisted or rendered as the answer unredacted.
+    const turnStatus = buildResultStatus(turnState);
     return {
-      status: buildResultStatus(turnState),
+      status: turnStatus,
       threadId,
       turnId: turnState.turnId,
-      finalMessage: turnState.lastAgentMessage,
+      finalMessage:
+        turnStatus === 0 ? turnState.lastAgentMessage : sanitizeModelText(turnState.lastAgentMessage),
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,

@@ -48,7 +48,13 @@ const SENSITIVE_KEY_FRAGMENTS = [
 // value, so the real assignment nested inside is never examined and the
 // credential survives. Scanning separators examines every `:`/`=` on its own
 // terms, so a non-sensitive assignment cannot swallow a sensitive one.
-const SEPARATOR_SCAN = /\s*[:=]\s*/g;
+// No leading `\s*`. A greedy whitespace prefix retries at every position inside
+// a whitespace run, which measured 55/834/3369 ms for 10k/40k/80k spaces -- the
+// THIRD distinct quadratic found in this file, and this one can wedge the
+// fail-closed stop gate, which sanitizes before it bounds. Leading whitespace is
+// already skipped walking backwards in readKeyBefore, so dropping it here costs
+// nothing.
+const SEPARATOR_SCAN = /[:=]\s*/g;
 // Sticky, so the value is read at an index without slicing the remainder. The
 // quoted class consumes backslash escapes so an embedded escaped quote cannot
 // end the value early and leak its suffix; the bare class admits `]` so an
@@ -65,7 +71,6 @@ const KEY_CHAR = /[\w.-]/;
 const LINE_VALUED_KEYS = ["authorization", "cookie", "setcookie"];
 // PEM bodies are newline-delimited, so the line rule above would keep all but
 // the first line. Consume through the matching end marker instead.
-const PEM_BEGIN = /^-----BEGIN [A-Z ]*-----/;
 const PEM_END = /-----END [A-Z ]*-----/;
 
 const REDACTED = "[secret]";
@@ -149,10 +154,27 @@ function readBalancedValue(text, index) {
   if (!closer) {
     return null;
   }
+  const opener = text[index];
   let depth = 0;
+  let quote = "";
   for (let cursor = index; cursor < text.length; cursor += 1) {
     const char = text[cursor];
-    if (char === text[index]) {
+    // Braces inside a quoted string are data, not structure. Counting them
+    // ended the value early: `credentials={"v":"TOP}SECRET"}` stopped at the
+    // brace inside the string and left `SECRET"}` behind.
+    if (quote) {
+      if (char === "\\") {
+        cursor += 1;
+      } else if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (QUOTE_CHARS.has(char)) {
+      quote = char;
+      continue;
+    }
+    if (char === opener) {
       depth += 1;
     } else if (char === closer) {
       depth -= 1;
@@ -186,8 +208,10 @@ function readValueAt(text, index, key) {
     return balanced;
   }
 
-  const rest = text.slice(index, index + 32);
-  if (PEM_BEGIN.test(rest)) {
+  // Tested against the text directly rather than a fixed-width slice: a 32-char
+  // window is shorter than `-----BEGIN ENCRYPTED PRIVATE KEY-----` and than the
+  // OPENSSH header, so those fell through to the bare rule and leaked the body.
+  if (text.startsWith("-----BEGIN", index)) {
     const endMarker = PEM_END.exec(text.slice(index));
     if (endMarker) {
       return spanTo(text, index, index + endMarker.index + endMarker[0].length);

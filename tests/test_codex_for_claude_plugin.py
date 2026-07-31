@@ -8866,6 +8866,84 @@ def test_codex_sanitizer_fails_closed_on_malformed_and_compound_values():
     assert "SECRET9" not in payload["wrappedCookie"]
 
 
+def test_codex_sanitizer_is_linear_in_whitespace_runs():
+    # The THIRD distinct quadratic found in this file, each through a different
+    # door: a greedy prefix in the key pattern, a growing prefix slice per
+    # separator, and now a greedy `\\s*` at the head of the separator pattern,
+    # which retries at every position inside a whitespace run.
+    #
+    # This one is the worst placed: the fail-closed stop gate sanitizes BEFORE it
+    # applies its length bound, so degraded child output can wedge session
+    # termination rather than merely being slow.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const timeFor = (n) => {
+          const text = 'a' + ' '.repeat(n) + 'b';
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(10000), large: timeFor(160000) }));
+        """
+    )
+    # 16x the run length. The quadratic version measured 55 ms -> 3369 ms for 8x.
+    assert payload["large"] < 200, f"160k whitespace took {payload['large']}ms"
+
+
+def test_codex_sanitizer_takes_structured_and_long_header_values_whole():
+    # Both shapes produced redacted-LOOKING output that still carried the value.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          // A brace inside a quoted string is data, not structure; counting it
+          // ended the value early and left the tail behind.
+          braceInString: sanitizeModelText('credentials={"v":"TOP}SECRET"}'),
+          // `-----BEGIN ENCRYPTED PRIVATE KEY-----` is longer than the 32-char
+          // window the PEM check used to inspect, so it fell through entirely.
+          encryptedPem: sanitizeModelText(
+            'PRIVATE_KEY=-----BEGIN ENCRYPTED PRIVATE KEY-----\\nBODYLINE\\n-----END ENCRYPTED PRIVATE KEY-----'
+          ),
+        }));
+        """
+    )
+    assert "SECRET" not in payload["braceInString"]
+    assert "BODYLINE" not in payload["encryptedPem"]
+
+
+def test_codex_stderr_multiline_secret_is_redacted_before_truncation():
+    # A line boundary is not a safe boundary for a multiline secret: cutting
+    # inside a PEM block drops the key name AND the BEGIN header while keeping
+    # body lines, which a key-based redactor cannot recognize afterwards.
+    # Redaction therefore runs while that context still exists -- on overflow
+    # only, so the common path pays nothing.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        const pem = 'PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\\nBODYLINE_ONE\\nBODYLINE_TWO\\n-----END RSA PRIVATE KEY-----\\n';
+        const fillerLines = Math.floor((MAX_CAPTURED_STDERR_BYTES - pem.length + 40) / 7);
+        let state = appendBoundedStderr('', 'filler\\n'.repeat(fillerLines) + pem);
+        state = appendBoundedStderr(state, 'more\\n'.repeat(20));
+        console.log(JSON.stringify({ text: state.text }));
+        """
+    )
+    assert "BODYLINE" not in payload["text"]
+
+
+def test_codex_failed_turn_does_not_promote_intermediate_chatter_unredacted():
+    # lastAgentMessage is overwritten by EVERY main-thread agent message while
+    # final_answer completion is tracked separately, and the result returned it
+    # unconditionally. On a failed or interrupted turn that value is intermediate
+    # commentary, not the deliverable, so it loses the byte-identical exemption.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert re.search(
+        r"turnStatus === 0\s*\?\s*turnState\.lastAgentMessage\s*:\s*sanitizeModelText\(turnState\.lastAgentMessage\)",
+        source,
+    ), "a failed turn must not return the last agent message unredacted"
+
+
 def test_codex_reasoning_summary_is_redacted_where_it_is_stored():
     # The reasoning array is rendered verbatim by both review renderers and
     # persisted into the payload and the job sidecar. Sanitizing only the

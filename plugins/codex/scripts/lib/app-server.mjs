@@ -15,6 +15,7 @@ import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
+import { sanitizeModelText } from "./sanitize.mjs";
 
 // Cap the captured stderr as it ARRIVES, not when it is read. The process
 // hosting a SpawnedCodexAppServerClient is long-lived -- in the default broker
@@ -26,20 +27,21 @@ import { terminateProcessTree } from "./process.mjs";
 // what gets dropped.
 export const MAX_CAPTURED_STDERR_BYTES = 64 * 1024;
 
-// Truncation happens at a LINE boundary, never mid-line. Cutting raw bytes can
-// land between a credential's key and its value, and the redactor keys off the
-// key name -- so a headless `hunter2` survives a pass that would have caught
-// `PASSWORD=hunter2`. Truncating first is strictly worse than not truncating.
+// Three rules, each earned from a measured failure:
+//
+// 1. Truncate at a LINE boundary, never mid-line. Cutting raw bytes can land
+//    between a key and its value, and the redactor keys off the key name -- so a
+//    headless `hunter2` survives a pass that would have caught `PASSWORD=hunter2`.
+// 2. Carry `discarding` across chunks. Dropping an overlong line once is not
+//    enough: stderr arrives in arbitrary chunks, so the REMAINDER of that line
+//    lands in the next event and is otherwise captured as a fresh, headless
+//    line. Measured: `PASSWORD=` + `HUNTER2` + `_SUFFIX\n` retained `_SUFFIX`.
+// 3. Redact before cutting, because a line boundary is NOT safe for a multiline
+//    secret (see below).
 //
 // If the retained tail contains no newline at all, the single line is longer
 // than the whole cap and there is no safe place to cut it, so it is dropped
 // entirely rather than kept headless.
-// Carries `discarding` across chunks. Dropping an overlong line once is not
-// enough: stderr arrives in arbitrary chunks, so the REMAINDER of that same
-// physical line shows up in the next event and, without state, is captured as
-// though it were a fresh line -- headless, with the key that would have
-// identified it already thrown away. Measured: `PASSWORD=` + `HUNTER2` +
-// `_SUFFIX\n` across three chunks retained `_SUFFIX`.
 export function appendBoundedStderr(state, chunk) {
   const previous = typeof state === "string" ? { text: state, discarding: false } : state;
   let incoming = String(chunk ?? "");
@@ -57,7 +59,15 @@ export function appendBoundedStderr(state, chunk) {
     return { text: combined, discarding: false };
   }
 
-  const tail = combined.slice(combined.length - MAX_CAPTURED_STDERR_BYTES);
+  // Redact BEFORE cutting. A line boundary is not a safe boundary for a
+  // multiline secret: cutting inside a PEM block drops the key name and the
+  // BEGIN header while keeping body lines, which a key-based redactor cannot
+  // recognize afterwards. Running it here, while the header is still present,
+  // is the only point where the context needed to identify the value exists.
+  //
+  // Only on overflow, so the common path pays nothing.
+  const redacted = sanitizeModelText(combined);
+  const tail = redacted.slice(Math.max(0, redacted.length - MAX_CAPTURED_STDERR_BYTES));
   const firstNewline = tail.indexOf("\n");
   return firstNewline === -1
     ? { text: "", discarding: true }
