@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { BROKER_APP_SERVER_EXIT_METHOD, BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -250,6 +250,17 @@ async function main() {
   // endpoint/pid/state and exit non-zero so the next ensureBrokerSession spawns
   // a fresh broker.
   appClient.exitPromise.then(async () => {
+    // Hand the cause to every connected client BEFORE tearing their sockets down.
+    // A streaming turn (turn/start, review/start) has already had its request
+    // resolved, so there is no pending call left to reject — without this the outer
+    // client only sees the socket close and reports the generic
+    // "connection closed", losing the crash reason in the case that matters most.
+    const exitMessage = appClient.exitError?.message;
+    if (exitMessage) {
+      for (const socket of sockets) {
+        send(socket, { method: BROKER_APP_SERVER_EXIT_METHOD, params: { message: exitMessage } });
+      }
+    }
     // Hard deadline: server.close() only settles once every client socket has
     // closed, so a hung companion that ignores socket.end() would keep
     // shutdown() pending forever and process.exit(1) would never run — leaving

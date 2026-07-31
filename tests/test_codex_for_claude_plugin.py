@@ -4,6 +4,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import time
 import tempfile
 
 import pytest
@@ -428,7 +429,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.6" in notices
+    assert "Local extended version: 1.1.0-fh.7" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -9541,3 +9542,356 @@ def test_codex_run_command_lets_callers_opt_out_of_the_shell():
     assert "shell: options.shell ??" in process_lib
     # The Windows default must survive for the .cmd-shim spawns.
     assert 'process.platform === "win32" ? (process.env.SHELL || true) : false' in process_lib
+
+
+# ===== app-server crash diagnostics: surface the cause, redacted and bounded =====
+
+
+def test_codex_app_server_crash_error_carries_child_stderr():
+    """A codex app-server that dies mid-turn must not discard why.
+
+    The stderr buffer was written and never read: a crash surfaced only as
+    `exited unexpectedly (exit 1).`, which is what a broker-backed `--quality max`
+    review reports when the child dies. Adapted from upstream's fix — ours caps and
+    sanitizes, because raw failure output carries local paths.
+    """
+    app_server = read_text(PLUGIN / "scripts" / "lib" / "app-server.mjs")
+
+    assert "exited unexpectedly" in app_server
+    # The exit path must consult the buffer it has been filling.
+    exit_handler = app_server[app_server.index('this.proc.on("exit"') :][:900]
+    assert "stderr" in exit_handler, "exit handler still ignores the captured stderr"
+    # Redaction is not optional: this string reaches job records and the user.
+    assert "sanitizeModelText" in app_server
+
+
+
+def test_codex_app_server_crash_surfaces_redacted_child_stderr(tmp_path):
+    """End-to-end: a child that dies nonzero must report WHY, redacted and capped.
+
+    The source-contract test above pins the wiring; this one proves the behaviour —
+    that the panic line reaches the caller, that routine PATH noise does not, and that
+    a home-directory path in the child's own output is redacted before it lands in an
+    error a job record will store.
+    """
+    server_js = (
+        "process.stderr.write('WARNING: proceeding, even though we could not update PATH: noise\\n');\n"
+        f"process.stderr.write(\"thread 'main' panicked at {os.path.expanduser('~')}/secret/place.rs:42\\n\");\n"
+        "process.exit(3);\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    script = (
+        "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+        "let out = { outcome: 'connected' };\n"
+        "try {\n"
+        "  await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });\n"
+        "} catch (error) {\n"
+        "  out = { outcome: 'rejected', message: String(error.message || error) };\n"
+        "}\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+        "process.exit(0);\n"
+    )
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=45)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "rejected", payload
+    message = payload["message"]
+    assert "exited unexpectedly" in message
+    # The cause survives...
+    assert "panicked" in message, message
+    # ...the routine noise line does not...
+    assert "could not update PATH" not in message, message
+    # ...and the child's own local path is redacted before we store or show it.
+    assert os.path.expanduser("~") not in message, message
+
+
+
+def test_codex_app_server_crash_diagnostic_sanitizes_before_truncating(tmp_path):
+    """Redaction must run on the WHOLE buffer, not on the tail.
+
+    Slicing first can cut a secret in half: the tail then begins mid-keyword
+    (`oken=...`), the `\\btoken` pattern no longer matches, and the value survives
+    into a job record. Reproduced against the 2 KB cap before this was fixed.
+    """
+    secret = "token=SUPERSECRETVALUE1234567890"
+    # Position the payload so the 2 KB cutoff lands one byte into the keyword.
+    server_js = (
+        "const secret = " + json.dumps(secret) + ";\n"
+        "const prefix = 'a'.repeat(99) + '\\n';\n"
+        "const suffix = 'b'.repeat(2 * 1024 - 31);\n"
+        "process.stderr.write(prefix + secret + suffix);\n"
+        "process.exit(4);\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    script = (
+        "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+        "let out = { outcome: 'connected' };\n"
+        "try {\n"
+        "  await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });\n"
+        "} catch (error) {\n"
+        "  out = { outcome: 'rejected', message: String(error.message || error) };\n"
+        "}\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+        "process.exit(0);\n"
+    )
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=45)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "rejected", payload
+    assert "SUPERSECRETVALUE" not in payload["message"], payload["message"][:400]
+
+
+
+def test_codex_broker_propagates_backing_crash_cause_to_clients(tmp_path):
+    """The broker is the DEFAULT transport, and a review is a streaming turn.
+
+    When the backing app-server dies mid-turn there is no in-flight request to
+    reject, so the broker used to just close its sockets and the outer client fell
+    back to the generic "connection closed" message — losing the cause in exactly
+    the case the diagnostic exists for. `captureTurn` rethrows `client.exitError`,
+    so the broker must hand that error across the socket before tearing down.
+    """
+    marker = "BACKING_CRASH_MARKER_7719"
+    server_js = (
+        "import readline from 'node:readline';\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "const send = (m) => console.log(JSON.stringify(m));\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const m = JSON.parse(line);\n"
+        "  send({ id: m.id, result: {} });\n"
+        "  if (m.method === 'thread/start') {\n"
+        f"    process.stderr.write('panic: {marker}\\n');\n"
+        "    setTimeout(() => process.exit(9), 100);\n"
+        "  }\n"
+        "});\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    session_dir = pathlib.Path(tempfile.mkdtemp(prefix="cxc-brkdiag-"))
+    try:
+        endpoint = f"unix:{session_dir / 'broker.sock'}"
+        log_file = session_dir / "broker.log"
+        with open(log_file, "w", encoding="utf8") as log_fd:
+            proc = subprocess.Popen(
+                [
+                    NODE,
+                    str(PLUGIN / "scripts" / "app-server-broker.mjs"),
+                    "serve",
+                    "--endpoint",
+                    endpoint,
+                    "--cwd",
+                    str(bin_dir),
+                ],
+                cwd=str(bin_dir),
+                env={**os.environ, **app_server_env(tmp_path, bin_dir)},
+                stdout=log_fd,
+                stderr=log_fd,
+            )
+        try:
+            socket_path = session_dir / "broker.sock"
+            deadline = time.time() + 15
+            while not socket_path.exists() and time.time() < deadline:
+                assert proc.poll() is None, log_file.read_text(encoding="utf8")
+                time.sleep(0.05)
+            assert socket_path.exists(), f"broker never listened; log:\n{log_file.read_text(encoding='utf8')}"
+
+            script = (
+                "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+                "const client = await CodexAppServerClient.connect(process.argv[1], "
+                "{ brokerEndpoint: process.argv[2] });\n"
+                "await client.request('thread/start', {}).catch(() => {});\n"
+                "await Promise.race([\n"
+                "  client.exitPromise,\n"
+                "  new Promise((r) => setTimeout(r, 8000)),\n"
+                "]);\n"
+                "process.stdout.write(JSON.stringify({ exitError: client.exitError?.message ?? null }));\n"
+                "process.exit(0);\n"
+            )
+            result = run_node_inline(
+                script,
+                app_server_env(tmp_path, bin_dir),
+                args=[str(bin_dir), endpoint],
+                timeout=45,
+            )
+            assert result.returncode == 0, result.stderr
+            payload = json.loads(result.stdout)
+            assert payload["exitError"], f"no exitError propagated; broker log:\n{log_file.read_text(encoding='utf8')}"
+            assert marker in payload["exitError"], payload["exitError"]
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+    finally:
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+
+def test_codex_app_server_crash_diagnostic_cap_is_measured_in_bytes(tmp_path):
+    """The cap is named MAX_BYTES, so it must count bytes, not UTF-16 code units.
+
+    1500 CJK characters are 1500 code units but 4500 UTF-8 bytes — a `.length`
+    check lets them through untruncated and the "2 KB" bound silently becomes 4.5 KB
+    in a job record. Truncation must also not split a multi-byte code point.
+    """
+    server_js = (
+        "process.stderr.write('\\u4e2d'.repeat(1500) + '\\n');\n"
+        "process.exit(5);\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    script = (
+        "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+        "let out = { outcome: 'connected' };\n"
+        "try {\n"
+        "  await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });\n"
+        "} catch (error) {\n"
+        "  const m = String(error.message || error);\n"
+        "  out = { outcome: 'rejected', bytes: Buffer.byteLength(m, 'utf8'), hasReplacement: m.includes('\\uFFFD') };\n"
+        "}\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+        "process.exit(0);\n"
+    )
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=45)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "rejected", payload
+    # 2 KB cap + the fixed prefix ("codex app-server exited unexpectedly (exit 5). stderr: ").
+    assert payload["bytes"] <= 2 * 1024 + 200, payload
+    # A cut through a 3-byte code point would decode as U+FFFD.
+    assert payload["hasReplacement"] is False, payload
+
+
+
+def test_codex_sanitizer_redacts_common_env_credential_shapes():
+    """Crash stderr can contain an environment dump, and this text is persisted.
+
+    The original patterns required a word boundary immediately before the keyword and
+    `=` immediately after it, so every conventional SCREAMING_SNAKE env name slipped
+    through: `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `DATABASE_PASSWORD` all have a
+    `_` (a word character) adjacent to the keyword, and `Authorization: Bearer` was
+    not covered at all. All four were measured leaking before this was fixed.
+    """
+    script = (
+        "import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';\n"
+        "const cases = {\n"
+        "  aws: 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI0K7MDENGbPxRfiCYEXAMPLEKEY',\n"
+        "  gh: 'GITHUB_TOKEN=notaghpprefixedvalue12345',\n"
+        "  db: 'DATABASE_PASSWORD=hunter2hunter2hunter2',\n"
+        "  bearer: 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9',\n"
+        "  json_bearer: '{\"Authorization\":\"Bearer eyJ.secret.signature\"}',\n"
+        "  unterminated: 'TOKEN=\"super-secret-value',\n"
+        "  mixed_quote: String.fromCharCode(84,79,75,69,78,61,34) + \"abc-secret\" + String.fromCharCode(39),\n"
+        "  mixed_quote2: String.fromCharCode(84,79,75,69,78,61,39) + \"mix\" + String.fromCharCode(34) + \"ed-secret\",\n"
+        "  plain: 'token=plainvalue123',\n"
+        "};\n"
+        "const out = {};\n"
+        "for (const [k, v] of Object.entries(cases)) out[k] = sanitizeModelText(v);\n"
+        "// Re-sanitizing a stored record must be a no-op, or markers accumulate.\n"
+        "out.stable = Object.values(out).every((v) => sanitizeModelText(v) === v);\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+    )
+    result = run_node_inline(script, {}, timeout=30)
+
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert "wJalrXUtnFEMI0K7MDENGbPxRfiCYEXAMPLEKEY" not in out["aws"], out["aws"]
+    assert "notaghpprefixedvalue12345" not in out["gh"], out["gh"]
+    assert "hunter2hunter2hunter2" not in out["db"], out["db"]
+    assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" not in out["bearer"], out["bearer"]
+    # Quoted/JSON header form — the bare-header pattern cannot see it.
+    assert "eyJ.secret.signature" not in out["json_bearer"], out["json_bearer"]
+    # Truncated output can leave a quote unterminated; the value must still go.
+    assert "super-secret-value" not in out["unterminated"], out["unterminated"]
+    # An unterminated value may still contain the OTHER quote character; only a
+    # matching closing delimiter means the value was terminated.
+    assert "abc-secret" not in out["mixed_quote"], out["mixed_quote"]
+    assert "mix" not in out["mixed_quote2"], out["mixed_quote2"]
+    # The shape that already worked must keep working.
+    assert "plainvalue123" not in out["plain"], out["plain"]
+    # Redaction must stay idempotent so a re-sanitized record does not grow markers.
+    assert out["stable"] is True, out
+
+
+
+def test_codex_app_server_waits_briefly_for_stderr_to_drain(tmp_path):
+    """`exit` does not guarantee stdio is drained; `close` does.
+
+    Measured: a child that hands its stderr to a detached grandchild exits at ~29 ms
+    with an EMPTY buffer while the crash line only arrives at ~358 ms, before `close`.
+    Formatting the diagnostic at `exit` therefore reported nothing in exactly the
+    scenario it exists for. The wait must stay bounded — a held descriptor must not be
+    able to stall the turn's rejection forever.
+    """
+    server_js = (
+        "import { spawn } from 'node:child_process';\n"
+        "import fs from 'node:fs';\n"
+        "import os from 'node:os';\n"
+        "import path from 'node:path';\n"
+        "const gc = path.join(os.tmpdir(), 'latecrash-' + process.pid + '.mjs');\n"
+        "fs.writeFileSync(gc, 'setTimeout(() => { process.stderr.write(\"LATE_CRASH_MARKER\\\\n\"); }, 250);');\n"
+        "spawn(process.execPath, [gc], { stdio: ['ignore', 'ignore', 'inherit'], detached: true }).unref();\n"
+        "process.exitCode = 9;\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    script = (
+        "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+        "let out = { outcome: 'connected' };\n"
+        "const started = Date.now();\n"
+        "try {\n"
+        "  await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });\n"
+        "} catch (error) {\n"
+        "  out = { outcome: 'rejected', message: String(error.message || error), ms: Date.now() - started };\n"
+        "}\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+        "process.exit(0);\n"
+    )
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=45)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "rejected", payload
+    assert "LATE_CRASH_MARKER" in payload["message"], payload
+    # Bounded: a descriptor held open must not stall rejection indefinitely.
+    assert payload["ms"] < 20000, payload
+
+
+
+def test_codex_app_server_releases_stdio_when_the_drain_grace_expires(tmp_path):
+    """A held descriptor must not keep OUR process alive after we give up waiting.
+
+    The child's stderr pipe stays open while any descendant holds it, and an open pipe
+    keeps the parent's event loop alive. Measured on the bare topology: a parent that
+    merely listens on that pipe exits in 60 ms normally, but never exits at all when a
+    grandchild inherits stderr. So when the drain grace expires the handles must be
+    destroyed, not just abandoned.
+    """
+    server_js = (
+        "import { spawn } from 'node:child_process';\n"
+        "import fs from 'node:fs';\n"
+        "import os from 'node:os';\n"
+        "import path from 'node:path';\n"
+        "const gc = path.join(os.tmpdir(), 'holder-' + process.pid + '.mjs');\n"
+        "fs.writeFileSync(gc, 'setTimeout(() => {}, 30000);');\n"
+        "spawn(process.execPath, [gc], { stdio: ['ignore', 'ignore', 'inherit'], detached: true }).unref();\n"
+        "process.exitCode = 9;\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    # No process.exit() here on purpose: the script must be able to end on its own.
+    script = (
+        "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+        "try {\n"
+        "  await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });\n"
+        "} catch (error) {\n"
+        "  process.stdout.write(JSON.stringify({ outcome: 'rejected' }));\n"
+        "}\n"
+    )
+    started = time.time()
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=25)
+    elapsed = time.time() - started
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["outcome"] == "rejected"
+    # The grandchild holds the descriptor for 30s; exiting well inside that proves the
+    # handles were released rather than waited on.
+    assert elapsed < 15, f"process lingered {elapsed:.1f}s — stdio was not released"
