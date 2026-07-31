@@ -428,7 +428,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.5" in notices
+    assert "Local extended version: 1.1.0-fh.6" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -9505,3 +9505,39 @@ def test_native_review_start_has_no_effort_channel(tmp_path):
     # metadata-only: never queries model/list, never sends effort to review/start.
     assert "MODEL_LIST_CALLED" not in marker_text
     assert _marker_value(marker_text, "REVIEW_HAS_EFFORT") is False
+
+
+# ===== Upstream db52e28 uptake: repo-derived git args must never reach a shell =====
+
+
+def test_codex_git_wrapper_pins_shell_false():
+    """`detectDefaultBranch` returns `refs/remotes/origin/HEAD` verbatim, so a cloned
+    repo controls a string that reaches git argv at `["merge-base", "HEAD", baseRef]`.
+    On Windows `runCommand` interposes a shell, and `git check-ref-format` bans spaces
+    but NOT `&`, `|`, `` ` `` or `$()`, so a hostile default branch name is a command
+    injection there.
+
+    A behavioural test would pass vacuously on darwin — the platform ternary already
+    evaluates to `false` here — so this asserts the source contract instead. Adopted
+    from upstream db52e28.
+    """
+    git_lib = read_text(PLUGIN / "scripts" / "lib" / "git.mjs")
+
+    assert 'runCommand("git", args, { cwd, ...options, shell: false })' in git_lib
+    assert 'runCommandChecked("git", args, { cwd, ...options, shell: false })' in git_lib
+
+
+
+def test_codex_run_command_lets_callers_opt_out_of_the_shell():
+    """The opt-out must be a caller option, NOT an unconditional `shell: false`.
+
+    `runCommand` also spawns `npm` and `codex`, which are `.cmd` shims on Windows that
+    Node cannot spawn without a shell. Pinning `false` globally would break the plugin
+    there while fixing the injection — upstream's `options.shell ?? (...)` is the shape
+    that does both.
+    """
+    process_lib = read_text(PLUGIN / "scripts" / "lib" / "process.mjs")
+
+    assert "shell: options.shell ??" in process_lib
+    # The Windows default must survive for the .cmd-shim spawns.
+    assert 'process.platform === "win32" ? (process.env.SHELL || true) : false' in process_lib

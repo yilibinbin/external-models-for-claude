@@ -12,7 +12,10 @@ export function runCommand(command, args = [], options = {}) {
     // enumeration step on a stalled/stdin-waiting child.
     timeout: options.timeout,
     stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+    // Callers that pass repository-derived arguments opt out of the shell entirely
+    // (see git.mjs). The Windows default stays for the .cmd shims — `claude` cannot
+    // be spawned there without one.
+    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
   });
 

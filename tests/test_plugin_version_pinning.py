@@ -124,7 +124,14 @@ def _uncommitted_payload_changes(plugin_dir):
     lines = _git("status", "--porcelain", "--", relative).splitlines()
     changed = []
     for line in lines:
-        path = line[3:].strip().strip('"')
+        # `--porcelain` is `XY<space>PATH`, but _git() strips the whole output, which
+        # eats the leading space of an unstaged status code (" M path" -> "M path") and
+        # would shift a fixed line[3:] slice by one on the first line. Split on the
+        # first run of whitespace instead of slicing at a fixed offset.
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        path = parts[1].strip().strip('"')
         # Renames read as "old -> new"; the destination is what ships.
         if " -> " in path:
             path = path.split(" -> ", 1)[1]

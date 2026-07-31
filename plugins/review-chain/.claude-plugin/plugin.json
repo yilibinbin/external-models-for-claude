@@ -1,6 +1,6 @@
 {
   "name": "review-chain",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Run all installed external-model plugins as one serial adversarial review chain, with accumulated findings, verbatim rebuttal relay, and an evidence gate.",
   "author": {
     "name": "fanghao",
