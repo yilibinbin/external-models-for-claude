@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.1.0-fh.7
+
+Close the paths by which child-process output reached persisted or user-visible
+sinks unredacted. Scope and design were settled by a three-model serial
+adversarial review (Claude / Gemini via Antigravity / Codex) that rejected the
+first design outright; the items below are what survived it.
+
+- **Redaction no longer has a key-length cliff.** Sensitivity is decided in JS
+  against the captured key, not inside the regex. Every regex that scans the key
+  needs a bounded prefix to stay linear, and a bounded prefix anchored by a
+  lookbehind fails *silently* once the key outgrows it — measured total bypass at
+  64 characters, squarely where names like `ACME_PLATFORM_INTERNAL_SERVICE_API_KEY`
+  live. Assignments are now found by scanning separators and looking back for the
+  key, so a non-sensitive assignment (`rpc failed: DATABASE_URL=…`) can no longer
+  swallow a sensitive one nested inside it. `DATABASE_URL`, `SESSION_COOKIE` and
+  `PRIVATE_KEY` are covered; they carry no keyword from the old list and leaked
+  verbatim. The key name is preserved and only the value dropped, so a finding
+  stays actionable.
+- **stderr is bounded as it arrives**, not when it is read. Bounding on read is a
+  no-op on the default transport: `BrokerCodexAppServerClient` never accumulates,
+  while the spawned client backing the broker grows for the whole session.
+- **`captureDiagnosticStderr`** redacts at the one seam both stderr readers pass
+  through, and **`buildFailureMessage`** covers the error branch of
+  `result.error?.message ?? result.stderr` — the `??` short-circuited past
+  redaction entirely whenever an error message was present.
+- **`payload.codex.stderr` is deleted** (both write sites). It had zero readers
+  repo-wide yet reached the job sidecar, `--json`, and `/codex:result` with no
+  renderer in between, so no rendering fix could cover it.
+- **The rendered stderr fence is gated on failure**, not merely on stderr being
+  non-empty. The block is persisted and logged as well as printed, so an ungated
+  fence shipped the child's stderr on every *successful* review.
+- **`renderTaskResult` no longer returns the failure message as the answer.** It
+  is frequently raw stderr, which made exhaust indistinguishable from model
+  output; it is now labelled diagnostics under a fixed outcome line.
+- **Persisted index fields and the progress channel are redacted**: `summary`,
+  `errorMessage`, and progress `message`/`stderrMessage` (both branches).
+  `logBody` is deliberately exempt — it carries the model's own review text, and
+  the deliverable stays byte-identical.
+- **The stop gate redacts at the emit boundary**, not only in
+  `classifyStopGateResult`: `handleHookException` builds its own block reason and
+  never calls the classifier. `readHookInput` no longer propagates V8's quoted
+  snippet of the malformed payload, which is unredactable by construction — ~10
+  bytes with no assignment structure and below any vendor-token length.
+- **Job state is written 0600 / 0700.** These files hold review text, outlive the
+  session and have no TTL; they were created at the process umask.
+
+Deliberately **not** included: relocating the state root out of `/tmp`. Losing
+the old state makes `loadState` default `stopReviewGate` to `false` — a
+fail-closed security gate silently becoming fail-open — so it needs a versioned
+migration and ships separately.
+
 ## 1.1.0-fh.6
 
 - Adopt upstream `db52e28`: pin `shell: false` on the `git()`/`gitChecked()` wrappers and let `runCommand` honour `options.shell`. `detectDefaultBranch` returns whatever `refs/remotes/origin/HEAD` points at, unvalidated, and that string reaches git argv at `["merge-base", "HEAD", baseRef]`; on Windows the spawn interposed a shell, and `git check-ref-format` bans spaces but not `&`, `|`, backticks or `$()`, so a cloned repository's default branch name was a command injection there. Unreachable on darwin/linux, where the platform ternary already evaluated to `false`. The opt-in shape is deliberate: `runCommand` also spawns the `npm`/`codex` `.cmd` shims, which Windows cannot launch without a shell.

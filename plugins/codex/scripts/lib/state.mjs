@@ -64,7 +64,9 @@ export function resolveJobsDir(cwd) {
 }
 
 export function ensureStateDir(cwd) {
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+  // 0700: the jobs dir holds review text and job records that outlive the
+  // session. It was created at the process umask -- 0755 on a default install.
+  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true, mode: 0o700 });
 }
 
 export function loadState(cwd) {
@@ -313,9 +315,11 @@ export function withJobFileLock(cwd, jobId, callback) {
 }
 
 export function writeAtomicJson(filePath, payload) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const tempFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tempFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  // Mode set on the temp file so it survives the rename below; setting it
+  // after the rename would leave a window at the umask default.
+  fs.writeFileSync(tempFile, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   fs.renameSync(tempFile, filePath);
   return filePath;
 }

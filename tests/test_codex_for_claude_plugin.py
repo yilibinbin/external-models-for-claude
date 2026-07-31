@@ -428,7 +428,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.6" in notices
+    assert "Local extended version: 1.1.0-fh.7" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -8977,6 +8977,96 @@ def test_codex_persisted_index_fields_pass_through_the_redactor():
     source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "tracked-jobs.mjs").read_text()
     assert "summary: sanitizeModelText(execution.summary)" in source
     assert re.search(r"const errorMessage = sanitizeModelText\(", source)
+
+
+def test_codex_stop_gate_classifier_redacts_the_reason_on_every_branch():
+    # The BLOCK reason is injected into the Claude transcript
+    # (~/.claude/projects/**.jsonl), which is permanent and outside this plugin's
+    # control, and is re-fed to the model.
+    #
+    # This is where the panel's central conflict landed. Gemini argued the reason
+    # must be sanitized; the design argued a review saying "line 12 commits
+    # AWS_SECRET_ACCESS_KEY=..." is destroyed by redaction. Both hold, because
+    # the redactor drops the VALUE and keeps the KEY: the finding stays
+    # actionable (which key, which file, which line) and the credential does not
+    # enter the transcript. Asserted here so neither half can regress.
+    payload = run_node_script(
+        """
+        import { classifyStopGateResult } from './plugins/codex/scripts/lib/stop-gate-result.mjs';
+        const reason = 'src/config.ts:12 commits AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG';
+        console.log(JSON.stringify({
+          block: classifyStopGateResult({ ok: true, verdict: 'BLOCK', reason }),
+          allow: classifyStopGateResult({ ok: true, verdict: 'ALLOW', reason }),
+          failure: classifyStopGateResult({ ok: false, reason }),
+        }));
+        """
+    )
+    for branch, decision in payload.items():
+        text = decision["reason"]
+        assert "wJalrXUtnFEMIK7MDENG" not in text, f"{branch} leaked the credential"
+        # The finding must survive: the key name and its location are the point.
+        assert "AWS_SECRET_ACCESS_KEY" in text, f"{branch} over-redacted the finding"
+        assert "src/config.ts:12" in text, f"{branch} lost the location"
+
+
+def test_codex_stop_gate_exception_path_is_redacted_too(tmp_path):
+    # `handleHookException` emits a block decision WITHOUT going through
+    # classifyStopGateResult, so redacting the classifier alone leaves this
+    # degraded path open. It is not hypothetical: readHookInput JSON.parse()s the
+    # Stop payload, and V8 embeds a snippet of the offending input -- i.e. the
+    # hook's stdin, which carries last_assistant_message -- in the error message.
+    #
+    # Hence sanitization sits at the EMIT boundary, which every path crosses.
+    plugin_data = tmp_path / "plugin-data"
+    gate_on = tmp_path / "gate_on"
+    gate_on.mkdir()
+    _enable_stop_gate(gate_on, plugin_data)
+
+    # The input shape matters. V8 reports most malformed JSON by POSITION only
+    # ("Expected ',' or '}' ... at position 60"), which quotes nothing -- a test
+    # built on that shape passes without any fix. It quotes the offending bytes
+    # only in the "Unexpected token" form, so that is what is exercised here.
+    secret = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIII"
+    result = _run_stop_gate_hook(gate_on, plugin_data, secret)
+    assert result.returncode == 0, result.stderr
+    decision = json.loads(result.stdout)
+    assert decision["decision"] == "block", "must still fail closed"
+    quoted_prefix = secret[:10]
+    assert quoted_prefix not in decision["reason"]
+    assert quoted_prefix not in result.stderr, "the stderr note leaks what the decision redacts"
+
+
+def test_codex_job_state_files_are_not_group_or_world_readable(tmp_path):
+    # The sidecar and the job log hold review text and (before this change) raw
+    # child stderr, they outlive the session, and they had no TTL. They were
+    # created at the process umask -- 0644 on a default install.
+    #
+    # Modes are passed explicitly rather than relying on umask so the assertion
+    # holds for any developer or CI runner. Scope note: the panel REJECTED
+    # relocating the state root in this change, because losing the old state
+    # makes loadState default stopReviewGate to false -- a fail-closed security
+    # gate silently becoming fail-open. Only the modes are hardened here.
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        import { createJobLogFile } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        const workspace = process.argv[1];
+        const jobFile = writeJobFile(workspace, 'probe-job', { id: 'probe-job', status: 'completed' });
+        const logFile = createJobLogFile(workspace, 'probe-job');
+        const modeOf = (p) => (fs.statSync(p).mode & 0o777).toString(8);
+        console.log(JSON.stringify({
+          job: modeOf(jobFile),
+          log: modeOf(logFile),
+          jobsDir: modeOf(path.dirname(jobFile)),
+        }));
+        """.replace("path.dirname(jobFile)", "jobFile.replace(/\\/[^/]+$/, '')"),
+        env={"CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")},
+        args=[str(tmp_path)],
+    )
+    assert payload["job"] == "600", f"job sidecar is {payload['job']}"
+    assert payload["log"] == "600", f"job log is {payload['log']}"
+    assert payload["jobsDir"] == "700", f"jobs dir is {payload['jobsDir']}"
 
 
 # ===== effort-policy.mjs (codex intelligence-tier capability adaptation, spec v6) =====

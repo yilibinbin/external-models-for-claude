@@ -13,6 +13,7 @@ import { getConfig, listJobs } from "./lib/state.mjs";
 import { classifyStopGateResult } from "./lib/stop-gate-result.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
+import { sanitizeModelText } from "./lib/sanitize.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 8 * 60 * 1000;
@@ -29,19 +30,57 @@ function readHookInput() {
   if (!raw) {
     return {};
   }
-  return JSON.parse(raw);
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    // Re-throw without V8's quoted snippet. Its "Unexpected token" form embeds
+    // the offending bytes verbatim, and those bytes are the Stop payload --
+    // which carries last_assistant_message. The snippet cannot be redacted
+    // reliably either: it is ~10 characters with no assignment structure, so it
+    // matches neither the key/value rule nor a vendor token shape.
+    //
+    // The position is the whole diagnostic value here; the bytes are the payload.
+    const position = /position (\d+)/.exec(error?.message ?? "")?.[1];
+    throw new Error(
+      position
+        ? `hook stdin was not valid JSON (at position ${position})`
+        : "hook stdin was not valid JSON"
+    );
+  }
+}
+
+// Redaction sits at the EMIT boundary, not only in classifyStopGateResult.
+// handleHookException builds its own block reason and never calls the
+// classifier, so a classifier-only fix leaves that degraded path open -- and it
+// is a real carrier: readHookInput JSON.parse()s the Stop payload and V8's
+// "Unexpected token" form quotes the offending bytes, while getConfig failures
+// put absolute machine paths into the message.
+//
+// Bounding lives here too, for the same reason: every path crosses this seam.
+const MAX_EMITTED_REASON_CHARS = 4000;
+const REASON_TRUNCATION_SUFFIX = "... [truncated]";
+
+function boundReason(reason) {
+  const text = String(reason ?? "");
+  return text.length > MAX_EMITTED_REASON_CHARS
+    ? `${text.slice(0, MAX_EMITTED_REASON_CHARS - REASON_TRUNCATION_SUFFIX.length)}${REASON_TRUNCATION_SUFFIX}`
+    : text;
 }
 
 function emitHookDecision(payload) {
   decisionEmitted = true;
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  const safePayload =
+    typeof payload?.reason === "string"
+      ? { ...payload, reason: boundReason(sanitizeModelText(payload.reason)) }
+      : payload;
+  process.stdout.write(`${JSON.stringify(safePayload)}\n`);
 }
 
 function logNote(message) {
   if (!message) {
     return;
   }
-  process.stderr.write(`${message}\n`);
+  process.stderr.write(`${boundReason(sanitizeModelText(message))}\n`);
 }
 
 function filterJobsForCurrentSession(jobs, input = {}) {
@@ -251,7 +290,7 @@ function main() {
 
 function handleHookException(error) {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`[codex review-gate] failed: ${message}\n`);
+  process.stderr.write(`${sanitizeModelText(`[codex review-gate] failed: ${message}`)}\n`);
   let config = activeGateConfig;
   if (!config) {
     try {
@@ -265,7 +304,7 @@ function handleHookException(error) {
       );
     } catch (configError) {
       const configMessage = configError instanceof Error ? configError.message : String(configError);
-      process.stderr.write(`[codex review-gate] could not determine gate config; allowing Stop: ${configMessage}\n`);
+      process.stderr.write(`${sanitizeModelText(`[codex review-gate] could not determine gate config; allowing Stop: ${configMessage}`)}\n`);
       return;
     }
   }
