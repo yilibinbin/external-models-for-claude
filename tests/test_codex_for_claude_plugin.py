@@ -8853,6 +8853,132 @@ def test_codex_failure_message_redacts_the_error_branch_too():
     assert payload["neither"] == ""
 
 
+def test_codex_payload_carries_no_raw_child_stderr_field():
+    # Panel consensus: `payload.codex.stderr` is write-only exhaust -- verified
+    # zero readers across plugins/ tests/ docs/ templates/ -- yet it reaches the
+    # job sidecar (tracked-jobs writes `result: execution.payload`), the terminal
+    # under `--json`, and `/codex:result --json`, which emits the stored job
+    # wholesale.
+    #
+    # Deleting the field closes all three sinks with no pattern matching at all,
+    # which is why this is asserted structurally rather than by probing content:
+    # a redaction test would still pass if someone re-added the field carrying
+    # text the patterns happen to miss.
+    # Scoped to the persisted `codex: { ... }` payload blocks on purpose. The
+    # renderer is separately passed a stderr argument and legitimately keeps it:
+    # that path is fixed by gating the fence on failure, not by removing the
+    # data. A blanket source-wide ban would conflate the two fixes.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "codex-companion.mjs").read_text()
+    payload_blocks = re.findall(r"codex: \{(.*?)\n\s*\}", source, re.DOTALL)
+    assert payload_blocks, "expected at least one persisted codex payload block"
+    for block in payload_blocks:
+        assert "stderr" not in block, (
+            "a raw child-stderr field was re-added to a persisted payload; "
+            "it reaches the job sidecar, --json, and /codex:result with no "
+            "renderer in between. Diagnostics belong in the redacted failure message."
+        )
+
+
+def test_codex_native_review_emits_no_stderr_fence_on_success():
+    # The fence was guarded only on stderr being non-empty, never on the run
+    # having failed, so a CLEAN review shipped the child's stderr to the
+    # terminal, the job sidecar and the job log. A successful review has no
+    # diagnostic to show.
+    payload = run_node_script(
+        """
+        import { renderNativeReviewResult } from './plugins/codex/scripts/lib/render.mjs';
+        const stderr = 'tracing: connecting\\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7';
+        console.log(JSON.stringify({
+          ok: renderNativeReviewResult(
+            { status: 0, stdout: 'No issues found.', stderr },
+            { reviewLabel: 'review', targetLabel: 'HEAD', reasoningSummary: [] },
+          ),
+          failed: renderNativeReviewResult(
+            { status: 1, stdout: '', stderr },
+            { reviewLabel: 'review', targetLabel: 'HEAD', reasoningSummary: [] },
+          ),
+        }));
+        """
+    )
+    assert "```text" not in payload["ok"], "success path still emits the stderr fence"
+    assert "tracing: connecting" not in payload["ok"]
+    assert "No issues found." in payload["ok"]
+    # The diagnostic channel still works where it is actually needed.
+    assert "```text" in payload["failed"]
+    assert "tracing: connecting" in payload["failed"]
+
+
+def test_codex_task_result_never_returns_bare_stderr_as_the_answer():
+    # When a turn produced no final message, the child's stderr WAS the rendered
+    # answer -- unlabelled and indistinguishable from model output, then persisted
+    # and re-shown by /codex:result. It must be presented as diagnostics instead.
+    payload = run_node_script(
+        """
+        import { renderTaskResult } from './plugins/codex/scripts/lib/render.mjs';
+        console.log(JSON.stringify({
+          withDiagnostics: renderTaskResult(
+            { rawOutput: '', failureMessage: 'connection reset by peer' },
+            { title: 'task' },
+          ),
+          bare: renderTaskResult({ rawOutput: '', failureMessage: '' }, { title: 'task' }),
+          success: renderTaskResult({ rawOutput: 'the answer' }, { title: 'task' }),
+        }));
+        """
+    )
+    rendered = payload["withDiagnostics"]
+    assert "did not return a final message" in rendered
+    assert rendered.strip() != "connection reset by peer", "raw stderr is still the answer"
+    # Present, but explicitly labelled as diagnostics rather than as output.
+    assert "diagnostics" in rendered.lower()
+    assert "connection reset by peer" in rendered
+    assert "did not return a final message" in payload["bare"]
+    # The success path is untouched.
+    assert payload["success"].strip() == "the answer"
+
+
+def test_codex_progress_events_redact_message_but_not_log_body():
+    # Progress lines quote the model's shell commands and assistant text verbatim
+    # and reach the terminal, the job log and the /codex:status preview -- on
+    # success, on every run, independent of transport. `logBody` is deliberately
+    # exempt: it carries the model's own review text, which follows the
+    # unredacted-deliverable policy the panel settled on.
+    payload = run_node_script(
+        """
+        import { normalizeProgressEvent } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        const secret = 'GITHUB_TOKEN=ghp_AAAABBBBCCCCDDDD';
+        console.log(JSON.stringify({
+          fromObject: normalizeProgressEvent({
+            message: 'ran: export ' + secret,
+            stderrMessage: 'warn ' + secret,
+            logBody: 'review body mentioning ' + secret,
+          }),
+          fromString: normalizeProgressEvent('ran: export ' + secret),
+        }));
+        """
+    )
+    obj = payload["fromObject"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in obj["message"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in obj["stderrMessage"]
+    # The deliverable survives byte-for-byte.
+    assert "ghp_AAAABBBBCCCCDDDD" in obj["logBody"]
+    # The plain-string branch sets stderrMessage from the same raw value, so
+    # leaving it unredacted would defeat the object-branch fix entirely.
+    string_event = payload["fromString"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in string_event["message"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in string_event["stderrMessage"]
+
+
+def test_codex_persisted_index_fields_pass_through_the_redactor():
+    # `summary` and `errorMessage` are written straight into state.json and the
+    # job sidecar with no renderer in between, so the wrap has to sit at the
+    # write site. Asserted structurally because that is the invariant: a future
+    # producer added upstream must not be able to bypass it, which is exactly how
+    # the multi-review summary came to skip the redactor three call sites later.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "tracked-jobs.mjs").read_text()
+    assert "summary: sanitizeModelText(execution.summary)" in source
+    assert re.search(r"const errorMessage = sanitizeModelText\(", source)
+
+
 # ===== effort-policy.mjs (codex intelligence-tier capability adaptation, spec v6) =====
 
 def _run_effort_policy(body):

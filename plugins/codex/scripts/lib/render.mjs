@@ -322,7 +322,11 @@ export function renderNativeReviewResult(result, meta) {
     lines.push("Codex review failed.");
   }
 
-  if (stderr) {
+  // Gated on failure, not merely on stderr being non-empty. A clean review has
+  // no diagnostic to show, and this block is persisted to the job sidecar and
+  // the job log as well as printed -- so an ungated fence shipped the child's
+  // stderr on every successful run.
+  if (stderr && result.status !== 0) {
     lines.push("", "stderr:", "", "```text", stderr, "```");
   }
 
@@ -337,8 +341,17 @@ export function renderTaskResult(parsedResult, meta) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
   }
 
-  const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
-  return `${message}\n`;
+  // The failure message must never BE the answer. It is frequently the child's
+  // stderr (buildFailureMessage falls through to captureDiagnosticStderr when
+  // the turn carried no error), and returning it bare made exhaust
+  // indistinguishable from model output -- then persisted it and re-showed it
+  // via /codex:result. State the outcome, then label the diagnostics as such.
+  const lines = ["Codex did not return a final message."];
+  const diagnostics = String(parsedResult?.failureMessage ?? "").trim();
+  if (diagnostics) {
+    lines.push("", "diagnostics:", "", "```text", diagnostics, "```");
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 export function renderStatusReport(report) {
