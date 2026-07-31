@@ -141,7 +141,10 @@ function dirHasAdversarialSkill(skillsDir) {
 }
 
 function probeCompanionAdvertisesAdversarialReview(companionPath) {
-  const result = runCommand(process.execPath, [companionPath, "--help"], { timeout: 10000 });
+  // `companionPath` comes from `claude plugin list --json`, so it is externally
+  // supplied. node is a real executable on every platform, so no shell is needed —
+  // and letting one in would concatenate that path into a command line on Windows.
+  const result = runCommand(process.execPath, [companionPath, "--help"], { timeout: 10000, shell: false });
   const text = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
   return text.includes("adversarial-review");
 }

@@ -13,7 +13,7 @@
       "name": "codex",
       "source": "./plugins/codex",
       "description": "OpenAI Codex for Claude Code with local marketplace extensions: release checks, diagnostics, capacity governance, hardened jobs, preview CI workflow rendering, multi-role review, quality presets, and safer stop gates.",
-      "version": "1.1.0-fh.5",
+      "version": "1.1.0-fh.6",
       "category": "Productivity",
       "author": {
         "name": "OpenAI",
@@ -35,7 +35,7 @@
       "name": "review-chain",
       "source": "./plugins/review-chain",
       "description": "Run all installed external-model plugins as one serial adversarial review chain (Claude, then Gemini via Antigravity, then Codex), with accumulated findings, verbatim rebuttal relay, and an evidence gate.",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "category": "Productivity",
       "author": {
         "name": "fanghao",

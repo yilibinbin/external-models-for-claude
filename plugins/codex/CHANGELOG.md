@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0-fh.6
+
+- Adopt upstream `db52e28`: pin `shell: false` on the `git()`/`gitChecked()` wrappers and let `runCommand` honour `options.shell`. `detectDefaultBranch` returns whatever `refs/remotes/origin/HEAD` points at, unvalidated, and that string reaches git argv at `["merge-base", "HEAD", baseRef]`; on Windows the spawn interposed a shell, and `git check-ref-format` bans spaces but not `&`, `|`, backticks or `$()`, so a cloned repository's default branch name was a command injection there. Unreachable on darwin/linux, where the platform ternary already evaluated to `false`. The opt-in shape is deliberate: `runCommand` also spawns the `npm`/`codex` `.cmd` shims, which Windows cannot launch without a shell.
+- Not adopted from upstream v1.0.5/v1.0.6: the `/codex:transfer` command. The capability ships natively in codex-cli, upstream's own plugin is separately installable for it, and porting would violate four of this fork's command-surface invariants and bypass the resource governor.
+
 ## 1.1.0-fh.5
 
 - Stop pinning the marketplace's `metadata.version` inside this plugin. The constant existed only to be compared against `marketplace.json`, so the check was circular, and its real effect was that **every** marketplace bump edited a file inside `plugins/codex` while `CODEX_VERSION` stayed put — shipping changed codex bytes under an unchanged version key, which a version-pinned install never picks up. Three merged PRs (#7, #8, #9) drifted this way. The marketplace version is now asserted only in `tests/`, which ships in no plugin, and `tests/test_plugin_version_pinning.py` guards the drift class repo-wide.

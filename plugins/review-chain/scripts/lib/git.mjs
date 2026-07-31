@@ -8,12 +8,16 @@ const MAX_UNTRACKED_BYTES = 24 * 1024;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 
+// Git is directly executable on Windows. Repository-derived arguments must never pass
+// through a shell: `detectDefaultBranch` returns whatever `refs/remotes/origin/HEAD`
+// points at, and `git check-ref-format` bans spaces but not `&`, `|`, backticks or
+// `$()`, so a hostile default branch name would otherwise be a command injection there.
 function git(cwd, args, options = {}) {
-  return runCommand("git", args, { cwd, ...options });
+  return runCommand("git", args, { cwd, ...options, shell: false });
 }
 
 function gitChecked(cwd, args, options = {}) {
-  return runCommandChecked("git", args, { cwd, ...options });
+  return runCommandChecked("git", args, { cwd, ...options, shell: false });
 }
 
 function listUniqueFiles(...groups) {

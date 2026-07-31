@@ -19,7 +19,7 @@ import { hasMachinePath, MACHINE_PATH_PATTERN_SOURCE } from "./path-hygiene.mjs"
 // asserted that marketplace.json matched a constant whose sole purpose was to be compared
 // against marketplace.json. The marketplace version is asserted in tests/, which ships in
 // no plugin. Codex's own version coupling (manifest <-> marketplace entry) stays below.
-export const CODEX_VERSION = "1.1.0-fh.5";
+export const CODEX_VERSION = "1.1.0-fh.6";
 export const MARKETPLACE_CODEX_AUTHOR = {
   name: "OpenAI",
   url: "https://github.com/openai/codex-plugin-cc"

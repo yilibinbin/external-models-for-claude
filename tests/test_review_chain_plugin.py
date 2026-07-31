@@ -495,3 +495,51 @@ def test_dispatch_lib_closes_output_fd():
     # F4: the parent must close the openSync fd after handing it to the child.
     text = read_text(ROOT / "plugins" / "review-chain" / "scripts" / "lib" / "dispatch.mjs")
     assert "closeSync" in text
+
+
+# ===== Upstream db52e28 uptake: this plugin vendors its own git wrapper =====
+
+
+def test_review_chain_git_wrapper_pins_shell_false():
+    """review-chain vendored codex's `git.mjs`/`process.mjs`, so it inherited the same
+    defect: a repo-controlled default-branch name reaches git argv, and on Windows that
+    argv goes through a shell. `build-diff` — the first step of the serial chain — is on
+    that path. Source contract, because the platform ternary makes a behavioural test
+    vacuous on darwin.
+    """
+    git_lib = read_text(PLUGIN / "scripts" / "lib" / "git.mjs")
+
+    assert 'runCommand("git", args, { cwd, ...options, shell: false })' in git_lib
+    assert 'runCommandChecked("git", args, { cwd, ...options, shell: false })' in git_lib
+
+
+
+def test_review_chain_run_command_lets_callers_opt_out_of_the_shell():
+    """Opt-in, not a blanket `false`: this copy also spawns `claude` for plugin
+    enumeration, which is a `.cmd` shim on Windows.
+
+    Our copy additionally forwards `timeout` (a divergence from upstream), so the
+    upstream patch does not apply here by hand — both properties are asserted.
+    """
+    process_lib = read_text(PLUGIN / "scripts" / "lib" / "process.mjs")
+
+    assert "shell: options.shell ??" in process_lib
+    assert 'process.platform === "win32" ? (process.env.SHELL || true) : false' in process_lib
+    # The fork-only timeout forwarding must survive the uptake.
+    assert "timeout: options.timeout" in process_lib
+
+
+
+def test_review_chain_companion_probe_does_not_go_through_a_shell():
+    """The capability probe spawns node with a path taken from `claude plugin list
+    --json` — an externally supplied value. On Windows `runCommand` would otherwise
+    concatenate it into a shell command, where a `&` in an install path runs a second
+    command (and can make the probe report success), while a plain space silently
+    breaks enumeration and drops a reviewer from the panel.
+
+    `claude` itself (registry.mjs:89) must KEEP the shell: it is a `.cmd` shim there.
+    """
+    registry = read_text(PLUGIN / "scripts" / "lib" / "registry.mjs")
+
+    assert 'runCommand(process.execPath, [companionPath, "--help"], { timeout: 10000, shell: false })' in registry
+    assert 'runCommand("claude", ["plugin", "list", "--json"])' in registry
