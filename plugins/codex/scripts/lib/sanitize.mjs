@@ -57,13 +57,23 @@ const QUOTED_VALUE = /(["'`])((?:\\.|(?!\1)[^\\])*)\1/y;
 const BARE_VALUE = /[^\s"'`,}]+/y;
 const QUOTE_CHARS = new Set(['"', "'", "`"]);
 const KEY_CHAR = /[\w.-]/;
-// A sensitive key followed by an auth scheme means the credential is the REST of
-// the header, not the scheme word. Redacting only the first token yielded
-// `Authorization: [secret] eyJhbGci...` -- worse than doing nothing, because it
-// reads as redacted.
-const AUTH_SCHEME = /^(?:bearer|basic|digest|token)$/i;
+// Keys whose value runs to the end of the line rather than to the next space.
+// Redacting only the first token yielded `Authorization: [secret] eyJhbGci...`
+// -- worse than doing nothing, because it reads as already handled. Keyed on the
+// header NAME rather than on a list of schemes: enumerating schemes missed
+// Negotiate and NTLM, and a cookie header holds several pairs.
+const LINE_VALUED_KEYS = ["authorization", "cookie", "setcookie"];
+// PEM bodies are newline-delimited, so the line rule above would keep all but
+// the first line. Consume through the matching end marker instead.
+const PEM_BEGIN = /^-----BEGIN [A-Z ]*-----/;
+const PEM_END = /-----END [A-Z ]*-----/;
 
 const REDACTED = "[secret]";
+
+function isLineValuedKey(key) {
+  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+  return LINE_VALUED_KEYS.some((name) => normalized.endsWith(name));
+}
 
 function isSensitiveKey(key) {
   const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -92,9 +102,6 @@ export function redactSecrets(text) {
   return redactAssignedValues(output);
 }
 
-// The key name is preserved and only the value is dropped. A review whose point
-// is "line 12 commits AWS_SECRET_ACCESS_KEY" stays actionable -- the reader
-// already holds the value; what they need is which key, and where.
 // Reads the key ending at `end`, walking backwards over key characters and, if
 // the key is quoted (`{"password": ...}`), over the surrounding quotes.
 //
@@ -124,23 +131,35 @@ function readKeyBefore(text, end, floor) {
   return text.slice(cursor, keyEnd);
 }
 
-function readValueAt(text, index) {
+function spanTo(text, index, end) {
+  return { value: text.slice(index, end), quote: "", length: end - index };
+}
+
+function readValueAt(text, index, key) {
   QUOTED_VALUE.lastIndex = index;
   const quoted = QUOTED_VALUE.exec(text);
   if (quoted) {
     return { value: quoted[2], quote: quoted[1], length: quoted[0].length };
   }
+
+  const rest = text.slice(index, index + 32);
+  if (PEM_BEGIN.test(rest)) {
+    const endMarker = PEM_END.exec(text.slice(index));
+    if (endMarker) {
+      return spanTo(text, index, index + endMarker.index + endMarker[0].length);
+    }
+    // Unterminated PEM: fail closed and take the remainder rather than leak it.
+    return spanTo(text, index, text.length);
+  }
+
+  if (isLineValuedKey(key)) {
+    const lineEnd = text.indexOf("\n", index);
+    return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
+  }
+
   BARE_VALUE.lastIndex = index;
   const bare = BARE_VALUE.exec(text);
-  if (!bare) {
-    return null;
-  }
-  if (AUTH_SCHEME.test(bare[0])) {
-    const lineEnd = text.indexOf("\n", index);
-    const end = lineEnd === -1 ? text.length : lineEnd;
-    return { value: text.slice(index, end), quote: "", length: end - index };
-  }
-  return { value: bare[0], quote: "", length: bare[0].length };
+  return bare ? { value: bare[0], quote: "", length: bare[0].length } : null;
 }
 
 // The key name is preserved and only the value is dropped. A review whose point
@@ -164,7 +183,7 @@ function redactAssignedValues(text) {
     }
 
     const separatorEnd = match.index + match[0].length;
-    const found = readValueAt(text, separatorEnd);
+    const found = readValueAt(text, separatorEnd, key);
     if (!found || isRedactedValue(found.value)) {
       continue;
     }

@@ -34,14 +34,34 @@ export const MAX_CAPTURED_STDERR_BYTES = 64 * 1024;
 // If the retained tail contains no newline at all, the single line is longer
 // than the whole cap and there is no safe place to cut it, so it is dropped
 // entirely rather than kept headless.
-export function appendBoundedStderr(buffer, chunk) {
-  const combined = `${buffer}${chunk}`;
-  if (combined.length <= MAX_CAPTURED_STDERR_BYTES) {
-    return combined;
+// Carries `discarding` across chunks. Dropping an overlong line once is not
+// enough: stderr arrives in arbitrary chunks, so the REMAINDER of that same
+// physical line shows up in the next event and, without state, is captured as
+// though it were a fresh line -- headless, with the key that would have
+// identified it already thrown away. Measured: `PASSWORD=` + `HUNTER2` +
+// `_SUFFIX\n` across three chunks retained `_SUFFIX`.
+export function appendBoundedStderr(state, chunk) {
+  const previous = typeof state === "string" ? { text: state, discarding: false } : state;
+  let incoming = String(chunk ?? "");
+
+  if (previous.discarding) {
+    const newline = incoming.indexOf("\n");
+    if (newline === -1) {
+      return { text: previous.text, discarding: true };
+    }
+    incoming = incoming.slice(newline + 1);
   }
+
+  const combined = `${previous.text}${incoming}`;
+  if (combined.length <= MAX_CAPTURED_STDERR_BYTES) {
+    return { text: combined, discarding: false };
+  }
+
   const tail = combined.slice(combined.length - MAX_CAPTURED_STDERR_BYTES);
   const firstNewline = tail.indexOf("\n");
-  return firstNewline === -1 ? "" : tail.slice(firstNewline + 1);
+  return firstNewline === -1
+    ? { text: "", discarding: true }
+    : { text: tail.slice(firstNewline + 1), discarding: false };
 }
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -264,8 +284,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
 
+    this.stderrCapture = { text: "", discarding: false };
     this.proc.stderr.on("data", (chunk) => {
-      this.stderr = appendBoundedStderr(this.stderr, chunk);
+      this.stderrCapture = appendBoundedStderr(this.stderrCapture, chunk);
+      this.stderr = this.stderrCapture.text;
     });
 
     this.proc.on("error", (error) => {

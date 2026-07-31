@@ -8807,6 +8807,67 @@ def test_codex_sanitizer_handles_quoted_keys_and_auth_headers():
     assert "dXNlcjpwYXNz" not in payload["basic"]
 
 
+def test_codex_sanitizer_redacts_whole_header_and_pem_values():
+    # Enumerating auth SCHEMES was the wrong axis and missed Negotiate and NTLM,
+    # while a cookie header holds several pairs and only the first was taken.
+    # Keying on the header NAME removes the enumeration entirely.
+    #
+    # PEM bodies then need their own rule, because they are newline-delimited and
+    # the line rule would keep everything after the first line.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          negotiate: sanitizeModelText('Authorization: Negotiate YIIFxAYGKwYBBQUCoIIFuDCC'),
+          ntlm: sanitizeModelText('authorization: NTLM TlRMTVNTUAABPAYGKw'),
+          cookies: sanitizeModelText('Cookie: a=1; session=abc123XYZ; b=2'),
+          pem: sanitizeModelText(
+            'PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\\nMIIEvQIBADAN\\nSECONDLINE\\n-----END RSA PRIVATE KEY-----'
+          ),
+        }));
+        """
+    )
+    assert "YIIFxAYGKwYBBQUCoIIFuDCC" not in payload["negotiate"]
+    assert "TlRMTVNTUAABPAYGKw" not in payload["ntlm"]
+    assert "abc123XYZ" not in payload["cookies"]
+    # Every line of the key body, not just the first.
+    assert "MIIEvQIBADAN" not in payload["pem"]
+    assert "SECONDLINE" not in payload["pem"]
+
+
+def test_codex_stderr_discard_state_survives_chunk_boundaries():
+    # Dropping an overlong line once is not enough. stderr arrives in arbitrary
+    # chunks, so the REMAINDER of the same physical line lands in the next data
+    # event and -- without carried state -- is captured as a fresh line, headless,
+    # with the key that would have identified it already discarded.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        let state = appendBoundedStderr('', 'x'.repeat(MAX_CAPTURED_STDERR_BYTES - 9) + 'PASSWORD=');
+        state = appendBoundedStderr(state, 'HUNTER2');
+        state = appendBoundedStderr(state, '_SUFFIX\\ntail line\\n');
+        console.log(JSON.stringify({ text: state.text }));
+        """
+    )
+    assert "_SUFFIX" not in payload["text"], "continuation of a discarded line was captured headless"
+    assert "tail line" in payload["text"], "capture must resume after the terminating newline"
+
+
+def test_codex_job_log_redacts_intermediate_model_output_but_not_the_review():
+    # `logBody` carries three different things, and only one of them is the
+    # deliverable the panel agreed to leave byte-identical:
+    #   codex.mjs  item.text      -> intermediate agent/subagent chatter
+    #   codex.mjs  item.review    -> THE review output
+    #   codex.mjs  reasoning      -> reasoning summary
+    # Exempting the field wholesale exempted all three. The exemption is applied
+    # at the source instead, so only the review body stays raw.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "logBody: sanitizeModelText(item.text)" in source
+    assert re.search(r"logBody: sanitizeModelText\(nextSections", source)
+    assert "logBody: item.review" in source, "the deliverable must stay byte-identical"
+
+
 def test_codex_stderr_truncation_cannot_orphan_a_credential_value():
     # Truncating raw bytes can land between a key and its value, and the redactor
     # keys off the key name -- so a headless `hunter2` survives a pass that would
@@ -8863,15 +8924,17 @@ def test_codex_stderr_is_bounded_during_accumulation_not_after():
         """
         import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES }
           from './plugins/codex/scripts/lib/app-server.mjs';
-        let buffer = '';
-        // 4 MB arriving in realistic chunks.
-        for (let i = 0; i < 4096; i += 1) buffer = appendBoundedStderr(buffer, 'x'.repeat(1024));
+        let state = { text: '', discarding: false };
+        // 4 MB arriving in realistic chunks, newline-delimited so the cut has a
+        // safe boundary to land on (see the discard-state test for the case
+        // where it does not).
+        for (let i = 0; i < 4096; i += 1) state = appendBoundedStderr(state, 'x'.repeat(1023) + '\\n');
         const tailMarker = 'TAIL_MARKER_KEPT';
-        buffer = appendBoundedStderr(buffer, tailMarker);
+        state = appendBoundedStderr(state, tailMarker);
         console.log(JSON.stringify({
-          length: buffer.length,
+          length: state.text.length,
           cap: MAX_CAPTURED_STDERR_BYTES,
-          keepsTail: buffer.endsWith(tailMarker),
+          keepsTail: state.text.endsWith(tailMarker),
         }));
         """
     )

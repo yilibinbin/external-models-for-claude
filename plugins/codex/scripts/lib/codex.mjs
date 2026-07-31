@@ -455,7 +455,10 @@ function recordItem(state, item, lifecycle, threadId = null) {
           stderrMessage: null,
           phase: item.phase === "final_answer" ? "finalizing" : null,
           logTitle: sourceLabel ? `Subagent ${sourceLabel} message` : "Assistant message",
-          logBody: item.text
+          // Intermediate agent chatter, not the deliverable. The unredacted-body
+          // exemption covers the review output only (see "Review output" below);
+          // these are persisted to the job log just the same.
+          logBody: sanitizeModelText(item.text)
         });
       }
     }
@@ -470,6 +473,9 @@ function recordItem(state, item, lifecycle, threadId = null) {
         stderrMessage: null,
         phase: "finalizing",
         logTitle: "Review output",
+        // THE deliverable -- byte-identical by design. A review whose point is
+        // "line 12 commits AWS_SECRET_ACCESS_KEY=..." is destroyed by redaction
+        // exactly when it matters most. This is the only unredacted log body.
         logBody: item.review
       });
     }
@@ -487,7 +493,8 @@ function recordItem(state, item, lifecycle, threadId = null) {
           : `Reasoning summary captured: ${shorten(nextSections[0], 96)}`,
         stderrMessage: null,
         logTitle: sourceLabel ? `Subagent ${sourceLabel} reasoning summary` : "Reasoning summary",
-        logBody: nextSections.map((section) => `- ${section}`).join("\n")
+        // Reasoning is intermediate too: it quotes what the model read.
+        logBody: sanitizeModelText(nextSections.map((section) => `- ${section}`).join("\n"))
       });
     }
     return;
