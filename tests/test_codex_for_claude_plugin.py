@@ -8866,6 +8866,39 @@ def test_codex_sanitizer_fails_closed_on_malformed_and_compound_values():
     assert "SECRET9" not in payload["wrappedCookie"]
 
 
+def test_codex_sanitizer_fails_closed_on_unterminated_and_forged_markers():
+    # Four shapes found by adversarial review, all of which rendered as redacted
+    # while still carrying the value -- the failure mode that matters most,
+    # because a reader who sees `[secret]` stops checking.
+    #
+    #   API_KEY="\\nSECRET       unterminated quote: stopping at the newline left
+    #                           the value on the FOLLOWING line
+    #   API_KEY=[secret]SECRET   a forged marker parsed as a complete bracketed
+    #                           value, so redaction replaced `[secret]` with
+    #                           `[secret]` -- a no-op -- and kept the tail. A
+    #                           chunk boundary produces this shape too.
+    #   {"API KEY": "SECRET"}    a quoted key may hold a space; the key scan
+    #                           stopped there and skipped the assignment
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          unterminatedQuote: sanitizeModelText('API_KEY="\\nSECRETVALUE1'),
+          forgedMarker: sanitizeModelText('API_KEY=[secret]SECRETVALUE2'),
+          spacedKey: sanitizeModelText('{"API KEY": "SECRETVALUE3"}'),
+          unterminatedBrace: sanitizeModelText('API_KEY={\\nSECRETVALUE4'),
+          // The genuine marker must still be treated as already redacted.
+          idempotent: sanitizeModelText(sanitizeModelText('API_KEY=abc123')),
+        }));
+        """
+    )
+    for name, value in payload.items():
+        if name == "idempotent":
+            continue
+        assert "SECRETVALUE" not in value, f"{name} leaked: {value!r}"
+    assert payload["idempotent"] == "API_KEY=[secret]"
+
+
 def test_codex_sanitizer_is_linear_in_whitespace_runs():
     # The THIRD distinct quadratic found in this file, each through a different
     # door: a greedy prefix in the key pattern, a growing prefix slice per

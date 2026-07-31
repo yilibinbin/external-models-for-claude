@@ -2,11 +2,17 @@
 //
 // This module recognises credential SHAPES. Its coverage is therefore
 // enumerable, and an enumerable list is never complete: adversarial review of
-// this file found new bypasses in four consecutive rounds -- long key names,
+// this file found new bypasses in FIVE consecutive rounds -- long key names,
 // quoted keys, auth schemes it had not listed, unterminated quotes, structured
 // values, braces inside strings, PEM headers longer than the window it
-// inspected. Each was real and each was fixed; the point is that the sequence
-// did not end because it cannot.
+// inspected, forged `[secret]` markers, keys containing spaces. Each was real
+// and each was fixed; the point is that the sequence did not end because it
+// cannot.
+//
+// Threat model, stated so the limits are judged against the right bar: this
+// defends against ACCIDENTAL exposure -- a review quoting a config file, a
+// stack trace carrying an env dump. It does NOT defend against a producer
+// deliberately shaping output to evade it. Nothing shape-based can.
 //
 // So it must never be the ONLY thing standing between child output and a sink.
 // Where a structural bound exists, that bound is the defence and this is a
@@ -111,8 +117,16 @@ function isSensitiveKey(key) {
 // Keeps redaction idempotent: `summary` is now sanitized at the job-state
 // chokepoint on top of call sites that already sanitize, so a second pass must
 // be a no-op rather than nesting markers.
-function isRedactedValue(value) {
-  return value === REDACTED;
+function isRedactedValue(text, value, endIndex) {
+  if (value !== REDACTED) {
+    return false;
+  }
+  // The marker must be the WHOLE value. `API_KEY=[secret]leftover` otherwise
+  // skipped the assignment as already-handled and left `leftover` in place --
+  // which is also what a chunk boundary produces when a partial value is
+  // redacted and its remainder arrives in the next event.
+  const next = text[endIndex];
+  return next === undefined || /[\s"'`,;}\]]/.test(next);
 }
 
 const ANSI_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
@@ -147,16 +161,22 @@ function readKeyBefore(text, end, floor) {
     cursor -= 1;
   }
   const keyEnd = cursor;
+  if (closingQuote) {
+    // A quoted key may hold anything but its own quote -- `{"API KEY": ...}` is
+    // ordinary JSON, and a KEY_CHAR-only scan stopped at the space and skipped
+    // the assignment. Bounded to the line so this stays linear.
+    while (cursor > floor && text[cursor - 1] !== closingQuote && text[cursor - 1] !== "\n") {
+      cursor -= 1;
+    }
+    if (cursor === keyEnd || cursor === floor || text[cursor - 1] !== closingQuote) {
+      return null;
+    }
+    return text.slice(cursor, keyEnd);
+  }
   while (cursor > floor && KEY_CHAR.test(text[cursor - 1])) {
     cursor -= 1;
   }
-  if (cursor === keyEnd) {
-    return null;
-  }
-  if (closingQuote && !(cursor > floor && text[cursor - 1] === closingQuote)) {
-    return null;
-  }
-  return text.slice(cursor, keyEnd);
+  return cursor === keyEnd ? null : text.slice(cursor, keyEnd);
 }
 
 function spanTo(text, index, end) {
@@ -202,9 +222,9 @@ function readBalancedValue(text, index) {
       }
     }
   }
-  // Unbalanced: fail closed on the rest of the line rather than leak the tail.
-  const lineEnd = text.indexOf("\n", index);
-  return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
+  // Unbalanced: fail closed on the remainder for the same reason an unterminated
+  // quote does -- a line boundary is not the end of an unclosed structure.
+  return spanTo(text, index, text.length);
 }
 
 function readValueAt(text, index, key) {
@@ -218,13 +238,22 @@ function readValueAt(text, index, key) {
   // the bare rule cannot START on a quote, so the value fell through untouched.
   // A truncated provider error is exactly this shape. Fail closed on the line.
   if (QUOTE_CHARS.has(text[index])) {
-    const lineEnd = text.indexOf("\n", index);
-    return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
+    // Unterminated quoted value. Stopping at the newline left the actual secret
+    // on the FOLLOWING line while the output read as redacted, so fail closed on
+    // the remainder: the value opened and never closed, so everything after it
+    // is plausibly the value.
+    return spanTo(text, index, text.length);
   }
 
+  // Only accept a balanced span when it ENDS the value. `API_KEY=[secret]leftover`
+  // otherwise parsed `[secret]` as the whole value, replaced it with `[secret]`
+  // -- a no-op -- and left `leftover` in place, reading as redacted.
   const balanced = readBalancedValue(text, index);
   if (balanced) {
-    return balanced;
+    const after = text[index + balanced.length];
+    if (after === undefined || /[\s"'`,;]/.test(after)) {
+      return balanced;
+    }
   }
 
   // Tested against the text directly rather than a fixed-width slice: a 32-char
@@ -271,7 +300,7 @@ function redactAssignedValues(text) {
 
     const separatorEnd = match.index + match[0].length;
     const found = readValueAt(text, separatorEnd, key);
-    if (!found || isRedactedValue(found.value)) {
+    if (!found || isRedactedValue(text, found.value, separatorEnd + found.length)) {
       continue;
     }
 
