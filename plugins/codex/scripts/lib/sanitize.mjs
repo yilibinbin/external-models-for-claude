@@ -1,3 +1,22 @@
+// BEST-EFFORT REDACTION. Read this before relying on it.
+//
+// This module recognises credential SHAPES. Its coverage is therefore
+// enumerable, and an enumerable list is never complete: adversarial review of
+// this file found new bypasses in four consecutive rounds -- long key names,
+// quoted keys, auth schemes it had not listed, unterminated quotes, structured
+// values, braces inside strings, PEM headers longer than the window it
+// inspected. Each was real and each was fixed; the point is that the sequence
+// did not end because it cannot.
+//
+// So it must never be the ONLY thing standing between child output and a sink.
+// Where a structural bound exists, that bound is the defence and this is a
+// second layer: the raw stderr payload field is deleted rather than redacted,
+// the rendered fence is gated on failure rather than scrubbed, stderr is never
+// returned as the answer, and job state is written 0600.
+//
+// The channels that have no structural backstop -- the job `summary`, progress
+// lines, the stop-gate reason -- are the ones where this file's limits are the
+// system's limits. Treat a new bypass there as expected, not as a surprise.
 import { redactMachinePaths } from "./path-hygiene.mjs";
 
 // Secret shapes worth redacting from Codex-derived text before it is persisted
