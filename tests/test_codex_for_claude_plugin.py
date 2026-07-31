@@ -8835,6 +8835,50 @@ def test_codex_sanitizer_redacts_whole_header_and_pem_values():
     assert "SECONDLINE" not in payload["pem"]
 
 
+def test_codex_sanitizer_fails_closed_on_malformed_and_compound_values():
+    # Three shapes that produced output LOOKING redacted while still carrying the
+    # credential -- worse than no redaction, because a reader stops checking.
+    #
+    #   PASSWORD="HUNTER2               unterminated quote: the quoted rule needs a
+    #                                   closing delimiter and the bare rule cannot
+    #                                   start on a quote, so nothing matched
+    #   credentials={"value":"..."}     bare rule stopped at the first inner quote
+    #   AUTHORIZATION_HEADER=Bearer x   sensitive by substring, but whole-line
+    #                                   handling used endsWith and excluded it
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {
+          unterminated: sanitizeModelText('PASSWORD="HUNTER2'),
+          compound: sanitizeModelText('credentials={"value":"TOPSECRET"}'),
+          wrappedAuth: sanitizeModelText('AUTHORIZATION_HEADER=Bearer eyJhbGciXYZ'),
+          wrappedCookie: sanitizeModelText('COOKIE_HEADER=a=1; session=SECRET9'),
+        };
+        // A second pass must not resurrect anything either.
+        out.compoundTwice = sanitizeModelText(out.compound);
+        console.log(JSON.stringify(out));
+        """
+    )
+    assert "HUNTER2" not in payload["unterminated"]
+    assert "TOPSECRET" not in payload["compound"]
+    assert "TOPSECRET" not in payload["compoundTwice"]
+    assert "eyJhbGciXYZ" not in payload["wrappedAuth"]
+    assert "SECRET9" not in payload["wrappedCookie"]
+
+
+def test_codex_reasoning_summary_is_redacted_where_it_is_stored():
+    # The reasoning array is rendered verbatim by both review renderers and
+    # persisted into the payload and the job sidecar. Sanitizing only the
+    # progress-log copy left the original reachable through --json, the job log
+    # and /codex:result.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert re.search(
+        r"mergeReasoningSections\(\s*state\.reasoningSummary,\s*nextSections\.map\("
+        r"\(section\) => sanitizeModelText\(section\)\)",
+        source,
+    ), "reasoning sections must be redacted where they are stored, not only when logged"
+
+
 def test_codex_stderr_discard_state_survives_chunk_boundaries():
     # Dropping an overlong line once is not enough. stderr arrives in arbitrary
     # chunks, so the REMAINDER of the same physical line lands in the next data

@@ -484,7 +484,14 @@ function recordItem(state, item, lifecycle, threadId = null) {
 
   if (item.type === "reasoning" && lifecycle === "completed") {
     const nextSections = extractReasoningSections(item.summary);
-    state.reasoningSummary = mergeReasoningSections(state.reasoningSummary, nextSections);
+    // Redact where the sections are STORED, not only on the progress copy. The
+    // raw array is rendered verbatim by both review renderers and persisted into
+    // the payload and the job sidecar, so sanitizing the log copy alone left the
+    // original reachable through --json, the job log and /codex:result.
+    state.reasoningSummary = mergeReasoningSections(
+      state.reasoningSummary,
+      nextSections.map((section) => sanitizeModelText(section))
+    );
     if (nextSections.length > 0) {
       const sourceLabel = labelForThread(state, threadId);
       emitLogEvent(state.onProgress, {

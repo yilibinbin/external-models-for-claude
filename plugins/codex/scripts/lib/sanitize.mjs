@@ -70,9 +70,13 @@ const PEM_END = /-----END [A-Z ]*-----/;
 
 const REDACTED = "[secret]";
 
+// `includes`, not `endsWith`: AUTHORIZATION_HEADER and COOKIE_HEADER are
+// sensitive by the same substring rule, but an endsWith test excluded them from
+// whole-line handling, so only the scheme word was taken and the credential
+// suffix survived behind a `[secret]` that read as complete.
 function isLineValuedKey(key) {
   const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
-  return LINE_VALUED_KEYS.some((name) => normalized.endsWith(name));
+  return LINE_VALUED_KEYS.some((name) => normalized.includes(name));
 }
 
 function isSensitiveKey(key) {
@@ -135,11 +139,51 @@ function spanTo(text, index, end) {
   return { value: text.slice(index, end), quote: "", length: end - index };
 }
 
+// Consumes a `{...}` / `[...]` value through its matching close, so a structured
+// credential is taken whole. Without this the bare rule stopped at the first
+// quote inside the braces and produced `credentials=[secret]"value":"TOPSECRET"}`
+// -- redacted-looking, still leaking, and stable across a second pass.
+function readBalancedValue(text, index) {
+  const OPEN = { "{": "}", "[": "]" };
+  const closer = OPEN[text[index]];
+  if (!closer) {
+    return null;
+  }
+  let depth = 0;
+  for (let cursor = index; cursor < text.length; cursor += 1) {
+    const char = text[cursor];
+    if (char === text[index]) {
+      depth += 1;
+    } else if (char === closer) {
+      depth -= 1;
+      if (depth === 0) {
+        return spanTo(text, index, cursor + 1);
+      }
+    }
+  }
+  // Unbalanced: fail closed on the rest of the line rather than leak the tail.
+  const lineEnd = text.indexOf("\n", index);
+  return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
+}
+
 function readValueAt(text, index, key) {
   QUOTED_VALUE.lastIndex = index;
   const quoted = QUOTED_VALUE.exec(text);
   if (quoted) {
     return { value: quoted[2], quote: quoted[1], length: quoted[0].length };
+  }
+
+  // An opening quote with no closing delimiter: the quoted rule cannot match and
+  // the bare rule cannot START on a quote, so the value fell through untouched.
+  // A truncated provider error is exactly this shape. Fail closed on the line.
+  if (QUOTE_CHARS.has(text[index])) {
+    const lineEnd = text.indexOf("\n", index);
+    return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
+  }
+
+  const balanced = readBalancedValue(text, index);
+  if (balanced) {
+    return balanced;
   }
 
   const rest = text.slice(index, index + 32);
