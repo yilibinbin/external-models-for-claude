@@ -45,13 +45,15 @@ fh.5 re-validation (2026-07-22): `claude plugin validate --strict .claude-plugin
 
 fh.6 re-validation (2026-07-31): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.6` manifests and both exited 0 ("Validation passed"), as did `plugins/review-chain` at `0.1.2`. The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold; the shipping values are the ones under "Current version axis" below.
 
+fh.7 re-validation (2026-07-31): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.7` manifests and both exited 0 ("Validation passed"). The axis flags still hold; the shipping values are the ones under "Current version axis" below.
+
 ## Current version axis
 
-These are the values that ship today, each verified by the fh.6 re-validation above.
+These are the values that ship today, each verified by the fh.7 re-validation above.
 
 - Marketplace metadata version: `0.5.0`
-- Codex marketplace entry version: `1.1.0-fh.6`
-- Codex plugin manifest version: `1.1.0-fh.6`
+- Codex marketplace entry version: `1.1.0-fh.7`
+- Codex plugin manifest version: `1.1.0-fh.7`
 
 The marketplace metadata version is no longer pinned inside this plugin (see the `1.1.0-fh.5`
 changelog entry): pinning it here made every marketplace bump edit codex's shipped bytes under

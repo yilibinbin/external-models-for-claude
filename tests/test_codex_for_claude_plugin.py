@@ -428,7 +428,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.6" in notices
+    assert "Local extended version: 1.1.0-fh.7" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -9541,3 +9541,34 @@ def test_codex_run_command_lets_callers_opt_out_of_the_shell():
     assert "shell: options.shell ??" in process_lib
     # The Windows default must survive for the .cmd-shim spawns.
     assert 'process.platform === "win32" ? (process.env.SHELL || true) : false' in process_lib
+
+
+def test_codex_review_summary_is_sanitized_on_every_branch():
+    """All three summary branches must redact, not just the fallback.
+
+    `firstMeaningfulLine` carries a comment explaining exactly why: the summary is
+    persisted into job state and re-displayed by `/codex:status` and `/codex:result`.
+    But the multi-review call site selects it only as the LAST of three options —
+
+        summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(...)
+
+    so a model-authored `summary` field, and a `JSON.parse` error (which quotes the
+    offending bytes verbatim), both bypass redaction. The sibling call sites at the
+    native-review and task paths route through `firstMeaningfulLine` and are covered.
+
+    This is a missing call, not a pattern gap: the probe credential below IS matched by
+    the existing patterns wherever they actually run.
+    """
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+
+    # Locate the three-way summary selection and require it to be wrapped.
+    idx = companion.index("parsed.parsed?.summary")
+    # The wrapper may sit on the preceding line, so look at the whole expression.
+    expr_start = companion.rindex("summary:", 0, idx)
+    expr_end = companion.index("\n", idx)
+    summary_expr = companion[expr_start:expr_end]
+
+    assert "sanitizeModelText(" in summary_expr, (
+        "the model-authored summary and the parse-error branch reach persisted job state "
+        f"unredacted:\n  {summary_line.strip()}"
+    )

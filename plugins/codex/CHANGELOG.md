@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0-fh.7
+
+- Redact the review summary on every branch, not only the fallback. The multi-review call site selected it as `parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(...)`, so a model-authored `summary` field and a `JSON.parse` error both bypassed the redaction that `firstMeaningfulLine` applies — while the native-review and task call sites, which route through it, were covered. The summary is persisted into job state and re-displayed by `/codex:status` and `/codex:result`, which is the reason that redaction exists. This was a missing call, not a pattern gap: the probe credential is matched by the existing patterns wherever they actually run.
+
 ## 1.1.0-fh.6
 
 - Adopt upstream `db52e28`: pin `shell: false` on the `git()`/`gitChecked()` wrappers and let `runCommand` honour `options.shell`. `detectDefaultBranch` returns whatever `refs/remotes/origin/HEAD` points at, unvalidated, and that string reaches git argv at `["merge-base", "HEAD", baseRef]`; on Windows the spawn interposed a shell, and `git check-ref-format` bans spaces but not `&`, `|`, backticks or `$()`, so a cloned repository's default branch name was a command injection there. Unreachable on darwin/linux, where the platform ternary already evaluated to `false`. The opt-in shape is deliberate: `runCommand` also spawns the `npm`/`codex` `.cmd` shims, which Windows cannot launch without a shell.

@@ -533,7 +533,13 @@ async function executeReviewRun(request) {
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    // All three branches are persisted and re-displayed, so all three must be
+    // redacted — see firstMeaningfulLine. The first is model-authored text and the
+    // second is a JSON.parse error, which quotes the offending bytes verbatim;
+    // only the fallback was covered before.
+    summary: sanitizeModelText(
+      parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`)
+    ),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
