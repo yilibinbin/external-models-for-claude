@@ -290,7 +290,7 @@ function main() {
 
 function handleHookException(error) {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${sanitizeModelText(`[codex review-gate] failed: ${message}`)}\n`);
+  process.stderr.write(`${boundReason(sanitizeModelText(`[codex review-gate] failed: ${message}`))}\n`);
   let config = activeGateConfig;
   if (!config) {
     try {
@@ -304,7 +304,7 @@ function handleHookException(error) {
       );
     } catch (configError) {
       const configMessage = configError instanceof Error ? configError.message : String(configError);
-      process.stderr.write(`${sanitizeModelText(`[codex review-gate] could not determine gate config; allowing Stop: ${configMessage}`)}\n`);
+      process.stderr.write(`${boundReason(sanitizeModelText(`[codex review-gate] could not determine gate config; allowing Stop: ${configMessage}`))}\n`);
       return;
     }
   }

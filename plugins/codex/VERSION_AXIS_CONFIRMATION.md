@@ -43,11 +43,11 @@ fh.4 re-validation (2026-07-12): `claude plugin validate --strict .claude-plugin
 
 fh.5 re-validation (2026-07-22): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.5` manifests and both exited 0 ("Validation passed"). What this re-run verifies for fh.5 — rather than inheriting from fh.4 — is the axis itself: `marketplaceEntryVersionSupported: true` and `validatorUnavailable: false` still hold, and the values now shipping are the ones under "Current version axis" below. The `(original probe)` lines above remain historical and are not re-asserted here.
 
-fh.6 re-validation (2026-07-31): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.7` manifests and both exited 0 ("Validation passed"), as did `plugins/review-chain` at `0.1.2`. The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold; the shipping values are the ones under "Current version axis" below.
+fh.7 re-validation (2026-07-31): `claude plugin validate --strict .claude-plugin/marketplace.json` and `claude plugin validate --strict plugins/codex` were re-run against the bumped `1.1.0-fh.7` manifests and both exited 0 ("Validation passed"), as did `plugins/review-chain` at `0.1.2`. The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold; the shipping values are the ones under "Current version axis" below.
 
 ## Current version axis
 
-These are the values that ship today, each verified by the fh.6 re-validation above.
+These are the values that ship today, each verified by the fh.7 re-validation above.
 
 - Marketplace metadata version: `0.5.0`
 - Codex marketplace entry version: `1.1.0-fh.7`

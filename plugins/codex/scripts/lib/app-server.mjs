@@ -43,7 +43,8 @@ export const MAX_CAPTURED_STDERR_BYTES = 64 * 1024;
 // than the whole cap and there is no safe place to cut it, so it is dropped
 // entirely rather than kept headless.
 export function appendBoundedStderr(state, chunk) {
-  const previous = typeof state === "string" ? { text: state, discarding: false } : state;
+  const previous =
+    state && typeof state === "object" ? state : { text: typeof state === "string" ? state : "", discarding: false };
   let incoming = String(chunk ?? "");
 
   if (previous.discarding) {
