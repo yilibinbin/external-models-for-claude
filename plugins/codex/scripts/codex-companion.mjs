@@ -10,6 +10,7 @@ import { parseArgs, normalizeArgv } from "./lib/args.mjs";
 import { parseStrictCommandInput } from "./lib/command-policy.mjs";
 import { KNOWN_EFFORTS } from "./lib/effort-policy.mjs";
 import {
+    buildFailureMessage,
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
@@ -500,7 +501,7 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, buildAdversarialReviewTurnOptions(context, request, focusText));
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
-    failureMessage: result.error?.message ?? result.stderr
+    failureMessage: buildFailureMessage(result.error, result.stderr)
   });
   const payload = {
     review: reviewName,
@@ -581,7 +582,7 @@ async function executeTaskRun(request) {
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
-  const failureMessage = result.error?.message ?? result.stderr ?? "";
+  const failureMessage = buildFailureMessage(result.error, result.stderr);
   const rendered = renderTaskResult(
     {
       rawOutput,

@@ -39,18 +39,39 @@ import { resolveTurnEffort } from "./effort-policy.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { sanitizeModelText } from "./sanitize.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 
-function cleanCodexStderr(stderr) {
-  return stderr
+// The single capture boundary for the child's diagnostic channel.
+//
+// Nobody ran a command to read stderr -- unlike the review text, it is exhaust,
+// so it can be redacted hard with no loss of anything the user asked for. Doing
+// it here rather than at each sink is deliberate: this is the one function both
+// stderr readers already pass through, and every downstream sink (the rendered
+// fence, the job sidecar, the job log, `parseError`) derives from this value.
+export function captureDiagnosticStderr(stderr) {
+  const cleaned = String(stderr ?? "")
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter((line) => line && !line.startsWith("WARNING: proceeding, even though we could not update PATH:"))
     .join("\n");
+  return sanitizeModelText(cleaned);
+}
+
+// `result.error?.message ?? result.stderr` short-circuits, so when an error
+// message is present the stderr branch -- and with it captureDiagnosticStderr --
+// never runs. The error message is child-supplied (a JSON-RPC error quotes the
+// offending payload), so it needs the same treatment as the branch it displaces.
+export function buildFailureMessage(error, stderr) {
+  const message = error?.message;
+  if (typeof message === "string" && message) {
+    return sanitizeModelText(message);
+  }
+  return captureDiagnosticStderr(stderr ?? "");
 }
 
 /** @returns {ThreadStartParams} */
@@ -968,7 +989,7 @@ export async function runAppServerReview(cwd, options = {}) {
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr)
+      stderr: captureDiagnosticStderr(client.stderr)
     };
   });
 }
@@ -1093,7 +1114,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr),
+      stderr: captureDiagnosticStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions

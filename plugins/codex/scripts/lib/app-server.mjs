@@ -16,6 +16,23 @@ import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
+// Cap the captured stderr as it ARRIVES, not when it is read. The process
+// hosting a SpawnedCodexAppServerClient is long-lived -- in the default broker
+// topology it backs the whole session -- so an unbounded accumulator grows for
+// as long as the child keeps writing. Bounding on read cannot help: by then the
+// full string is already realized and about to be regex-scanned in one pass.
+//
+// The tail is kept because that is where a crash explains itself; the head is
+// what gets dropped.
+export const MAX_CAPTURED_STDERR_BYTES = 64 * 1024;
+
+export function appendBoundedStderr(buffer, chunk) {
+  const combined = `${buffer}${chunk}`;
+  return combined.length <= MAX_CAPTURED_STDERR_BYTES
+    ? combined
+    : combined.slice(combined.length - MAX_CAPTURED_STDERR_BYTES);
+}
+
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 
@@ -237,7 +254,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stderr.setEncoding("utf8");
 
     this.proc.stderr.on("data", (chunk) => {
-      this.stderr += chunk;
+      this.stderr = appendBoundedStderr(this.stderr, chunk);
     });
 
     this.proc.on("error", (error) => {

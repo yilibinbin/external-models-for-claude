@@ -8662,6 +8662,197 @@ def test_codex_summary_is_sanitized():
     assert "AB" in output
 
 
+def test_codex_sanitizer_has_no_key_length_cliff():
+    # Panel consensus (Claude C2 / Gemini G4 / Codex X5): a bounded-prefix pattern
+    # anchored with a lookbehind fails SILENTLY once the key name outgrows the
+    # bound -- no start position satisfies the lookbehind, so no match is even
+    # attempted. Measured on the rejected candidate: matched at a 60-char prefix,
+    # TOTAL BYPASS at 64 and beyond. Deeply-namespaced enterprise env names
+    # (ACME_PLATFORM_INTERNAL_SERVICE_API_KEY) live exactly in that range, so the
+    # sanitizer must not have a cliff at ANY length.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const n of [10, 60, 64, 120, 400]) {
+          const key = 'A'.repeat(n) + '_API_KEY';
+          out['n' + n] = sanitizeModelText(key + '=xyz123secretvalue');
+        }
+        console.log(JSON.stringify(out));
+        """
+    )
+    for key, redacted in payload.items():
+        assert "xyz123secretvalue" not in redacted, f"{key} leaked the value"
+        assert "[secret]" in redacted, f"{key} was not redacted"
+
+
+def test_codex_sanitizer_covers_credential_keys_without_a_listed_keyword():
+    # Panel consensus: `summary` and the progress channel get NO structural
+    # backstop, so the redactor IS the whole defence there -- its key policy is
+    # load-bearing. These three key names contain none of the original keywords
+    # (api_key|token|secret|password|passwd|pwd) and leaked verbatim on main.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const cases = {
+          db: 'DATABASE_URL=postgres://alice:s3cr3tpw@db.internal/app',
+          cookie: 'SESSION_COOKIE=abc123def456ghi789',
+          pkey: 'PRIVATE_KEY=MIIEvQIBADANBgkqhkiG9w0BAQ',
+          aws: 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG',
+        };
+        const out = {};
+        for (const [k, v] of Object.entries(cases)) out[k] = sanitizeModelText(v);
+        console.log(JSON.stringify(out));
+        """
+    )
+    assert "s3cr3tpw" not in payload["db"]
+    assert "abc123def456ghi789" not in payload["cookie"]
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQ" not in payload["pkey"]
+    assert "wJalrXUtnFEMI" not in payload["aws"]
+    for name, redacted in payload.items():
+        assert "[secret]" in redacted, f"{name} was not redacted"
+
+
+def test_codex_sanitizer_stays_idempotent_and_linear():
+    # Two properties that sank earlier attempts at this same fix, locked together
+    # because the fix trades one off against the other:
+    #  - idempotence: tracked-jobs now sanitizes `summary` on top of call sites
+    #    that already sanitize, so a second pass must be a no-op.
+    #  - linearity: an earlier revision shipped a greedy `[\\w.-]*` prefix that
+    #    backtracked quadratically (3946 ms on 40 KB) INSIDE an exit handler.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const shapes = [
+          '{"token": "abc123"}',
+          'token = abc123',
+          'AWS_SECRET_ACCESS_KEY=wJalr',
+          'found token=x in cfg',
+          '"api_key":"sk-1"',
+          'password: "p@ss"',
+        ];
+        const notIdempotent = shapes.filter((s) => {
+          const once = sanitizeModelText(s);
+          return sanitizeModelText(once) !== once;
+        });
+        const adversarial = ('A'.repeat(300) + '_API_KEY ').repeat(400);
+        const started = process.hrtime.bigint();
+        sanitizeModelText(adversarial);
+        const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+        console.log(JSON.stringify({ notIdempotent, elapsedMs, bytes: adversarial.length }));
+        """
+    )
+    assert payload["notIdempotent"] == []
+    assert payload["bytes"] > 100_000
+    # Generous ceiling: the point is linear-vs-quadratic, not a micro-benchmark.
+    # The rejected greedy variant took 3946 ms on a tenth of this input.
+    assert payload["elapsedMs"] < 500, f"redaction took {payload['elapsedMs']}ms"
+
+
+def test_codex_sanitizer_preserves_non_secret_text():
+    # The anti-over-correction guard. The panel's central conflict was whether
+    # model-authored text may be rewritten at all; the settlement keeps the
+    # deliverable intact and redacts only values. A key policy broad enough to
+    # catch DATABASE_URL must still not eat ordinary prose or code.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'const timeout = 30',
+          'status: ok',
+          'Found 3 issues in src/app.ts',
+          'let keyboard = 1',
+          'version=1.2.3',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, result in payload.items():
+        assert result == original, f"over-redacted: {original!r} -> {result!r}"
+
+
+def test_codex_stderr_is_bounded_during_accumulation_not_after():
+    # Panel consensus (Gemini G3 primary + Codex X3): bounding stderr only when
+    # it is READ leaves the unbounded string fully realized in memory and fully
+    # regex-scanned first. It must be bounded as it ARRIVES.
+    #
+    # This matters most on the default path: BrokerCodexAppServerClient inherits
+    # `this.stderr = ""` and never accumulates, while the SpawnedCodexAppServerClient
+    # backing the broker process keeps appending for the whole session -- so a
+    # read-side cap is a no-op exactly where the growth happens.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        let buffer = '';
+        // 4 MB arriving in realistic chunks.
+        for (let i = 0; i < 4096; i += 1) buffer = appendBoundedStderr(buffer, 'x'.repeat(1024));
+        const tailMarker = 'TAIL_MARKER_KEPT';
+        buffer = appendBoundedStderr(buffer, tailMarker);
+        console.log(JSON.stringify({
+          length: buffer.length,
+          cap: MAX_CAPTURED_STDERR_BYTES,
+          keepsTail: buffer.endsWith(tailMarker),
+        }));
+        """
+    )
+    assert payload["length"] <= payload["cap"], "buffer grew past the cap while accumulating"
+    # The tail is what diagnoses a crash; the head is what gets dropped.
+    assert payload["keepsTail"] is True
+
+
+def test_codex_diagnostic_stderr_is_redacted_at_the_capture_boundary():
+    # Panel consensus: `cleanCodexStderr` is the one seam both stderr readers
+    # (codex.mjs:971 and :1096) already pass through, so redaction belongs there
+    # rather than at each of the downstream sinks -- a sink-side fix needs N call
+    # sites and silently regresses when an N+1th is added, which is exactly how
+    # the `summary` bypass came to exist.
+    payload = run_node_script(
+        """
+        import { captureDiagnosticStderr } from './plugins/codex/scripts/lib/codex.mjs';
+        const raw = [
+          'WARNING: proceeding, even though we could not update PATH: /opt/bin',
+          'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG',
+          'tracing enabled',
+        ].join('\\n');
+        console.log(JSON.stringify({ cleaned: captureDiagnosticStderr(raw) }));
+        """
+    )
+    cleaned = payload["cleaned"]
+    assert "wJalrXUtnFEMIK7MDENG" not in cleaned
+    assert "[secret]" in cleaned
+    # The pre-existing PATH-warning filter is preserved.
+    assert "WARNING: proceeding" not in cleaned
+    # Genuine diagnostics survive -- the point of keeping the channel at all.
+    assert "tracing enabled" in cleaned
+
+
+def test_codex_failure_message_redacts_the_error_branch_too():
+    # Codex X2, confirmed by Gemini and reproduced by the broker: in
+    # `result.error?.message ?? result.stderr` the `??` SHORT-CIRCUITS, so when an
+    # error message is present `result.stderr` is never evaluated and the capture
+    # boundary never runs. The design's claim that this chain needs no change
+    # ("the value is already redacted") was false for the error branch.
+    payload = run_node_script(
+        """
+        import { buildFailureMessage } from './plugins/codex/scripts/lib/codex.mjs';
+        console.log(JSON.stringify({
+          fromError: buildFailureMessage(
+            { message: 'rpc failed: DATABASE_URL=postgres://u:p4ssw0rd@h/db' },
+            'unused stderr',
+          ),
+          fromStderr: buildFailureMessage(null, 'GITHUB_TOKEN=ghp_AAAABBBBCCCCDDDD'),
+          neither: buildFailureMessage(null, ''),
+        }));
+        """
+    )
+    assert "p4ssw0rd" not in payload["fromError"]
+    assert "[secret]" in payload["fromError"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in payload["fromStderr"]
+    assert payload["neither"] == ""
+
+
 # ===== effort-policy.mjs (codex intelligence-tier capability adaptation, spec v6) =====
 
 def _run_effort_policy(body):
