@@ -50,7 +50,12 @@ const DEFAULT_CAPABILITIES = {
 
 // Render a structured exit reason into text. The inputs are validated to a tiny
 // alphabet on the receiving side, so this can never become a channel for child bytes.
+const PROTOCOL_EXIT_REASONS = new Set(["malformed-output"]);
+
 function describeExit(reason) {
+  if (reason?.protocol && PROTOCOL_EXIT_REASONS.has(reason.protocol)) {
+    return `protocol error: ${reason.protocol}`;
+  }
   if (reason?.signal) {
     return `signal ${reason.signal}`;
   }
@@ -173,6 +178,11 @@ class AppServerClientBase {
     try {
       message = JSON.parse(line);
     } catch (error) {
+      // A protocol death resolves exitPromise right here, BEFORE the child's 'exit'
+      // event fires, so the reason must be recorded now or the broker's handler finds
+      // none and the cause is lost. It is an enum, not text: the parse Error quotes the
+      // offending child bytes, so that message must never be what travels.
+      this.exitReason = { protocol: "malformed-output" };
       this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
       return;
     }
@@ -214,7 +224,10 @@ class AppServerClientBase {
         // design exists to close.
         const { code, signal } = message.params ?? {};
         const reason = {};
-        if (typeof signal === "string" && /^[A-Z][A-Z0-9]*$/.test(signal)) {
+        const { protocol } = message.params ?? {};
+        if (typeof protocol === "string" && PROTOCOL_EXIT_REASONS.has(protocol)) {
+          reason.protocol = protocol;
+        } else if (typeof signal === "string" && /^[A-Z][A-Z0-9]*$/.test(signal)) {
           reason.signal = signal;
         } else if (Number.isInteger(code)) {
           reason.code = code;

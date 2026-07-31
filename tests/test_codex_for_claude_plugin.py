@@ -9715,3 +9715,74 @@ def test_codex_broker_exit_notification_ignores_free_text():
     broker = read_text(PLUGIN / "scripts" / "app-server-broker.mjs")
     assert "exitError?.message" not in broker
     assert "params: reason" in broker
+
+
+def test_codex_broker_propagates_protocol_death_reason(tmp_path):
+    """A protocol death must also carry a reason across the broker.
+
+    Malformed JSONL calls handleExit() directly (app-server.mjs:176), which resolves
+    exitPromise BEFORE the child's 'exit' event fires — and 'exit' is the only place the
+    structured reason was assigned. The broker's exitPromise handler therefore saw no
+    reason, sent no notification, and tore the sockets down, leaving a streaming turn
+    with the generic "connection closed" again.
+
+    The reason must also stay structured: the parse-failure Error embeds the offending
+    child bytes, so it must never be what travels.
+    """
+    marker = "PROTOCOL_DEATH_CHILD_BYTES"
+    server_js = (
+        "import readline from 'node:readline';\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "const send = (m) => console.log(JSON.stringify(m));\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const m = JSON.parse(line);\n"
+        "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+        "  send({ id: m.id, result: {} });\n"
+        f"  if (m.method === 'thread/start') {{ console.log('{marker} not-json at all'); }}\n"
+        "});\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    session_dir = pathlib.Path(tempfile.mkdtemp(prefix="cxc-proto-"))
+    try:
+        endpoint = f"unix:{session_dir / 'broker.sock'}"
+        log_file = session_dir / "broker.log"
+        with open(log_file, "w", encoding="utf8") as log_fd:
+            proc = subprocess.Popen(
+                [NODE, str(PLUGIN / "scripts" / "app-server-broker.mjs"), "serve",
+                 "--endpoint", endpoint, "--cwd", str(bin_dir)],
+                cwd=str(bin_dir),
+                env={**os.environ, **app_server_env(tmp_path, bin_dir)},
+                stdout=log_fd, stderr=log_fd,
+            )
+        try:
+            socket_path = session_dir / "broker.sock"
+            deadline = time.time() + 15
+            while not socket_path.exists() and time.time() < deadline:
+                assert proc.poll() is None, log_file.read_text(encoding="utf8")
+                time.sleep(0.05)
+            assert socket_path.exists(), log_file.read_text(encoding="utf8")
+
+            script = (
+                "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+                "const client = await CodexAppServerClient.connect(process.argv[1], "
+                "{ brokerEndpoint: process.argv[2] });\n"
+                "await client.request('thread/start', {}).catch(() => {});\n"
+                "await Promise.race([client.exitPromise, new Promise((r) => setTimeout(r, 8000))]);\n"
+                "process.stdout.write(JSON.stringify({ exitError: client.exitError?.message ?? null }));\n"
+                "process.exit(0);\n"
+            )
+            result = run_node_inline(script, app_server_env(tmp_path, bin_dir),
+                                     args=[str(bin_dir), endpoint], timeout=45)
+            assert result.returncode == 0, result.stderr
+            message = json.loads(result.stdout)["exitError"]
+            assert message, f"no reason propagated; broker log:\n{log_file.read_text(encoding='utf8')}"
+            # A cause arrives rather than the generic close...
+            assert "connection closed" not in message, message
+            # ...and it carries none of the child's bytes.
+            assert marker not in message, message
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+    finally:
+        shutil.rmtree(session_dir, ignore_errors=True)

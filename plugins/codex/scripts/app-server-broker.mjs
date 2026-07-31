@@ -261,7 +261,7 @@ async function main() {
     // relaying it would make this socket a child-byte channel. The receiver validates
     // these fields and builds its own text.
     const reason = appClient.exitReason;
-    if (reason && (reason.signal || Number.isInteger(reason.code))) {
+    if (reason && (reason.protocol || reason.signal || Number.isInteger(reason.code))) {
       for (const socket of sockets) {
         send(socket, { method: BROKER_APP_SERVER_EXIT_METHOD, params: reason });
       }
