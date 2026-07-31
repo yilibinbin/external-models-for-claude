@@ -309,6 +309,30 @@ def _published_release_ref_pattern(plugin_source, published):
     return match.group(1)
 
 
+def _published_default_release_ref(plugin_source, published):
+    """A release ref declared as a renderer DEFAULT rather than in version.mjs.
+
+    codex has no version.mjs: its workflow template carries `{{RELEASE_REF}}` and the
+    renderer substitutes `String(value ?? "v0.2.0")`. Keying discovery on version.mjs
+    alone therefore exempted codex entirely, so a missing tag there was invisible.
+
+    Only a literal default is read — a rendered workflow can override the ref at
+    render time, and this guard is about what ships unconfigured.
+    """
+    path = f"{plugin_source.rstrip('/')}/scripts/lib/github-actions.mjs".lstrip("./")
+    listing = _git("ls-tree", "--name-only", published, "--", path)
+    if not listing:
+        return None
+    source = _git("show", f"{published}:{path}")
+    if not source:
+        raise GitUnavailable(
+            f"{published}:{path} is listed in the tree but read back empty; "
+            "the release-tag guard cannot judge this plugin"
+        )
+    match = re.search(r"""\?\?\s*["'`]([^"'`]+)["'`]\s*\)\s*\.trim\(\)""", source)
+    return match.group(1) if match else None
+
+
 def test_published_versions_have_the_release_tags_their_workflows_fetch():
     """A published version that pins a tag must have that tag, or CI cannot install it.
 
@@ -317,6 +341,18 @@ def test_published_versions_have_the_release_tags_their_workflows_fetch():
     every antigravity release before 0.1.3, so those workflows could never resolve
     it. Only versions already on the base ref are required to be tagged: a bump
     still in review is not released yet, and tagging happens after the merge.
+
+    Two limits, stated rather than papered over:
+
+    * Only the CURRENTLY published version is required to have its tag. Earlier
+      antigravity releases (0.1.0-0.1.2) also declared a ref and were never tagged, so
+      workflows rendered by them still cannot fetch. Fixing that means tagging release
+      points after the fact, which manufactures a release history that did not exist;
+      the gap is left visible instead.
+    * A tag is matched by NAME against the local tag list. That does not prove the
+      remote has it, nor that it points at the released bytes. Proving either needs
+      network access, which does not belong in a unit suite — the merge-time story for
+      that is a release step, not a test.
     """
     published = _published_ref()
     tags = _local_tags()
@@ -335,10 +371,15 @@ def test_published_versions_have_the_release_tags_their_workflows_fetch():
         name = entry["name"]
         # Resolve version.mjs from the entry's own `source`, not an assumed
         # plugins/<name> layout — the marketplace is what decides where a plugin lives.
-        pattern = _published_release_ref_pattern(entry.get("source") or f"plugins/{name}", published)
-        if pattern is None:
+        source = entry.get("source") or f"plugins/{name}"
+        pattern = _published_release_ref_pattern(source, published)
+        if pattern is not None:
+            expected = pattern.replace("${PLUGIN_VERSION}", entry["version"])
+        else:
+            # Second mechanism: a renderer default, with no version.mjs (codex).
+            expected = _published_default_release_ref(source, published)
+        if not expected:
             continue
-        expected = pattern.replace("${PLUGIN_VERSION}", entry["version"])
         if expected not in tags:
             missing[name] = expected
 
@@ -366,3 +407,28 @@ def test_marketplace_entry_versions_match_each_plugin_manifest():
             f"{name}: marketplace entry says {matching[0]['version']} but its manifest says "
             f"{_version_of(plugin_dir)}"
         )
+
+
+def test_release_ref_discovery_covers_every_declaration_mechanism():
+    """Two plugins declare a fetched ref two different ways; the guard must know both.
+
+    antigravity exports ``RELEASE_REF`` from ``scripts/lib/version.mjs``. codex has no
+    such file — its renderer defaults the ref in ``scripts/lib/github-actions.mjs``
+    (``String(value ?? "v0.2.0")``) and the workflow fetches
+    ``refs/tags/$CODEX_FOR_CLAUDE_RELEASE_REF``. Keying discovery on ``version.mjs``
+    alone silently exempted codex, so a missing ``v0.2.0`` would not have been caught.
+
+    This asserts the mechanisms themselves still exist, so that renaming or removing one
+    fails here rather than quietly shrinking what the tag check covers.
+    """
+    published = _published_ref()
+    mechanisms = {}
+    for entry in json.loads(_git("show", f"{published}:.claude-plugin/marketplace.json"))["plugins"]:
+        source = (entry.get("source") or f"plugins/{entry['name']}").rstrip("/").lstrip("./")
+        if _published_release_ref_pattern(source, published):
+            mechanisms[entry["name"]] = "version.mjs"
+        elif _published_default_release_ref(source, published):
+            mechanisms[entry["name"]] = "github-actions default"
+
+    assert mechanisms.get("antigravity-for-claude") == "version.mjs", mechanisms
+    assert mechanisms.get("codex") == "github-actions default", mechanisms
