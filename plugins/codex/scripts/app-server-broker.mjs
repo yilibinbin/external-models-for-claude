@@ -255,10 +255,15 @@ async function main() {
     // resolved, so there is no pending call left to reject — without this the outer
     // client only sees the socket close and reports the generic
     // "connection closed", losing the crash reason in the case that matters most.
-    const exitMessage = appClient.exitError?.message;
-    if (exitMessage) {
+    //
+    // Send the STRUCTURED reason, never appClient.exitError.message: that message can
+    // embed child stdout (a JSONL parse failure quotes the offending bytes), so
+    // relaying it would make this socket a child-byte channel. The receiver validates
+    // these fields and builds its own text.
+    const reason = appClient.exitReason;
+    if (reason && (reason.signal || Number.isInteger(reason.code))) {
       for (const socket of sockets) {
-        send(socket, { method: BROKER_APP_SERVER_EXIT_METHOD, params: { message: exitMessage } });
+        send(socket, { method: BROKER_APP_SERVER_EXIT_METHOD, params: reason });
       }
     }
     // Hard deadline: server.close() only settles once every client socket has

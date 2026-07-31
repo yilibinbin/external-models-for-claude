@@ -15,7 +15,6 @@ import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
-import { sanitizeModelText } from "./sanitize.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -49,52 +48,16 @@ const DEFAULT_CAPABILITIES = {
   ]
 };
 
-// Cap on how much captured child stderr is quoted back in an exit error. Enough to
-// carry the cause, small enough that a runaway child cannot blow up a job record.
-const EXIT_DIAGNOSTIC_MAX_BYTES = 2 * 1024;
-
-// How long to let stderr finish draining after the child exits before giving up on
-// a fuller diagnostic. Node only guarantees drainage at `close`, which an inherited
-// descriptor can delay indefinitely — so this is a grace period, not a wait.
-const EXIT_DRAIN_GRACE_MS = 1500;
-
-// The app-server's stderr was previously captured and then discarded on crash, so a
-// child that died mid-turn surfaced only as "exited unexpectedly (exit 1)." with the
-// reason lost — the common case being a broker-backed review. Quote the tail instead.
-// Redaction is mandatory, not cosmetic: this string reaches job records and the user,
-// and raw failure output carries local filesystem paths.
-function formatExitDiagnostic(stderr) {
-  const text = String(stderr || "");
-  if (!text.trim()) {
-    return "";
+// Render a structured exit reason into text. The inputs are validated to a tiny
+// alphabet on the receiving side, so this can never become a channel for child bytes.
+function describeExit(reason) {
+  if (reason?.signal) {
+    return `signal ${reason.signal}`;
   }
-  // Redact BEFORE truncating. Slicing first can cut a secret in half, leaving a tail
-  // that starts mid-keyword (`oken=...`) which the redaction patterns no longer match,
-  // so the value would survive into a job record.
-  const redacted = sanitizeModelText(text);
-  const cleaned = redacted
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    // Routine codex noise, filtered the same way cleanCodexStderr does in codex.mjs.
-    .filter((line) => line && !line.startsWith("WARNING: proceeding, even though we could not update PATH:"))
-    .join("\n")
-    .trim();
-  if (!cleaned) {
-    return "";
+  if (Number.isInteger(reason?.code)) {
+    return `exit ${reason.code}`;
   }
-  // Cap in BYTES, not code units: `.length` counts UTF-16 units, so 1500 CJK
-  // characters would pass a 2048 check while carrying 4500 bytes into a job record.
-  const buffer = Buffer.from(cleaned, "utf8");
-  if (buffer.length <= EXIT_DIAGNOSTIC_MAX_BYTES) {
-    return `stderr: ${cleaned}`;
-  }
-  let start = buffer.length - EXIT_DIAGNOSTIC_MAX_BYTES;
-  // Never start mid-code-point: skip UTF-8 continuation bytes (0b10xxxxxx), which
-  // would otherwise decode to U+FFFD.
-  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) {
-    start += 1;
-  }
-  return `stderr: ${buffer.subarray(start).toString("utf8")}`;
+  return "reason unknown";
 }
 
 function buildJsonRpcError(code, message, data) {
@@ -244,8 +207,20 @@ class AppServerClientBase {
     // transport event, not an app-server notification.
     if (message.method === BROKER_APP_SERVER_EXIT_METHOD) {
       if (!this.exitResolved && !this.exitError) {
+        // Only a validated code/signal is accepted, and the text is built from a local
+        // template. Any free-text field on this notification is IGNORED: the broker's
+        // own exitError can embed child stdout (a JSON parse failure quotes the
+        // offending bytes), so relaying its message would reopen the channel this
+        // design exists to close.
+        const { code, signal } = message.params ?? {};
+        const reason = {};
+        if (typeof signal === "string" && /^[A-Z][A-Z0-9]*$/.test(signal)) {
+          reason.signal = signal;
+        } else if (Number.isInteger(code)) {
+          reason.code = code;
+        }
         this.exitError = createProtocolError(
-          message.params?.message ?? "codex app-server exited unexpectedly."
+          `codex app-server exited unexpectedly (${describeExit(reason)}).`
         );
       }
       return;
@@ -313,45 +288,14 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     });
 
     this.proc.on("exit", (code, signal) => {
-      if (code === 0) {
-        this.handleExit(null);
-        return;
-      }
-
-      const reason = signal ? `signal ${signal}` : `exit ${code}`;
-      const finalize = () => {
-        const diagnostic = formatExitDiagnostic(this.stderr);
-        this.handleExit(
-          createProtocolError(
-            `codex app-server exited unexpectedly (${reason}).${diagnostic ? ` ${diagnostic}` : ""}`
-          )
-        );
-      };
-
-      // `exit` does not mean stdio has drained — only `close` does. A grandchild
-      // holding an inherited stderr descriptor delays it: measured, a child exited at
-      // ~29ms with an EMPTY buffer while its crash line arrived at ~358ms. Formatting
-      // at `exit` would report the very nothing this diagnostic exists to replace.
-      //
-      // So wait for `close`, but BOUND it: a descriptor held open indefinitely must
-      // never stall the turn's rejection, which is this handler's real job.
-      const drainTimer = setTimeout(() => {
-        // The grace expired, which means a descendant is holding the inherited
-        // descriptor. That pipe keeps OUR event loop alive for as long as it is held —
-        // measured: a parent merely listening on it exits in 60ms normally and never
-        // exits at all once a grandchild inherits stderr. Giving up on the diagnostic
-        // is not enough; the handles have to be released.
-        this.proc.stdout?.destroy();
-        this.proc.stderr?.destroy();
-        finalize();
-      }, EXIT_DRAIN_GRACE_MS);
-      if (typeof drainTimer.unref === "function") {
-        drainTimer.unref();
-      }
-      this.proc.once("close", () => {
-        clearTimeout(drainTimer);
-        finalize();
-      });
+      // Record the exit reason as STRUCTURED data. It is deliberately not built from
+      // child output: quoting the child's stderr here was tried and withdrawn, because
+      // its content is unbounded and un-authored by this plugin, so no redaction pass
+      // can bound what it might contain. Only the exit code / signal name travels.
+      this.exitReason = signal ? { signal } : { code };
+      this.handleExit(
+        code === 0 ? null : createProtocolError(`codex app-server exited unexpectedly (${describeExit(this.exitReason)}).`)
+      );
     });
 
     this.readline = readline.createInterface({ input: this.proc.stdout });
@@ -377,6 +321,16 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     if (this.readline) {
       this.readline.close();
     }
+
+    // Release the child's stdio unconditionally. These pipes stay open for as long as
+    // ANY descendant holds the inherited descriptor, and an open pipe pins this
+    // process's event loop: measured on the bare topology, a parent listening on
+    // stderr exits in 60ms normally and never exits once a grandchild inherits it
+    // (killed at the 10s timeout). This predates the crash-diagnostic work — main has
+    // the same accumulator with no release — and it must run on the clean-exit path
+    // too, which an exit-handler-only fix would miss.
+    this.proc?.stdout?.destroy();
+    this.proc?.stderr?.destroy();
 
     if (this.proc && !this.proc.killed) {
       this.proc.stdin.end();
