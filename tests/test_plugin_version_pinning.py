@@ -266,7 +266,7 @@ def _local_tags():
     return set(tags)
 
 
-def _published_release_ref_pattern(plugin_name, published):
+def _published_release_ref_pattern(plugin_source, published):
     """The tag pattern a plugin pinned *as published*, or None if it pinned nothing.
 
     Read from the published snapshot, never the working tree. Both halves of this
@@ -284,12 +284,25 @@ def _published_release_ref_pattern(plugin_name, published):
     Parsed rather than executed: it is a one-line template literal, and running
     plugin code from an arbitrary historical commit inside the test suite is not
     something to invite.
+
+    ``plugin_source`` is the marketplace entry's own ``source`` (e.g. ``./plugins/codex``)
+    rather than an assumed ``plugins/<name>`` layout: the marketplace decides where a
+    plugin lives, and guessing would silently skip one that moved.
     """
-    path = f"plugins/{plugin_name}/scripts/lib/version.mjs"
-    # Absence is legitimate (most plugins pin no ref), so this read may fail.
-    source = _git("show", f"{published}:{path}", allow_failure=True)
-    if not source:
+    path = f"{plugin_source.rstrip('/')}/scripts/lib/version.mjs".lstrip("./")
+    # "This plugin pins no ref" is a real answer, but — as with _version_at — it must
+    # be established POSITIVELY. Treating any `git show` failure as absence would let a
+    # corrupt object or a partial clone silently exempt a release from needing its tag,
+    # which is the fail-open direction.
+    listing = _git("ls-tree", "--name-only", published, "--", path)
+    if not listing:
         return None
+    source = _git("show", f"{published}:{path}")
+    if not source:
+        raise GitUnavailable(
+            f"{published}:{path} is listed in the tree but read back empty; "
+            "the release-tag guard cannot judge this plugin"
+        )
     match = re.search(r"RELEASE_REF\s*=\s*`([^`]*)`", source)
     if not match:
         return None
@@ -320,7 +333,9 @@ def test_published_versions_have_the_release_tags_their_workflows_fetch():
     # working tree would let a deletion skip the check.
     for entry in published_marketplace["plugins"]:
         name = entry["name"]
-        pattern = _published_release_ref_pattern(name, published)
+        # Resolve version.mjs from the entry's own `source`, not an assumed
+        # plugins/<name> layout — the marketplace is what decides where a plugin lives.
+        pattern = _published_release_ref_pattern(entry.get("source") or f"plugins/{name}", published)
         if pattern is None:
             continue
         expected = pattern.replace("${PLUGIN_VERSION}", entry["version"])
