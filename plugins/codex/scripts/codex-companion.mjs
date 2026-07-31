@@ -1589,7 +1589,9 @@ async function handleMultiReview(argv) {
               reasoningSummary: result.payload?.reasoningSummary ?? null
             });
           } catch (error) {
-            const message = redactMachinePaths(error instanceof Error ? error.message : String(error));
+            // Path redaction alone left credentials in a rejected role's error,
+            // which is then persisted in the payload AND rendered.
+            const message = sanitizeModelText(error instanceof Error ? error.message : String(error));
             results.push({
               role: role.id,
               title: role.title,
@@ -1685,7 +1687,11 @@ function isDirectEntrypoint() {
 
 if (isDirectEntrypoint()) {
   main().catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
+    // The ultimate exception boundary. runAppServerTurn can REJECT (transport
+    // failure, rejected JSON-RPC) before buildFailureMessage ever runs, and a
+    // JSON-RPC error quotes the offending payload -- so the sanitized copy
+    // runTrackedJob persists is not enough; the rethrown original lands here.
+    const message = sanitizeModelText(error instanceof Error ? error.message : String(error));
     process.stderr.write(`${message}\n`);
     if (error?.code === "ECAPACITY" || error?.status === 75) {
       process.exitCode = 75;

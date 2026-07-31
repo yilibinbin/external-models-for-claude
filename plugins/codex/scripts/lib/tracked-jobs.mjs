@@ -129,6 +129,7 @@ export function createJobLogFile(workspaceRoot, jobId, title) {
   // The job log accumulates the full rendered output and every model message
   // body; it is world-readable at the default umask and has no TTL.
   fs.writeFileSync(logFile, "", { encoding: "utf8", mode: 0o600 });
+  fs.chmodSync(logFile, 0o600);
   if (title) {
     appendLogLine(logFile, `Starting ${title}.`);
   }

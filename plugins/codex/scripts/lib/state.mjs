@@ -66,7 +66,15 @@ export function resolveJobsDir(cwd) {
 export function ensureStateDir(cwd) {
   // 0700: the jobs dir holds review text and job records that outlive the
   // session. It was created at the process umask -- 0755 on a default install.
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true, mode: 0o700 });
+  const jobsDir = resolveJobsDir(cwd);
+  fs.mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
+  // Repairs a directory created 0755 by an earlier release (mode is honoured
+  // only on creation).
+  try {
+    fs.chmodSync(jobsDir, 0o700);
+  } catch {
+    // Best effort: a directory we cannot chmod is one we do not own.
+  }
 }
 
 export function loadState(cwd) {
@@ -320,6 +328,10 @@ export function writeAtomicJson(filePath, payload) {
   // Mode set on the temp file so it survives the rename below; setting it
   // after the rename would leave a window at the umask default.
   fs.writeFileSync(tempFile, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  // `mode` applies only when the file is CREATED, so an install upgrading from a
+  // release that wrote 0644 would keep those modes forever. chmod the temp file
+  // explicitly; it survives the rename below and repairs the destination.
+  fs.chmodSync(tempFile, 0o600);
   fs.renameSync(tempFile, filePath);
   return filePath;
 }

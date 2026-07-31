@@ -7749,10 +7749,15 @@ def test_codex_multi_review_uses_role_prompt_tracking_and_leases():
     assert "resumeLast: false" in multi_body
     assert "persistThread: false" in multi_body
     assert "} catch (error) {" in multi_body
-    assert "redactMachinePaths(error instanceof Error ? error.message : String(error))" in multi_body
+    # Upgraded from redactMachinePaths to sanitizeModelText, which wraps it
+    # (sanitize.mjs: redactMachinePaths(redactSecrets(stripTerminalControls(x)))).
+    # Path redaction alone left credentials in a rejected role's error, and that
+    # message is both persisted in the payload and rendered. The original intent
+    # of this assertion is preserved and strengthened.
+    assert "sanitizeModelText(error instanceof Error ? error.message : String(error))" in multi_body
     assert "output: `Role failed: ${message}`" in multi_body
     assert "error: message" in multi_body
-    assert multi_body.index("redactMachinePaths(") < multi_body.index("output: `Role failed: ${message}`")
+    assert multi_body.index("sanitizeModelText(") < multi_body.index("output: `Role failed: ${message}`")
     assert multi_start < companion.index("async function main")
 
 
@@ -8747,6 +8752,79 @@ def test_codex_sanitizer_stays_idempotent_and_linear():
     # Generous ceiling: the point is linear-vs-quadratic, not a micro-benchmark.
     # The rejected greedy variant took 3946 ms on a tenth of this input.
     assert payload["elapsedMs"] < 500, f"redaction took {payload['elapsedMs']}ms"
+
+
+def test_codex_sanitizer_is_linear_in_ordinary_separators():
+    # A SECOND linearity axis, because the first one missed a real quadratic.
+    # The adversarial input above has few separators, so it never exercised the
+    # per-separator work; an implementation that re-scanned a growing prefix for
+    # each `:`/`=` passed it while measuring 96/1465/6032 ms on 20/80/160 KB of
+    # plain `status=ok` pairs -- the same blow-up class that sank the previous
+    # attempt at this fix, reintroduced through a different door.
+    #
+    # Structured model output and large JSON errors are exactly this shape, and
+    # the redactor runs inside the fail-closed stop gate, so a stall there is a
+    # timeout, not just slowness.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const timeFor = (kb) => {
+          const text = 'status=ok '.repeat(Math.floor((kb * 1024) / 10));
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(40), large: timeFor(320) }));
+        """
+    )
+    # 8x the input must not cost dramatically more than 8x the time. A quadratic
+    # implementation lands near 64x.
+    assert payload["large"] < 200, f"320KB took {payload['large']}ms"
+    growth = payload["large"] / max(payload["small"], 0.05)
+    assert growth < 24, f"scaling looks super-linear: {growth:.1f}x for 8x input"
+
+
+def test_codex_sanitizer_handles_quoted_keys_and_auth_headers():
+    # Both regressed against origin/main during this change and were caught in
+    # review, so they are pinned here.
+    #
+    # `Authorization: Bearer <jwt>` is the sharper of the two: redacting only the
+    # first token produced `Authorization: [secret] eyJhbGci...`, which is worse
+    # than doing nothing because it reads as already handled.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          json: sanitizeModelText('{"password":"hunter2"}'),
+          bearer: sanitizeModelText('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc'),
+          basic: sanitizeModelText('proxy-authorization: Basic dXNlcjpwYXNz'),
+        }));
+        """
+    )
+    assert "hunter2" not in payload["json"]
+    assert "[secret]" in payload["json"]
+    assert "eyJhbGciOiJIUzI1NiJ9.abc" not in payload["bearer"]
+    assert "dXNlcjpwYXNz" not in payload["basic"]
+
+
+def test_codex_stderr_truncation_cannot_orphan_a_credential_value():
+    # Truncating raw bytes can land between a key and its value, and the redactor
+    # keys off the key name -- so a headless `hunter2` survives a pass that would
+    # have caught `PASSWORD=hunter2`. Truncating mid-line is strictly worse than
+    # not truncating, so the cut is made at a line boundary.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        import { captureDiagnosticStderr } from './plugins/codex/scripts/lib/codex.mjs';
+        // Place the credential so the cap boundary falls between key and value.
+        const filler = 'diagnostic line\\n'.repeat(Math.ceil(MAX_CAPTURED_STDERR_BYTES / 16));
+        let buffer = appendBoundedStderr('', 'x'.repeat(MAX_CAPTURED_STDERR_BYTES - 9) + 'PASSWORD=hunter2\\n');
+        buffer = appendBoundedStderr(buffer, filler);
+        console.log(JSON.stringify({ captured: captureDiagnosticStderr(buffer) }));
+        """
+    )
+    assert "hunter2" not in payload["captured"]
 
 
 def test_codex_sanitizer_preserves_non_secret_text():

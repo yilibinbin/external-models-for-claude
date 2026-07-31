@@ -26,11 +26,22 @@ import { terminateProcessTree } from "./process.mjs";
 // what gets dropped.
 export const MAX_CAPTURED_STDERR_BYTES = 64 * 1024;
 
+// Truncation happens at a LINE boundary, never mid-line. Cutting raw bytes can
+// land between a credential's key and its value, and the redactor keys off the
+// key name -- so a headless `hunter2` survives a pass that would have caught
+// `PASSWORD=hunter2`. Truncating first is strictly worse than not truncating.
+//
+// If the retained tail contains no newline at all, the single line is longer
+// than the whole cap and there is no safe place to cut it, so it is dropped
+// entirely rather than kept headless.
 export function appendBoundedStderr(buffer, chunk) {
   const combined = `${buffer}${chunk}`;
-  return combined.length <= MAX_CAPTURED_STDERR_BYTES
-    ? combined
-    : combined.slice(combined.length - MAX_CAPTURED_STDERR_BYTES);
+  if (combined.length <= MAX_CAPTURED_STDERR_BYTES) {
+    return combined;
+  }
+  const tail = combined.slice(combined.length - MAX_CAPTURED_STDERR_BYTES);
+  const firstNewline = tail.indexOf("\n");
+  return firstNewline === -1 ? "" : tail.slice(firstNewline + 1);
 }
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
