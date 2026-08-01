@@ -129,19 +129,62 @@ function isLineValuedKey(key) {
 // words: `key` is in `keyboard`, `auth` is in `author`, `pass` is in
 // `tests_passed`. Splitting on separators and camelCase boundaries first gives
 // SSH_KEY / AUTH_HEADER / DB_PASS without eating any of those.
-const SENSITIVE_KEY_SEGMENTS = new Set([
-  "key",
-  "keys",
-  "auth",
-  "pass",
-  "pwd",
+// A bare `key` / `pass` / `auth` segment is NOT enough: PRIMARY_KEY, FOREIGN_KEY,
+// PASS_RATE and DICT_KEYS are ordinary identifiers, and with unquoted values now
+// running to end-of-line, a false positive destroys the rest of the line.
+//
+// So a weak word only counts when a QUALIFIER precedes it. That keeps SSH_KEY,
+// DB_PASS, AUTH_HEADER, ENCRYPTION_KEY, CLIENT_KEY, TLSCert, JWTAuth while
+// leaving the identifiers above alone.
+const STRONG_KEY_SEGMENTS = new Set([
   "token",
   "secret",
   "secrets",
+  "password",
+  "passwd",
+  "passphrase",
+  "pwd",
   "credential",
   "credentials",
+  "apikey",
+  "privatekey"
+]);
+
+const KEY_QUALIFIERS = new Set([
+  "ssh",
+  "tls",
+  "ssl",
+  "api",
+  "private",
+  "public",
+  "secret",
+  "client",
+  "encryption",
+  "signing",
+  "access",
+  "db",
+  "database",
+  "jwt",
+  "auth",
+  "oauth",
+  "bearer",
+  "session",
+  "refresh",
+  "master",
+  "service",
+  "account"
+]);
+
+const WEAK_KEY_SEGMENTS = new Set([
+  "key",
+  "keys",
+  "pass",
   "cert",
-  "signature"
+  "certificate",
+  "auth",
+  "header",
+  "token",
+  "credential"
 ]);
 
 function keySegments(key) {
@@ -161,7 +204,13 @@ function isSensitiveKey(key) {
   if (SENSITIVE_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment))) {
     return true;
   }
-  return keySegments(key).some((segment) => SENSITIVE_KEY_SEGMENTS.has(segment));
+  const segments = keySegments(key);
+  if (segments.some((segment) => STRONG_KEY_SEGMENTS.has(segment))) {
+    return true;
+  }
+  return segments.some(
+    (segment, index) => index > 0 && KEY_QUALIFIERS.has(segments[index - 1]) && WEAK_KEY_SEGMENTS.has(segment)
+  );
 }
 
 // Keeps redaction idempotent: `summary` is now sanitized at the job-state
@@ -206,15 +255,35 @@ function redactOrphanedKeyBody(text) {
   if (before.includes("-----BEGIN")) {
     return text;
   }
-  // Everything from the last already-redacted marker (or the start of the text)
-  // up to the END marker is orphaned key body. An earlier attempt replaced only
-  // the line immediately before the marker, which left every MIDDLE body line
-  // intact between two `[secret]` markers -- output that reads as fully redacted
-  // while carrying most of the key.
-  const anchor = before.lastIndexOf(`${REDACTED}\n`);
-  const head = anchor === -1 ? "" : before.slice(0, anchor + REDACTED.length + 1);
+  // Walk back over lines that LOOK like key body and stop at the first that does
+  // not. Deleting everything before the marker instead destroyed up to a full
+  // buffer of legitimate diagnostics, because a truncated key body is normally
+  // preceded by ordinary output.
+  const lines = before.split("\n");
+  let firstBodyLine = lines.length;
+  while (firstBodyLine > 0 && looksLikeKeyBody(lines[firstBodyLine - 1])) {
+    firstBodyLine -= 1;
+  }
+  if (firstBodyLine === lines.length) {
+    // The marker is not preceded by key material at all; leave the text alone.
+    return text;
+  }
+  const head = lines.slice(0, firstBodyLine).join("\n");
   const tail = text.slice(end.index + end[0].length).replace(/^\n/, "");
-  return `${head}${REDACTED}\n${tail}`;
+  return `${head ? `${head}\n` : ""}${REDACTED}\n${tail}`;
+}
+
+// PEM body lines are unbroken base64 runs. A redaction marker counts too, so a
+// body already collapsed by an earlier pass does not stop the walk.
+function looksLikeKeyBody(line) {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return true;
+  }
+  if (trimmed === REDACTED || trimmed.endsWith(REDACTED)) {
+    return true;
+  }
+  return trimmed.length >= 16 && /^[A-Za-z0-9+/=]+$/.test(trimmed);
 }
 
 // Reads the key ending at `end`, walking backwards over key characters and, if

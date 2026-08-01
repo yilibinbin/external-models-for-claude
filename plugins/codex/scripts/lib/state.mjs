@@ -86,7 +86,11 @@ export function repairStatePermissions(cwd) {
     [resolveStateFile(cwd), 0o600]
   ]) {
     try {
-      if (fs.existsSync(target)) {
+      // stat first: repair runs on every state READ now, and an unconditional
+      // chmod rewrites the inode ctime each time, which is a pointless disk
+      // write and can keep file watchers firing for a whole session.
+      const current = fs.statSync(target, { throwIfNoEntry: false });
+      if (current && (current.mode & 0o777) !== mode) {
         fs.chmodSync(target, mode);
       }
     } catch {

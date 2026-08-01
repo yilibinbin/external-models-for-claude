@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "config": {
+    "stopReviewGate": false,
+    "stopReviewGateFailOpen": false
+  },
+  "endedSessions": [],
+  "jobs": []
+}

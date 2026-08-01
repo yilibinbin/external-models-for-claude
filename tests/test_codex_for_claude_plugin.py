@@ -9145,13 +9145,20 @@ def test_codex_orphaned_key_body_redaction_covers_middle_lines(tmp_path):
         );
         state = appendBoundedStderr(
           state,
-          'FIRSTLEAK\\nSECONDLEAK\\nTHIRDLEAK\\n-----END RSA PRIVATE KEY-----\\ntail line\\n',
+          // Realistic PEM body: 64-char base64 lines. Short toy strings are
+          // indistinguishable from ordinary short diagnostics.
+          'RklSU1RMRUFLRklSU1RMRUFLRklSU1RMRUFLRklSU1RMRUFLRklSU1RMRUFLQUJD\\n' +
+            'U0VDT05ETEVBS1NFQ09ORExFQUtTRUNPTkRMRUFLU0VDT05ETEVBS1NFQ09ORExF\\n' +
+            'VEhJUkRMRUFLVEhJUkRMRUFLVEhJUkRMRUFLVEhJUkRMRUFLVEhJUkRMRUFLQUJD\\n' +
+            '-----END RSA PRIVATE KEY-----\\ntail line\\n',
         );
         console.log(JSON.stringify({ captured: captureDiagnosticStderr(state.text) }));
         """
     )
     captured = payload["captured"]
-    for marker in ("FIRSTLEAK", "SECONDLEAK", "THIRDLEAK"):
+    # base64-shaped, because that is what a PEM body actually looks like and
+    # what the walk-back recognises; arbitrary words are legitimate diagnostics.
+    for marker in ("RklSU1RMRUFLRklS", "U0VDT05ETEVBS1NF", "VEhJUkRMRUFLVEhJ"):
         assert marker not in captured, f"{marker} survived"
     # Legitimate output after the marker must survive.
     assert "tail line" in captured
@@ -9166,7 +9173,7 @@ def test_codex_failed_turn_does_not_render_partial_output_as_the_answer():
         import { renderTaskResult } from './plugins/codex/scripts/lib/render.mjs';
         console.log(JSON.stringify({
           failed: renderTaskResult(
-            { rawOutput: 'Still investigating.', failureMessage: 'transport failed: reset' },
+            { rawOutput: 'Still investigating.', failureMessage: 'transport failed: reset', status: 1 },
             {},
           ),
           succeeded: renderTaskResult({ rawOutput: 'the answer' }, {}),
@@ -9213,6 +9220,114 @@ def test_codex_state_permissions_are_repaired_on_the_read_path(tmp_path):
     )
     assert payload["dir"] == "700"
     assert payload["file"] == "600"
+
+
+def test_codex_sanitizer_does_not_flag_ordinary_key_named_identifiers():
+    # A bare `key`/`pass`/`auth` segment is not enough to call a name sensitive.
+    # PRIMARY_KEY, FOREIGN_KEY, PASS_RATE and DICT_KEYS are ordinary identifiers,
+    # and because unquoted values run to end-of-line, a false positive here
+    # destroys the REST OF THE LINE, not just one token. A weak word therefore
+    # only counts when a qualifier precedes it.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'SSH_KEY=AAAAB3LEAK', 'DB_PASS=hunter2', 'AUTH_HEADER=xyz123',
+          'ENCRYPTION_KEY=k1', 'CLIENT_KEY=c1', 'SSHKey=LEAK1', 'DBPass=LEAK2',
+          'JWTAuth=LEAK3', 'TLSCert=LEAK4',
+          'PRIMARY_KEY=id', 'FOREIGN_KEY=user_id and more', 'PASS_RATE=0.98',
+          'DICT_KEYS=abc', 'let keyboard = 1', 'AUTHOR=alice', 'TESTS_PASSED=3',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    must_redact = ("SSH_KEY=AAAAB3LEAK", "DB_PASS=hunter2", "AUTH_HEADER=xyz123",
+                   "ENCRYPTION_KEY=k1", "CLIENT_KEY=c1", "SSHKey=LEAK1",
+                   "DBPass=LEAK2", "JWTAuth=LEAK3", "TLSCert=LEAK4")
+    must_keep = ("PRIMARY_KEY=id", "FOREIGN_KEY=user_id and more", "PASS_RATE=0.98",
+                 "DICT_KEYS=abc", "let keyboard = 1", "AUTHOR=alice", "TESTS_PASSED=3")
+    for original in must_redact:
+        assert "[secret]" in payload[original], f"{original} leaked"
+    for original in must_keep:
+        assert payload[original] == original, f"over-redacted {original!r}"
+
+
+def test_codex_orphaned_key_body_does_not_destroy_preceding_output():
+    # Deleting everything before an orphaned END marker discarded up to a full
+    # buffer of legitimate diagnostics -- a truncated key body is normally
+    # preceded by ordinary output. The walk back now stops at the first line that
+    # does not look like key body.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          noBody: sanitizeModelText(
+            'important diagnostic\\nanother line\\n-----END RSA PRIVATE KEY-----\\ntail'
+          ),
+          withBody: sanitizeModelText(
+            'diag line\\nMIIBAAKCAQEAvfake\\nQUJDREVGR0hJSktM\\n-----END RSA PRIVATE KEY-----\\ntail'
+          ),
+        }));
+        """
+    )
+    # Nothing that looks like key material precedes the marker: leave the text.
+    assert "important diagnostic" in payload["noBody"]
+    assert "another line" in payload["noBody"]
+    # Real body lines go; the diagnostic line before them stays.
+    assert "diag line" in payload["withBody"]
+    assert "MIIBAAKCAQEAvfake" not in payload["withBody"]
+    assert "QUJDREVGR0hJSktM" not in payload["withBody"]
+    assert "tail" in payload["withBody"]
+
+
+def test_codex_successful_turn_with_stderr_is_not_reported_as_failed():
+    # failureMessage is built from the child's stderr whenever no error object
+    # exists, so a successful turn that emitted an ordinary warning had a
+    # non-empty failureMessage. Branching on that relabelled the answer as
+    # "partial output" and reported the run as failed. Branch on the status.
+    payload = run_node_script(
+        """
+        import { renderTaskResult } from './plugins/codex/scripts/lib/render.mjs';
+        console.log(JSON.stringify({
+          okWithWarning: renderTaskResult(
+            { rawOutput: 'the answer', failureMessage: 'npm warn deprecated', status: 0 },
+            {},
+          ),
+          failed: renderTaskResult(
+            { rawOutput: 'partial', failureMessage: 'transport failed', status: 1 },
+            {},
+          ),
+        }));
+        """
+    )
+    assert payload["okWithWarning"].strip() == "the answer"
+    assert "did not complete" not in payload["okWithWarning"]
+    assert "did not complete" in payload["failed"]
+
+
+def test_codex_permission_repair_skips_the_write_when_modes_are_correct():
+    # Repair runs on every state READ now. An unconditional chmod rewrites the
+    # inode ctime each time -- a pointless disk write that can keep file watchers
+    # firing for a whole session.
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { ensureStateDir, repairStatePermissions, resolveStateFile, saveState }
+          from './plugins/codex/scripts/lib/state.mjs';
+        const workspace = process.argv[1];
+        ensureStateDir(workspace);
+        saveState(workspace, { jobs: [] });
+        const stateFile = resolveStateFile(workspace);
+        const before = fs.statSync(stateFile).ctimeMs;
+        repairStatePermissions(workspace);
+        repairStatePermissions(workspace);
+        console.log(JSON.stringify({ unchanged: fs.statSync(stateFile).ctimeMs === before }));
+        """,
+        env={"CLAUDE_PLUGIN_DATA": str(ROOT / ".pytest-plugin-data-perm")},
+        args=[str(ROOT)],
+    )
+    assert payload["unchanged"] is True, "repair rewrote a file whose mode was already correct"
 
 
 def test_codex_sanitizer_is_linear_in_whitespace_runs():

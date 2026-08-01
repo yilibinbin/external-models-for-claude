@@ -338,14 +338,16 @@ export function renderNativeReviewResult(result, meta) {
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
   const failure = String(parsedResult?.failureMessage ?? "").trim();
-  // A non-empty failureMessage means the turn did not complete. rawOutput is
-  // then whatever the agent last said mid-flight -- commentary, not an answer --
-  // and returning it alone presented a failed run as a successful one while
-  // hiding the diagnostic entirely. Label both instead of choosing wrongly.
-  if (rawOutput && !failure) {
+  // Branch on the STATUS, not on failureMessage being non-empty. That field is
+  // built from the child's stderr whenever no error object exists, so a
+  // perfectly successful turn that emitted an ordinary warning had a non-empty
+  // failureMessage -- and an earlier revision of this branch then relabelled its
+  // answer as "partial output" and reported the run as failed.
+  const failed = Number.isInteger(parsedResult?.status) ? parsedResult.status !== 0 : Boolean(parsedResult?.failed);
+  if (rawOutput && !failed) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
   }
-  if (rawOutput && failure) {
+  if (rawOutput && failed) {
     return [
       "Codex did not complete the turn.",
       "",

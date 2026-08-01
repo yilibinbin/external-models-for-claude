@@ -585,6 +585,9 @@ async function executeTaskRun(request) {
     {
       rawOutput,
       failureMessage,
+      // renderTaskResult needs the outcome, not an inference from
+      // failureMessage: that field carries ordinary stderr on success too.
+      status: result.status,
       reasoningSummary: result.reasoningSummary
     },
     {
