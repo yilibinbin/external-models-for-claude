@@ -103,8 +103,13 @@ function buildTurnInput(prompt) {
   return [{ type: "text", text: prompt, text_elements: [] }];
 }
 
+// Redact BEFORE truncating. Every preview in this file goes through here, and
+// cutting a recognized token turns it into an unrecognized fragment: a 39-char
+// key crossing the 96-char preview limit became a 38-char prefix with no marker,
+// leaving one character to enumerate. Third occurrence of this ordering error --
+// the same bug appeared in the stderr bound and in the stop-gate reason.
 function shorten(text, limit = 72) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  const normalized = sanitizeModelText(String(text ?? "").trim().replace(/\s+/g, " "));
   if (!normalized) {
     return "";
   }

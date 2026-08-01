@@ -9306,10 +9306,12 @@ def test_codex_successful_turn_with_stderr_is_not_reported_as_failed():
     assert "did not complete" in payload["failed"]
 
 
-def test_codex_permission_repair_skips_the_write_when_modes_are_correct():
+def test_codex_permission_repair_skips_the_write_when_modes_are_correct(tmp_path):
     # Repair runs on every state READ now. An unconditional chmod rewrites the
     # inode ctime each time -- a pointless disk write that can keep file watchers
     # firing for a whole session.
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
     payload = run_node_script(
         """
         import fs from 'node:fs';
@@ -9324,8 +9326,8 @@ def test_codex_permission_repair_skips_the_write_when_modes_are_correct():
         repairStatePermissions(workspace);
         console.log(JSON.stringify({ unchanged: fs.statSync(stateFile).ctimeMs === before }));
         """,
-        env={"CLAUDE_PLUGIN_DATA": str(ROOT / ".pytest-plugin-data-perm")},
-        args=[str(ROOT)],
+        env={"CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")},
+        args=[str(workspace)],
     )
     assert payload["unchanged"] is True, "repair rewrote a file whose mode was already correct"
 
@@ -10682,3 +10684,58 @@ def test_codex_run_command_lets_callers_opt_out_of_the_shell():
     assert "shell: options.shell ??" in process_lib
     # The Windows default must survive for the .cmd-shim spawns.
     assert 'process.platform === "win32" ? (process.env.SHELL || true) : false' in process_lib
+
+
+def test_codex_bare_pem_block_and_registry_auth_are_redacted():
+    # A whole PEM block is a credential on its own: everything else in the
+    # redactor keys off an assignment, so a bare block -- exactly how a key gets
+    # pasted into a review or dumped by a tool -- passed through untouched.
+    #
+    # DOCKER_AUTH_CONFIG and NPM_CONFIG__AUTH hold base64 registry credentials
+    # and match neither the qualifier+weak pairing nor the fragment list.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          barePem: sanitizeModelText(
+            '-----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFOQmdrcWhraUc5\\n-----END PRIVATE KEY-----'
+          ),
+          dockerAuth: sanitizeModelText('DOCKER_AUTH_CONFIG=eyJhdXRocyI6LEVBSw'),
+          npmAuth: sanitizeModelText('NPM_CONFIG__AUTH=bnBtOnRva2Vu'),
+        }));
+        """
+    )
+    assert "TUlJRXZRSUJBREFO" not in payload["barePem"]
+    assert "eyJhdXRocyI6LEVBSw" not in payload["dockerAuth"]
+    assert "bnBtOnRva2Vu" not in payload["npmAuth"]
+
+
+def test_codex_shape_qualified_keys_are_not_treated_as_secrets():
+    # `token_count` is a number, `passwordless` a boolean, `signature_status` an
+    # enum, `SSH_AUTH_SOCK` a socket path. All four matched the credential rules
+    # and, because unquoted values run to end-of-line, erased the rest of their
+    # line -- degrading exactly the diagnostics this channel exists to carry.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'token_count=42', 'passwordless=true', 'signature_status=valid and more',
+          'SSH_AUTH_SOCK=/tmp/agent.sock',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, value in payload.items():
+        assert value == original, f"over-redacted {original!r} -> {value!r}"
+
+
+def test_codex_progress_preview_redacts_before_it_shortens():
+    # Third occurrence of the same ordering error -- after the stderr bound and
+    # the stop-gate reason. Every preview in codex.mjs funnels through shorten(),
+    # so a token crossing the 96-character preview limit became an unrecognized
+    # fragment that then reached the terminal, the job log and /codex:status.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "sanitizeModelText(String(text ?? \"\").trim().replace(/\\s+/g, \" \"))" in source, (
+        "shorten() must redact before truncating"
+    )

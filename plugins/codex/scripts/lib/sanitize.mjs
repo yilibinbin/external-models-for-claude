@@ -72,6 +72,13 @@ const SENSITIVE_KEY_FRAGMENTS = [
   "mongourl",
   "amqpurl",
   "connectionuri",
+  // Registry credentials. `DOCKER_AUTH_CONFIG` holds a base64 auth blob and
+  // `NPM_CONFIG__AUTH` a base64 user:token; neither matches the qualifier+weak
+  // pairing, because `auth` is not preceded by a qualifier segment in either.
+  "dockerauth",
+  "npmconfigauth",
+  "registryauth",
+  "authconfig",
   "authorization",
   "signature"
 ];
@@ -199,12 +206,47 @@ function keySegments(key) {
     .filter(Boolean);
 }
 
+// Segments that make a key NON-sensitive despite an otherwise matching shape.
+// `token_count` is a number, `passwordless` is a boolean, `signature_status` is
+// an enum, and `SSH_AUTH_SOCK` is a socket path -- all ordinary diagnostics, and
+// with unquoted values running to end-of-line a false positive here erases the
+// rest of the line.
+const NON_SECRET_SEGMENTS = new Set([
+  "count",
+  "length",
+  "size",
+  "status",
+  "state",
+  "enabled",
+  "disabled",
+  "sock",
+  "socket",
+  "path",
+  "file",
+  "dir",
+  "id",
+  "type",
+  "kind",
+  "version",
+  "expiry",
+  "expires",
+  "ttl"
+]);
+
 function isSensitiveKey(key) {
+  const segments = keySegments(key);
+  // A trailing qualifier of shape rather than of secrecy demotes the whole key.
+  if (segments.length > 1 && NON_SECRET_SEGMENTS.has(segments[segments.length - 1])) {
+    return false;
+  }
+  // `passwordless` is one segment and must not match `password` as a substring.
+  if (segments.length === 1 && /less$/.test(segments[0])) {
+    return false;
+  }
   const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
   if (SENSITIVE_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment))) {
     return true;
   }
-  const segments = keySegments(key);
   if (segments.some((segment) => STRONG_KEY_SEGMENTS.has(segment))) {
     return true;
   }
@@ -224,8 +266,12 @@ function isRedactedValue(text, value, endIndex) {
   // skipped the assignment as already-handled and left `leftover` in place --
   // which is also what a chunk boundary produces when a partial value is
   // redacted and its remainder arrives in the next event.
-  const next = text[endIndex];
-  return next === undefined || /[\s"'`,;}\]]/.test(next);
+  // A space after the marker is NOT proof the value ended: compaction can turn
+  // `Authorization: Bearer <jwt>` into `Authorization: [secret] <jwt>` and the
+  // JWT then arrives looking like separate prose. Only a line break or a
+  // structural delimiter closes the value.
+  const rest = text.slice(endIndex);
+  return rest === "" || /^[\r\n"'`,;}\]]/.test(rest);
 }
 
 const ANSI_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
@@ -235,11 +281,17 @@ export function stripTerminalControls(text) {
   return String(text ?? "").replace(ANSI_PATTERN, "").replace(CONTROL_PATTERN, "");
 }
 
+const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]*-----[\s\S]*?-----END [A-Z0-9 ]*-----/g;
+
 export function redactSecrets(text) {
   let output = String(text ?? "");
   for (const pattern of SECRET_PATTERNS) {
     output = output.replace(pattern, REDACTED);
   }
+  // A whole PEM block is a credential on its own. Everything else here keys off
+  // an assignment, so a bare block -- which is exactly how a key is pasted into
+  // a review or dumped by a tool -- passed through untouched.
+  output = output.replace(PEM_BLOCK, REDACTED);
   return redactOrphanedKeyBody(redactAssignedValues(output));
 }
 
