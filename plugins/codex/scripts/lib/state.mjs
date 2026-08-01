@@ -64,10 +64,48 @@ export function resolveJobsDir(cwd) {
 }
 
 export function ensureStateDir(cwd) {
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+  // 0700: the jobs dir holds review text and job records that outlive the
+  // session. It was created at the process umask -- 0755 on a default install.
+  const jobsDir = resolveJobsDir(cwd);
+  fs.mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
+  // Repair modes created by an earlier release: `mode` is honoured only when the
+  // path is CREATED, so an upgraded install keeps 0755/0644 forever otherwise.
+  //
+  // The state ROOT and state.json need this as much as jobs/ does -- repairing
+  // only jobs/ left the parent traversable and state.json group-readable, and
+  // state.json carries the summaries and error messages that the rest of this
+  // change redacts. Measured on a real install: root 0755, state.json 0644,
+  // while jobs/ was already 0700.
+  repairStatePermissions(cwd);
+}
+
+export function repairStatePermissions(cwd) {
+  for (const [target, mode] of [
+    [resolveStateDir(cwd), 0o700],
+    [resolveJobsDir(cwd), 0o700],
+    [resolveStateFile(cwd), 0o600]
+  ]) {
+    try {
+      // stat first: repair runs on every state READ now, and an unconditional
+      // chmod rewrites the inode ctime each time, which is a pointless disk
+      // write and can keep file watchers firing for a whole session.
+      const current = fs.statSync(target, { throwIfNoEntry: false });
+      if (current && (current.mode & 0o777) !== mode) {
+        fs.chmodSync(target, mode);
+      }
+    } catch {
+      // Best effort: a path we cannot chmod is one we do not own.
+    }
+  }
 }
 
 export function loadState(cwd) {
+  // Repair legacy modes on the READ path too. ensureStateDir only runs before a
+  // write, and the Stop hook plus SessionStart reach state through loadState /
+  // getConfig / listJobs and can return without ever writing -- leaving 0755
+  // dirs and 0644 state.json (which holds summaries and error messages) readable
+  // for as long as the install is only read from.
+  repairStatePermissions(cwd);
   const stateFile = resolveStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
     return defaultState();
@@ -313,9 +351,15 @@ export function withJobFileLock(cwd, jobId, callback) {
 }
 
 export function writeAtomicJson(filePath, payload) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const tempFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tempFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  // Mode set on the temp file so it survives the rename below; setting it
+  // after the rename would leave a window at the umask default.
+  fs.writeFileSync(tempFile, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  // `mode` applies only when the file is CREATED, so an install upgrading from a
+  // release that wrote 0644 would keep those modes forever. chmod the temp file
+  // explicitly; it survives the rename below and repairs the destination.
+  fs.chmodSync(tempFile, 0o600);
   fs.renameSync(tempFile, filePath);
   return filePath;
 }

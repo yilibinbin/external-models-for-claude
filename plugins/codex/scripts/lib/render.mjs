@@ -1,3 +1,4 @@
+import { sanitizeModelText } from "./sanitize.mjs";
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -228,6 +229,23 @@ export function renderSetupReport(report) {
 }
 
 export function renderReviewResult(parsedResult, meta) {
+  // A FAILED turn never produces a verdict, whatever its text parsed into.
+  // Valid-looking review JSON emitted mid-flight rendered as "Verdict: approve"
+  // with no blockers, and that misleading rendering was persisted and replayed
+  // by /codex:result -- a failed review reading as an approval.
+  const failed = Number.isInteger(parsedResult?.status) && parsedResult.status !== 0;
+  if (failed) {
+    const lines = [`# Codex ${meta.reviewLabel}`, "", "Codex did not complete the review."];
+    const diagnostics = String(parsedResult?.failureMessage ?? parsedResult?.parseError ?? "").trim();
+    if (diagnostics) {
+      lines.push("", "diagnostics:", "", "```text", diagnostics, "```");
+    }
+    if (parsedResult.rawOutput) {
+      lines.push("", "partial output:", "", "```text", parsedResult.rawOutput.trimEnd(), "```");
+    }
+    return `${lines.join("\n").trimEnd()}\n`;
+  }
+
   if (!parsedResult.parsed) {
     const lines = [
       `# Codex ${meta.reviewLabel}`,
@@ -322,7 +340,11 @@ export function renderNativeReviewResult(result, meta) {
     lines.push("Codex review failed.");
   }
 
-  if (stderr) {
+  // Gated on failure, not merely on stderr being non-empty. A clean review has
+  // no diagnostic to show, and this block is persisted to the job sidecar and
+  // the job log as well as printed -- so an ungated fence shipped the child's
+  // stderr on every successful run.
+  if (stderr && result.status !== 0) {
     lines.push("", "stderr:", "", "```text", stderr, "```");
   }
 
@@ -333,12 +355,46 @@ export function renderNativeReviewResult(result, meta) {
 
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
-  if (rawOutput) {
+  const failure = String(parsedResult?.failureMessage ?? "").trim();
+  // Branch on the STATUS, not on failureMessage being non-empty. That field is
+  // built from the child's stderr whenever no error object exists, so a
+  // perfectly successful turn that emitted an ordinary warning had a non-empty
+  // failureMessage -- and an earlier revision of this branch then relabelled its
+  // answer as "partial output" and reported the run as failed.
+  const failed = Number.isInteger(parsedResult?.status) ? parsedResult.status !== 0 : Boolean(parsedResult?.failed);
+  if (rawOutput && !failed) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
   }
+  if (rawOutput && failed) {
+    return [
+      "Codex did not complete the turn.",
+      "",
+      "partial output:",
+      "",
+      "```text",
+      rawOutput.trimEnd(),
+      "```",
+      "",
+      "diagnostics:",
+      "",
+      "```text",
+      failure,
+      "```",
+      ""
+    ].join("\n");
+  }
 
-  const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
-  return `${message}\n`;
+  // The failure message must never BE the answer. It is frequently the child's
+  // stderr (buildFailureMessage falls through to captureDiagnosticStderr when
+  // the turn carried no error), and returning it bare made exhaust
+  // indistinguishable from model output -- then persisted it and re-showed it
+  // via /codex:result. State the outcome, then label the diagnostics as such.
+  const lines = ["Codex did not return a final message."];
+  const diagnostics = failure;
+  if (diagnostics) {
+    lines.push("", "diagnostics:", "", "```text", diagnostics, "```");
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 export function renderStatusReport(report) {
@@ -410,7 +466,11 @@ export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
+    // Same read-side redaction as the branch below: this early return fires
+    // first for a structured review, so fixing only the later branch left a
+    // failed structured review replaying its stored output unredacted.
+    const stored = job.status === "failed" ? sanitizeModelText(storedJob.rendered) : storedJob.rendered;
+    const output = stored.endsWith("\n") ? stored : `${stored}\n`;
     if (!threadId) {
       return output;
     }
@@ -421,7 +481,11 @@ export function renderStoredJobResult(job, storedJob) {
     (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
     (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
     "";
-  if (rawOutput) {
+  // A FAILED job must replay its stored framing, not its raw output. Preferring
+  // rawOutput here undid the failure labelling at retrieval time: /codex:result
+  // returned the mid-flight commentary alone and dropped both the "did not
+  // complete" notice and the diagnostics needed to act on it.
+  if (rawOutput && job.status !== "failed") {
     const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
     if (!threadId) {
       return output;
@@ -430,7 +494,11 @@ export function renderStoredJobResult(job, storedJob) {
   }
 
   if (storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
+    // Sanitize on READ as well as on write. The state directory is deliberately
+    // retained across upgrades, so a sidecar written by an earlier release holds
+    // unredacted output that no write-side fix can reach.
+    const stored = job.status === "failed" ? sanitizeModelText(storedJob.rendered) : storedJob.rendered;
+    const output = stored.endsWith("\n") ? stored : `${stored}\n`;
     if (!threadId) {
       return output;
     }

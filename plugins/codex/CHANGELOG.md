@@ -1,10 +1,70 @@
 # Changelog
 
-## 1.1.0-fh.7
+## 1.1.0-fh.8
 
 - Carry the app-server's exit reason across the broker as structured data. `review/start`/`turn/start` are streaming, so once the request has returned there is no pending call left to reject and the broker previously just closed its sockets — the outer client then reported only "connection closed", with not even the exit code. The reason now travels as `{code}`/`{signal}` on a `broker/appServerExited` notification, validated on receipt and rendered from a local template.
-- Deliberately does **not** quote the child's stderr. That was implemented and withdrawn: stderr is unbounded and not authored by this plugin, so no redaction pass can bound what it may contain. Four rounds of pattern-patching still leaked `DATABASE_URL`, `PRIVATE_KEY` and `SESSION_COOKIE`, and the patterns added to catch `_`-delimited names backtracked quadratically — 3.9 s on a 40 KB dump, run synchronously inside the exit handler, stalling the very rejection the feature was meant to deliver. `sanitize.mjs` is reverted to its previous form, which removes that cost entirely (40 KB: 3946 ms → 1 ms).
+- Deliberately does **not** quote the child's stderr. That was implemented and withdrawn: stderr is unbounded and not authored by this plugin, so no redaction pass can bound what it may contain. Four rounds of pattern-patching still leaked `DATABASE_URL`, `PRIVATE_KEY` and `SESSION_COOKIE`, and the patterns added to catch `_`-delimited names backtracked quadratically — 3.9 s on a 40 KB dump, run synchronously inside the exit handler, stalling the very rejection the feature was meant to deliver. That attempt was abandoned within its own branch rather than landing, which removes the cost entirely (40 KB: 3946 ms → 1 ms); the `sanitize.mjs` shipping since `1.1.0-fh.7` is the rewritten one, not the version those four rounds patched.
 - Release the child's stdio in `close()`. These pipes stay open while any descendant holds the inherited descriptor, and an open pipe pins this process's event loop: measured, a parent listening on stderr exits in 60 ms normally and never exits once a grandchild inherits it. This is a pre-existing hang — the same accumulator with no release exists in the prior version — and the release is unconditional so it covers a clean exit too.
+
+## 1.1.0-fh.7
+
+Close the paths by which child-process output reached persisted or user-visible
+sinks unredacted. Scope and design were settled by a three-model serial
+adversarial review (Claude / Gemini via Antigravity / Codex) that rejected the
+first design outright; the items below are what survived it.
+
+- **The review summary redacts on every branch, not only the fallback.** The
+  summary is persisted into job state and re-displayed by `/codex:status` and
+  `/codex:result`, which is why `firstMeaningfulLine` redacts -- but the review
+  call site selected it as the last of three options. A model-authored `summary`
+  field and a `JSON.parse` error both bypassed it, and V8 quotes the offending
+  bytes verbatim in the parse error, so raw output leaked through the message
+  itself. The status table strips control characters per cell; the plain-text
+  `Summary:` lines do not. (Folds in the fix that was open separately as #15.)
+
+- **Redaction no longer has a key-length cliff.** Sensitivity is decided in JS
+  against the captured key, not inside the regex. Every regex that scans the key
+  needs a bounded prefix to stay linear, and a bounded prefix anchored by a
+  lookbehind fails *silently* once the key outgrows it — measured total bypass at
+  64 characters, squarely where names like `ACME_PLATFORM_INTERNAL_SERVICE_API_KEY`
+  live. Assignments are now found by scanning separators and looking back for the
+  key, so a non-sensitive assignment (`rpc failed: DATABASE_URL=…`) can no longer
+  swallow a sensitive one nested inside it. `DATABASE_URL`, `SESSION_COOKIE` and
+  `PRIVATE_KEY` are covered; they carry no keyword from the old list and leaked
+  verbatim. The key name is preserved and only the value dropped, so a finding
+  stays actionable.
+- **stderr is bounded as it arrives**, not when it is read. Bounding on read is a
+  no-op on the default transport: `BrokerCodexAppServerClient` never accumulates,
+  while the spawned client backing the broker grows for the whole session.
+- **`captureDiagnosticStderr`** redacts at the one seam both stderr readers pass
+  through, and **`buildFailureMessage`** covers the error branch of
+  `result.error?.message ?? result.stderr` — the `??` short-circuited past
+  redaction entirely whenever an error message was present.
+- **`payload.codex.stderr` is deleted** (both write sites). It had zero readers
+  repo-wide yet reached the job sidecar, `--json`, and `/codex:result` with no
+  renderer in between, so no rendering fix could cover it.
+- **The rendered stderr fence is gated on failure**, not merely on stderr being
+  non-empty. The block is persisted and logged as well as printed, so an ungated
+  fence shipped the child's stderr on every *successful* review.
+- **`renderTaskResult` no longer returns the failure message as the answer.** It
+  is frequently raw stderr, which made exhaust indistinguishable from model
+  output; it is now labelled diagnostics under a fixed outcome line.
+- **Persisted index fields and the progress channel are redacted**: `summary`,
+  `errorMessage`, and progress `message`/`stderrMessage` (both branches).
+  `logBody` is deliberately exempt — it carries the model's own review text, and
+  the deliverable stays byte-identical.
+- **The stop gate redacts at the emit boundary**, not only in
+  `classifyStopGateResult`: `handleHookException` builds its own block reason and
+  never calls the classifier. `readHookInput` no longer propagates V8's quoted
+  snippet of the malformed payload, which is unredactable by construction — ~10
+  bytes with no assignment structure and below any vendor-token length.
+- **Job state is written 0600 / 0700.** These files hold review text, outlive the
+  session and have no TTL; they were created at the process umask.
+
+Deliberately **not** included: relocating the state root out of `/tmp`. Losing
+the old state makes `loadState` default `stopReviewGate` to `false` — a
+fail-closed security gate silently becoming fail-open — so it needs a versioned
+migration and ships separately.
 
 ## 1.1.0-fh.6
 

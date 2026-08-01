@@ -10,6 +10,7 @@ import { parseArgs, normalizeArgv } from "./lib/args.mjs";
 import { parseStrictCommandInput } from "./lib/command-policy.mjs";
 import { KNOWN_EFFORTS } from "./lib/effort-policy.mjs";
 import {
+    buildFailureMessage,
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
@@ -184,8 +185,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Redact BEFORE truncating. The task summary is built from the raw PROMPT and
+// written into running state and the job sidecar before execution even starts,
+// so the completion-time sanitizer never sees it. Cutting first turns a
+// recognized key into an unrecognized fragment -- the FIFTH place this ordering
+// error has been found in this change.
 function shorten(text, limit = 96) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  const normalized = sanitizeModelText(String(text ?? "").trim().replace(/\s+/g, " "));
   if (!normalized) {
     return "";
   }
@@ -469,7 +475,6 @@ async function executeReviewRun(request) {
       sourceThreadId: result.sourceThreadId,
       codex: {
         status: result.status,
-        stderr: result.stderr,
         stdout: result.reviewText,
         reasoning: result.reasoningSummary
       }
@@ -500,7 +505,7 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, buildAdversarialReviewTurnOptions(context, request, focusText));
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
-    failureMessage: result.error?.message ?? result.stderr
+    failureMessage: buildFailureMessage(result.error, result.stderr)
   });
   const payload = {
     review: reviewName,
@@ -513,7 +518,6 @@ async function executeReviewRun(request) {
     },
     codex: {
       status: result.status,
-      stderr: result.stderr,
       stdout: result.finalMessage,
       reasoning: result.reasoningSummary
     },
@@ -533,7 +537,13 @@ async function executeReviewRun(request) {
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    // All three branches are persisted and re-displayed, so all three must be
+    // redacted -- see firstMeaningfulLine. The first is model-authored text and
+    // the second is a JSON.parse error, which quotes the offending bytes
+    // verbatim; only the fallback was covered before.
+    summary: sanitizeModelText(
+      parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`)
+    ),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
@@ -581,11 +591,14 @@ async function executeTaskRun(request) {
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
-  const failureMessage = result.error?.message ?? result.stderr ?? "";
+  const failureMessage = buildFailureMessage(result.error, result.stderr);
   const rendered = renderTaskResult(
     {
       rawOutput,
       failureMessage,
+      // renderTaskResult needs the outcome, not an inference from
+      // failureMessage: that field carries ordinary stderr on success too.
+      status: result.status,
       reasoningSummary: result.reasoningSummary
     },
     {
@@ -597,6 +610,10 @@ async function executeTaskRun(request) {
   const payload = {
     status: result.status,
     threadId: result.threadId,
+    // The stop gate fails closed on a turn that completed without ever
+    // producing a final answer: `turn/completed` can arrive with status 0 while
+    // the captured text is intermediate commentary.
+    finalAnswerSeen: Boolean(result.finalAnswerSeen),
     rawOutput,
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
@@ -1590,7 +1607,9 @@ async function handleMultiReview(argv) {
               reasoningSummary: result.payload?.reasoningSummary ?? null
             });
           } catch (error) {
-            const message = redactMachinePaths(error instanceof Error ? error.message : String(error));
+            // Path redaction alone left credentials in a rejected role's error,
+            // which is then persisted in the payload AND rendered.
+            const message = sanitizeModelText(error instanceof Error ? error.message : String(error));
             results.push({
               role: role.id,
               title: role.title,
@@ -1686,7 +1705,11 @@ function isDirectEntrypoint() {
 
 if (isDirectEntrypoint()) {
   main().catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
+    // The ultimate exception boundary. runAppServerTurn can REJECT (transport
+    // failure, rejected JSON-RPC) before buildFailureMessage ever runs, and a
+    // JSON-RPC error quotes the offending payload -- so the sanitized copy
+    // runTrackedJob persists is not enough; the rethrown original lands here.
+    const message = sanitizeModelText(error instanceof Error ? error.message : String(error));
     process.stderr.write(`${message}\n`);
     if (error?.code === "ECAPACITY" || error?.status === 75) {
       process.exitCode = 75;
