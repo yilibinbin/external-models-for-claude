@@ -10798,3 +10798,30 @@ def test_codex_orphaned_key_body_walk_stops_at_ordinary_prose():
     # Nothing key-shaped precedes the marker: leave the text entirely alone.
     assert "important diagnostic" in payload["noBody"]
     assert "another line" in payload["noBody"]
+
+
+def test_codex_sanitizer_symmetric_keys_and_marker_suffixes():
+    # HMAC_KEY / FERNET_KEY / AES_KEY split into a non-qualifying first segment
+    # plus a weak `key`, so nothing promoted them -- ordinary env dumps kept real
+    # signing and encryption keys.
+    #
+    # `API_KEY=[secret] TOPSECRET` is what compaction and accidental
+    # concatenation produce. Treating whitespace as a value terminator made the
+    # marker look complete, so the assignment was skipped and the suffix stayed.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'HMAC_KEY=AAAALEAK', 'FERNET_KEY=bbbbLEAK', 'AES_KEY=cLEAK', 'SIGNING_KEY=dLEAK',
+          'API_KEY=[secret] TOPSECRETVALUE', 'Authorization: [secret] eyJLEAK',
+        ]) out[s] = sanitizeModelText(s);
+        // The genuine marker must still count as already redacted.
+        out.idempotent = sanitizeModelText('API_KEY=[secret]');
+        console.log(JSON.stringify(out));
+        """
+    )
+    idempotent = payload.pop("idempotent")
+    for original, value in payload.items():
+        assert "LEAK" not in value and "TOPSECRET" not in value, f"{original} leaked"
+    assert idempotent == "API_KEY=[secret]"

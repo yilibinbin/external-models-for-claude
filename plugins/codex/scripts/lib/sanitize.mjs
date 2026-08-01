@@ -138,6 +138,20 @@ const STRONG_KEY_SEGMENTS = new Set([
 
 
 const KEY_QUALIFIERS = new Set([
+  // Symmetric / signing key prefixes. HMAC_KEY and FERNET_KEY split into a
+  // non-qualifying first segment plus a weak `key`, so neither promoted.
+  "hmac",
+  "fernet",
+  "aes",
+  "rsa",
+  "ecdsa",
+  "ed25519",
+  "hs256",
+  "rs256",
+  "signing",
+  "encrypt",
+  "decrypt",
+  "cipher",
   "ssh",
   "tls",
   "ssl",
@@ -256,12 +270,18 @@ function isRedactedValue(text, value, endIndex) {
   // skipped the assignment as already-handled and left `leftover` in place --
   // which is also what a chunk boundary produces when a partial value is
   // redacted and its remainder arrives in the next event.
-  // A space after the marker is NOT proof the value ended: compaction can turn
-  // `Authorization: Bearer <jwt>` into `Authorization: [secret] <jwt>` and the
-  // JWT then arrives looking like separate prose. Only a line break or a
-  // structural delimiter closes the value.
+  // The marker counts as the whole value only when NOTHING but whitespace
+  // follows it on the same line. A space is not proof the value ended:
+  // compaction turns `Authorization: Bearer <jwt>` into
+  // `Authorization: [secret] <jwt>`, and the JWT then arrives looking like
+  // separate prose. Structural delimiters still close it, so a marker nested in
+  // JSON stays idempotent.
   const rest = text.slice(endIndex);
-  return rest === "" || /^[\r\n"'`,;}\]]/.test(rest);
+  if (rest === "" || /^["'`,;}\]]/.test(rest)) {
+    return true;
+  }
+  const restOfLine = rest.split("\n", 1)[0];
+  return restOfLine.trim() === "";
 }
 
 const ANSI_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
@@ -463,7 +483,16 @@ function readValueAt(text, index, key) {
     // which replaced only the opening brace and left the contents behind a
     // marker that read as complete.
     const after = text[index + balanced.length];
-    if (after === undefined || /[\s"'`,;}\]]/.test(after)) {
+    // A balanced span that is EXACTLY the redaction marker, with more content
+    // after it on the same line, is not a value -- it is a marker with a
+    // credential appended, which is what compaction and accidental
+    // concatenation produce. Accepting it would rewrite `[secret]` as
+    // `[secret]`, a no-op, and leave the suffix in place. Fall through to the
+    // line rule so the whole thing goes.
+    const markerWithSuffix =
+      balanced.value === REDACTED &&
+      text.slice(index + balanced.length).split("\n", 1)[0].trim() !== "";
+    if ((after === undefined || /[\s"'`,;}\]]/.test(after)) && !markerWithSuffix) {
       return balanced;
     }
   }
