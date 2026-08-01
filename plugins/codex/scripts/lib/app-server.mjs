@@ -77,9 +77,16 @@ export function appendBoundedStderr(state, chunk) {
   const redacted = sanitizeModelText(combined);
   const tail = redacted.slice(Math.max(0, redacted.length - MAX_CAPTURED_STDERR_BYTES));
   const firstNewline = tail.indexOf("\n");
-  return firstNewline === -1
-    ? { text: "", discarding: true }
-    : { text: tail.slice(firstNewline + 1), discarding: false };
+  if (firstNewline === -1) {
+    return { text: "", discarding: true };
+  }
+  const kept = tail.slice(firstNewline + 1);
+  // If compaction ended mid-value, the retained text ends with the redaction
+  // marker and the REST of that value is still to come. Emitting it would
+  // produce `KEY=[secret] <credential>` -- a marker with a live suffix. Discard
+  // the continuation instead, so the redactor is never handed that shape.
+  const endsWithMarker = /\[secret\]\s*$/.test(kept);
+  return { text: kept, discarding: endsWithMarker };
 }
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);

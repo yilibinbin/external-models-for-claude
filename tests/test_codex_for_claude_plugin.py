@@ -10814,14 +10814,76 @@ def test_codex_sanitizer_symmetric_keys_and_marker_suffixes():
         const out = {};
         for (const s of [
           'HMAC_KEY=AAAALEAK', 'FERNET_KEY=bbbbLEAK', 'AES_KEY=cLEAK', 'SIGNING_KEY=dLEAK',
-          'API_KEY=[secret] TOPSECRETVALUE', 'Authorization: [secret] eyJLEAK',
+          // ATTACHED suffix -- unambiguously a marker with a credential stuck to
+          // it, which is what shell concatenation produces.
+          'API_KEY=[secret]TOPSECRETVALUE',
         ]) out[s] = sanitizeModelText(s);
+        // A SPACE-separated marker is deliberately left alone: that is this
+        // module's OWN output shape, and treating it as forged made
+        // sanitize(sanitize(x)) !== sanitize(x) -- re-running the redactor on
+        // 'credentials=[secret] at src/config.ts:12' swallowed the file and
+        // line, destroying exactly the context a stop-gate block conveys. The
+        // compaction path that could produce a live suffix is closed at its
+        // source instead: appendBoundedStderr discards a continuation that
+        // follows a marker.
+        out.idempotentWithContext = sanitizeModelText('credentials=[secret] at src/config.ts:12');
         // The genuine marker must still count as already redacted.
         out.idempotent = sanitizeModelText('API_KEY=[secret]');
         console.log(JSON.stringify(out));
         """
     )
     idempotent = payload.pop("idempotent")
+    with_context = payload.pop("idempotentWithContext")
     for original, value in payload.items():
         assert "LEAK" not in value and "TOPSECRET" not in value, f"{original} leaked"
     assert idempotent == "API_KEY=[secret]"
+    # The finding survives re-sanitization with its location intact.
+    assert with_context == "credentials=[secret] at src/config.ts:12"
+
+
+def test_codex_sanitizer_compound_credential_names_with_infixes():
+    # A qualifier does not have to sit immediately before the weak word:
+    # HMAC_ROTATION_KEY, SIGNING_PRIMARY_KEY and TLS_SERVER_KEY put a
+    # descriptive word in between and matched nothing. PGPASSWORD and
+    # REDISCLI_AUTH need the suffix rule -- the credential word ends the segment
+    # rather than being the whole of it.
+    #
+    # The negatives matter as much: `tokenizer` starts with `token` and `author`
+    # contains `auth`, and a substring rule would eat both.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'PGPASSWORD=hLEAK', 'REDISCLI_AUTH=rLEAK', 'HMAC_ROTATION_KEY=kLEAK',
+          'SIGNING_PRIMARY_KEY=sLEAK', 'TLS_SERVER_KEY=tLEAK',
+          'SSH_AUTH_SOCK=/tmp/a.sock', 'AUTHOR=alice', 'auth_type=basic',
+          'oauth_state=xyz', 'tokenizer_model=gpt-4 and notes', 'PRIMARY_KEY=id',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, value in payload.items():
+        if "LEAK" in original:
+            assert "LEAK" not in value, f"{original} leaked"
+        else:
+            assert value == original, f"over-redacted {original!r} -> {value!r}"
+
+
+def test_codex_quoted_value_with_attached_suffix_is_taken_whole():
+    # `API_KEY="TOP"SECRET` is one value written as two pieces -- ordinary shell
+    # concatenation, not adversarial shaping. Accepting the first quoted span
+    # left the attached suffix behind a marker that read as complete.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          attached: sanitizeModelText('API_KEY="TOP"SECRETLEAK'),
+          // A SPACE ends the value in shell, and this is also this module's own
+          // output shape, so it must survive re-sanitization unchanged.
+          separated: sanitizeModelText('API_KEY="[secret]" and notes'),
+        }));
+        """
+    )
+    assert "LEAK" not in payload["attached"]
+    assert payload["separated"] == 'API_KEY="[secret]" and notes'

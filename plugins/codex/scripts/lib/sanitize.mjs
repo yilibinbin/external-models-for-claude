@@ -121,6 +121,10 @@ const REDACTED = "[secret]";
 const STRONG_KEY_SEGMENTS = new Set([
   "token",
   "authorization",
+  // A bare `auth` segment is a credential on its own (REDISCLI_AUTH). It cannot
+  // be reached from ordinary words: `author` does not split to `auth`, and
+  // SSH_AUTH_SOCK / auth_type are demoted by their trailing shape word.
+  "auth",
   "secret",
   "secrets",
   "password",
@@ -254,8 +258,22 @@ function isSensitiveKey(key) {
   if (segments.some((segment) => STRONG_KEY_SEGMENTS.has(segment))) {
     return true;
   }
+  // A segment ENDING in a credential word: PGPASSWORD, REDISCLI_AUTH. Suffix
+  // rather than substring, so `tokenizer` (token + more) and `author` stay out.
+  if (
+    segments.some((segment) =>
+      [...STRONG_KEY_SEGMENTS, "auth"].some((word) => segment !== word && segment.endsWith(word))
+    )
+  ) {
+    return true;
+  }
+  // A qualifier anywhere BEFORE the weak word, not just immediately before it.
+  // HMAC_ROTATION_KEY / SIGNING_PRIMARY_KEY / TLS_SERVER_KEY put a descriptive
+  // word in between and matched nothing. PRIMARY_KEY and FOREIGN_KEY stay out
+  // because their leading segment is not a qualifier at all.
   return segments.some(
-    (segment, index) => index > 0 && KEY_QUALIFIERS.has(segments[index - 1]) && WEAK_KEY_SEGMENTS.has(segment)
+    (segment, index) =>
+      WEAK_KEY_SEGMENTS.has(segment) && segments.slice(0, index).some((earlier) => KEY_QUALIFIERS.has(earlier))
   );
 }
 
@@ -458,6 +476,13 @@ function readValueAt(text, index, key) {
   QUOTED_VALUE.lastIndex = index;
   const quoted = QUOTED_VALUE.exec(text);
   if (quoted) {
+    // Shell concatenation: `API_KEY="TOP"SECRET` is one value written as two
+    // pieces. Accepting the first quoted span left the attached suffix in place
+    // behind a marker that read as complete.
+    if (/^\S/.test(text.slice(index + quoted[0].length))) {
+      const lineEnd = text.indexOf("\n", index);
+      return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
+    }
     return { value: quoted[2], quote: quoted[1], length: quoted[0].length };
   }
 
@@ -489,9 +514,14 @@ function readValueAt(text, index, key) {
     // concatenation produce. Accepting it would rewrite `[secret]` as
     // `[secret]`, a no-op, and leave the suffix in place. Fall through to the
     // line rule so the whole thing goes.
+    // Only an ATTACHED suffix counts as forged. Requiring merely "something else
+    // on the line" broke idempotence: re-sanitizing
+    // `credentials=[secret] at src/config.ts:12` swallowed the file and line,
+    // destroying exactly the context a stop-gate block exists to convey. The
+    // compaction case that motivated this is closed at its source instead --
+    // appendBoundedStderr now discards a continuation that follows a marker.
     const markerWithSuffix =
-      balanced.value === REDACTED &&
-      text.slice(index + balanced.length).split("\n", 1)[0].trim() !== "";
+      balanced.value === REDACTED && /^\S/.test(text.slice(index + balanced.length));
     if ((after === undefined || /[\s"'`,;}\]]/.test(after)) && !markerWithSuffix) {
       return balanced;
     }
