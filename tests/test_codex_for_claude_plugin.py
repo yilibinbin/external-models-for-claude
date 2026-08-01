@@ -11342,3 +11342,55 @@ def test_codex_parse_result_already_carries_status_and_failure_message():
     for name, result in payload.items():
         assert result["status"] == 1, f"{name} dropped status"
         assert result["failureMessage"] == "boom", f"{name} dropped failureMessage"
+
+
+def test_codex_yaml_block_scalar_uses_indentation_depth_not_diff_stripping():
+    # Round 10 stripped a leading [+- ] from continuation lines so a unified diff
+    # would parse. That ate the single indent space of raw YAML: `KEY: |` followed
+    # by a one-space-indented secret terminated the block immediately and the
+    # secret survived. Two- and four-space indents masked it by leaving a space
+    # behind. The block now continues while a line is indented deeper than the
+    # indicator's own line, which is the actual YAML rule and also holds for a
+    # nested key.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          indent1: sanitizeModelText('API_KEY: |\\n TOPSECRET\\nnext: ok'),
+          indent2: sanitizeModelText('API_KEY: |\\n  TOPSECRET\\nnext: ok'),
+          indent4: sanitizeModelText('API_KEY: |\\n    TOPSECRET\\nnext: ok'),
+          nested: sanitizeModelText('outer:\\n  API_KEY: |\\n    TOPSECRET\\n  next: ok'),
+          diffAdded: sanitizeModelText('+API_KEY: |\\n+  TOPSECRET\\n+next: ok'),
+          diffContext: sanitizeModelText(' API_KEY: |\\n   TOPSECRET\\n next: ok'),
+          diffBlankLine: sanitizeModelText('+API_KEY: |\\n+\\n+  TOPSECRET\\n+next: ok'),
+        }));
+        """
+    )
+    for name, value in payload.items():
+        assert "TOPSECRET" not in value, f"{name} leaked"
+        # Over-redaction is the opposite failure: the block must stop at the next
+        # key rather than swallowing it.
+        assert "next: ok" in value, f"{name} swallowed the following key"
+
+
+def test_codex_structured_review_early_return_sanitizes_a_failed_job():
+    # renderStoredJobResult has TWO branches that replay storedJob.rendered. The
+    # structured-review early return fires first, so redacting only the later one
+    # left a failed structured review replaying its stored output unredacted --
+    # exactly the legacy-sidecar case the later branch was added for.
+    payload = run_node_script(
+        """
+        import { renderStoredJobResult } from './plugins/codex/scripts/lib/render.mjs';
+        const storedJob = {
+          rendered: 'API_KEY=HUNTER2_SUPER_SECRET\\n',
+          result: { verdict: 'approve', summary: 's', findings: [], next_steps: [] },
+        };
+        console.log(JSON.stringify({
+          failed: renderStoredJobResult({ id: 'j', status: 'failed', title: 't' }, storedJob),
+          completed: renderStoredJobResult({ id: 'j', status: 'completed', title: 't' }, storedJob),
+        }));
+        """
+    )
+    assert "HUNTER2_SUPER_SECRET" not in payload["failed"]
+    # A successful deliverable stays byte-identical -- that exemption is the point.
+    assert "HUNTER2_SUPER_SECRET" in payload["completed"]

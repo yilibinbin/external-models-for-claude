@@ -652,12 +652,25 @@ function readValueAt(text, index, key) {
   // YAML. The continuation test below also has to see through a unified-diff
   // marker, since a config change arrives as `+API_KEY: |`.
   if (/^[|>][-+0-9]*\s*(?:#.*)?$/.test(text.slice(index, end))) {
+    // A block scalar continues while lines are indented MORE than the line
+    // holding the indicator -- that is the YAML rule, and it is the only test
+    // that works for a nested key as well as a top-level one. Comparing depths
+    // rather than "is indented at all" also survives a unified-diff marker: the
+    // marker is stripped from both sides only when the indicator itself carries
+    // one, so a raw YAML line indented by a single space keeps that space
+    // instead of having it eaten as a diff marker.
+    const headStart = text.lastIndexOf("\n", index) + 1;
+    const head = text.slice(headStart, end);
+    const diffMarked = /^[+-]/.test(head);
+    const stripMarker = (value) => (diffMarked && /^[+-]/.test(value) ? value.slice(1) : value);
+    const indentOf = (value) => /^\s*/.exec(value)[0].length;
+    const headIndent = indentOf(stripMarker(head));
     let cursor = end;
     while (cursor < text.length) {
       const nextEnd = text.indexOf("\n", cursor + 1);
       const line = text.slice(cursor + 1, nextEnd === -1 ? text.length : nextEnd);
-      const body = line.replace(/^[+\- ]/, "");
-      if (body.trim() && !/^\s/.test(body)) {
+      const body = stripMarker(line);
+      if (body.trim() && indentOf(body) <= headIndent) {
         break;
       }
       cursor = nextEnd === -1 ? text.length : nextEnd;

@@ -466,7 +466,11 @@ export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
+    // Same read-side redaction as the branch below: this early return fires
+    // first for a structured review, so fixing only the later branch left a
+    // failed structured review replaying its stored output unredacted.
+    const stored = job.status === "failed" ? sanitizeModelText(storedJob.rendered) : storedJob.rendered;
+    const output = stored.endsWith("\n") ? stored : `${stored}\n`;
     if (!threadId) {
       return output;
     }
