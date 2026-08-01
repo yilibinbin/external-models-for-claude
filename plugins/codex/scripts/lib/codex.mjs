@@ -448,9 +448,18 @@ function recordItem(state, item, lifecycle, threadId = null) {
     if (item.text) {
       if (!threadId || threadId === state.threadId) {
         state.lastAgentMessage = item.text;
-        if (lifecycle === "completed" && item.phase === "final_answer") {
+        // `phase` is optional in the protocol -- providers are not required to
+        // emit MessagePhase, and an absent value must keep legacy behaviour. A
+        // completed message with NO phase is therefore a final answer; only an
+        // explicit non-final phase means it is not. Requiring
+        // phase === "final_answer" reclassified ordinary phase-less completions
+        // as failures, which downstream became partial output, a failed job, and
+        // a fail-closed Stop block.
+        if (lifecycle === "completed" && (item.phase == null || item.phase === "final_answer")) {
           state.finalAnswerSeen = true;
-          scheduleInferredCompletion(state);
+          if (item.phase === "final_answer") {
+            scheduleInferredCompletion(state);
+          }
         }
       }
       if (lifecycle === "completed") {

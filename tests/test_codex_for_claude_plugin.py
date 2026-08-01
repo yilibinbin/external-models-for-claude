@@ -11114,3 +11114,53 @@ def test_codex_stop_gate_honours_the_host_loop_guard():
     # The CALL site, not the definition, which sits earlier in the file.
     review_at = source.index("= runStopReview(")
     assert guard_at < review_at, "the loop guard must precede any review dispatch"
+
+
+def test_codex_sanitizer_finds_inline_pem_delimiters():
+    # A delimiter can start mid-line -- `Evidence follows: -----BEGIN ...` is an
+    # ordinary diagnostic. Anchoring at the line start missed it, and the orphan
+    # fallback then declined too, merely because the text contained a BEGIN.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          inline: sanitizeModelText(
+            'Evidence follows: -----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFO\\n-----END PRIVATE KEY-----'
+          ),
+        }));
+        """
+    )
+    assert "TUlJRXZRSUJBREFO" not in payload["inline"]
+    # The lead-in text is not key material and stays.
+    assert "Evidence follows:" in payload["inline"]
+
+
+def test_codex_sanitizer_is_linear_in_weak_key_segments():
+    # The SIXTH quadratic, introduced by the round that added "a qualifier
+    # anywhere before the weak word": the prefix was re-sliced and rescanned for
+    # every weak segment. Measured 58/803/2168 ms at 16/64/128 KB of `key_`.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const timeFor = (kb) => {
+          const text = 'key_'.repeat((kb * 1024) / 4) + '=x';
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(16), large: timeFor(256) }));
+        """
+    )
+    assert payload["large"] < 200, f"256KB of weak segments took {payload['large']}ms"
+
+
+def test_codex_phaseless_completion_is_still_a_final_answer():
+    # `phase` is optional in the protocol: providers are not required to emit
+    # MessagePhase, and an absent value must keep legacy behaviour. Requiring
+    # phase === "final_answer" reclassified ordinary phase-less completions as
+    # failures, which downstream became partial output, a failed job, a failed
+    # multi-review role, and a fail-closed Stop block.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert 'item.phase == null || item.phase === "final_answer"' in source, (
+        "a completed message with no phase must count as a final answer"
+    )

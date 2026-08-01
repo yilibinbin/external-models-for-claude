@@ -280,10 +280,21 @@ function isSensitiveKey(key) {
   // HMAC_ROTATION_KEY / SIGNING_PRIMARY_KEY / TLS_SERVER_KEY put a descriptive
   // word in between and matched nothing. PRIMARY_KEY and FOREIGN_KEY stay out
   // because their leading segment is not a qualifier at all.
-  return segments.some(
-    (segment, index) =>
-      WEAK_KEY_SEGMENTS.has(segment) && segments.slice(0, index).some((earlier) => KEY_QUALIFIERS.has(earlier))
-  );
+  //
+  // One pass with a carried flag, not a prefix rescan per weak segment: the
+  // slice+some form reallocated the whole prefix each time and measured
+  // 58/803/2168 ms at 16/64/128 KB of repeated `key_` -- the SIXTH quadratic in
+  // this file, and introduced by the round that added the rule.
+  let sawQualifier = false;
+  for (const segment of segments) {
+    if (sawQualifier && WEAK_KEY_SEGMENTS.has(segment)) {
+      return true;
+    }
+    if (KEY_QUALIFIERS.has(segment)) {
+      sawQualifier = true;
+    }
+  }
+  return false;
 }
 
 // Keeps redaction idempotent: `summary` is now sanitized at the job-state
@@ -318,9 +329,6 @@ export function stripTerminalControls(text) {
   return String(text ?? "").replace(ANSI_PATTERN, "").replace(CONTROL_PATTERN, "");
 }
 
-const PEM_BEGIN_LINE = /^-----BEGIN [A-Z0-9 ]*-----/;
-const PEM_END_LINE = /^-----END [A-Z0-9 ]*-----/;
-
 // Line-scanned rather than matched with a lazy wildcard. A `[\s\S]*?` between
 // BEGIN and END rescans every suffix when END never arrives: measured 213 ms at
 // 328 KB and 1081 ms at 656 KB of repeated unmatched BEGIN headers -- the FOURTH
@@ -329,16 +337,17 @@ const PEM_END_LINE = /^-----END [A-Z0-9 ]*-----/;
 // Scanning lines also closes a truncated block, which the old pattern returned
 // byte-for-byte because it required an END marker that a crashed writer never
 // emitted.
-// A key committed to a repository reaches this channel through a unified diff,
-// where every line carries a `+`/`-`/space marker. Requiring the marker to start
-// the trimmed line missed exactly that case -- and the orphan fallback then
-// declined too, because the text still contained a BEGIN.
-function stripDiffPrefix(line) {
-  const trimmed = line.trim();
-  // Strip a single diff marker ONLY when what remains is a PEM delimiter.
-  // A blanket strip ate the first dash of `-----BEGIN` itself.
-  const stripped = trimmed.replace(/^[+\- ]\s*/, "");
-  return stripped.startsWith("-----") ? stripped : trimmed;
+
+// Finds a PEM delimiter anywhere in the line, tolerating a unified-diff marker
+// in front of it. Anchoring at the line start missed both an inline delimiter
+// and a diff-prefixed one.
+function findPemDelimiter(line, kind) {
+  const marker = `-----${kind} `;
+  const at = line.indexOf(marker);
+  if (at === -1) {
+    return -1;
+  }
+  return line.slice(at).includes("-----", marker.length) ? at : -1;
 }
 
 function redactPemBlocks(text) {
@@ -348,13 +357,19 @@ function redactPemBlocks(text) {
   const out = [];
   let inBlock = false;
   for (const line of text.split("\n")) {
-    if (!inBlock && PEM_BEGIN_LINE.test(stripDiffPrefix(line))) {
-      inBlock = true;
-      out.push(REDACTED);
-      continue;
+    if (!inBlock) {
+      const beginAt = findPemDelimiter(line, "BEGIN");
+      if (beginAt !== -1) {
+        inBlock = true;
+        // A delimiter can start mid-line: `Evidence follows: -----BEGIN ...`.
+        // Keep what came before it; the key itself starts at the marker.
+        const head = line.slice(0, beginAt).trimEnd();
+        out.push(head ? `${head} ${REDACTED}` : REDACTED);
+        continue;
+      }
     }
     if (inBlock) {
-      if (PEM_END_LINE.test(stripDiffPrefix(line))) {
+      if (findPemDelimiter(line, "END") !== -1) {
         inBlock = false;
       }
       continue;
