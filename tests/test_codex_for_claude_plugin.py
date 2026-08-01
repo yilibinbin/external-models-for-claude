@@ -9409,11 +9409,16 @@ def test_codex_failed_turn_does_not_promote_intermediate_chatter_unredacted():
     # Tightened in a later round: status 0 alone is not enough, because
     # `turn/completed` can land without a non-empty final_answer ever being
     # captured while lastAgentMessage still holds commentary.
+    # Tightened again: the returned text is the CAPTURED final answer, not
+    # whatever message happened to arrive last. finalAnswerSeen is sticky while
+    # lastAgentMessage keeps being overwritten, so a legal
+    # completion-then-commentary sequence otherwise ends with the commentary
+    # standing in as the answer.
     assert re.search(
-        r"turnStatus === 0 && turnState\.finalAnswerSeen\s*\?\s*turnState\.lastAgentMessage\s*"
-        r":\s*sanitizeModelText\(turnState\.lastAgentMessage\)",
+        r"turnStatus === 0 && turnState\.finalAnswerSeen\s*\?\s*turnState\.finalAnswerText\s*"
+        r":\s*sanitizeModelText\(turnState\.finalAnswerText \|\| turnState\.lastAgentMessage\)",
         source,
-    ), "a failed or final-answer-less turn must not return the last agent message unredacted"
+    ), "a completed turn must return the captured final answer, not the last message"
 
 
 def test_codex_reasoning_summary_is_redacted_where_it_is_stored():
@@ -11164,3 +11169,34 @@ def test_codex_phaseless_completion_is_still_a_final_answer():
     assert 'item.phase == null || item.phase === "final_answer"' in source, (
         "a completed message with no phase must count as a final answer"
     )
+
+
+def test_codex_sanitizer_redacts_password_only_uris():
+    # `redis://:p4ss@host` is how Redis and Celery URLs carry an auth string --
+    # the userinfo is password-only, and requiring a username missed them
+    # entirely. CELERY_BROKER_URL also misses every key rule, so the value
+    # pattern is the only thing standing between it and a persisted diagnostic.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          passwordOnly: sanitizeModelText('CELERY_BROKER_URL=redis://:p4ssW0rd@cache.internal/0'),
+          withUser: sanitizeModelText('REDIS_URL=redis://u:p4ssW0rd@h'),
+          plain: sanitizeModelText('BASE_URL=https://api.example.com'),
+        }));
+        """
+    )
+    assert "p4ssW0rd" not in payload["passwordOnly"]
+    assert "p4ssW0rd" not in payload["withUser"]
+    assert payload["plain"] == "BASE_URL=https://api.example.com"
+
+
+def test_codex_final_answer_text_is_captured_not_inferred_from_the_last_message():
+    # finalAnswerSeen is sticky, while every later main-thread message still
+    # overwrites lastAgentMessage. A legal sequence -- a phase-less completion
+    # followed by an explicit commentary message -- therefore ended with the
+    # COMMENTARY returned as the final answer, and the Stop classifier would
+    # accept an ALLOW parsed from it, defeating fail-closed behaviour.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "state.finalAnswerText = item.text;" in source
+    assert "finalAnswerText: \"\"," in source

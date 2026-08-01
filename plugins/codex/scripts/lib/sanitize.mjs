@@ -36,7 +36,9 @@ const SECRET_PATTERNS = [
   // `[a-z0-9+.-]*` retries at every word boundary of ordinary dotted output:
   // measured 63/1105/4166 ms at 16k/64k/128k of `a.` -- the FIFTH quadratic in
   // this file, introduced by the previous round's own fix.
-  /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]+:[^\s@/]+@[^\s"'`,}]*/gi,
+  // The userinfo may be password-only: `redis://:p4ss@host` is how Redis and
+  // Celery URLs carry an auth string, and requiring a username missed them.
+  /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]*:[^\s@/]+@[^\s"'`,}]*/gi,
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z_]{20,}\b/g,

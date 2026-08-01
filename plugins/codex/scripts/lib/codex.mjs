@@ -21,6 +21,7 @@
  *   finalTurn: Turn | null,
  *   completed: boolean,
  *   finalAnswerSeen: boolean,
+ *   finalAnswerText: string,
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
@@ -343,6 +344,7 @@ function createTurnCaptureState(threadId, options = {}) {
     finalTurn: null,
     completed: false,
     finalAnswerSeen: false,
+    finalAnswerText: "",
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
@@ -457,6 +459,12 @@ function recordItem(state, item, lifecycle, threadId = null) {
         // a fail-closed Stop block.
         if (lifecycle === "completed" && (item.phase == null || item.phase === "final_answer")) {
           state.finalAnswerSeen = true;
+          // Capture the TEXT, not just a flag. The flag is sticky while
+          // lastAgentMessage keeps being overwritten, so a legal
+          // completion-then-commentary sequence ended with the commentary
+          // standing in as the final answer -- and the Stop classifier would
+          // accept an ALLOW parsed from it.
+          state.finalAnswerText = item.text;
           if (item.phase === "final_answer") {
             scheduleInferredCompletion(state);
           }
@@ -1161,8 +1169,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       finalAnswerSeen: Boolean(turnState.finalAnswerSeen),
       finalMessage:
         turnStatus === 0 && turnState.finalAnswerSeen
-          ? turnState.lastAgentMessage
-          : sanitizeModelText(turnState.lastAgentMessage),
+          ? turnState.finalAnswerText
+          : sanitizeModelText(turnState.finalAnswerText || turnState.lastAgentMessage),
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
