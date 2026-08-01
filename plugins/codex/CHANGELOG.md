@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0-fh.9
+
+No code change. `1.1.0-fh.8` and its predecessor shipped as multi-commit branches that
+carried the new version from their FIRST commit onward, so merging them put several
+different byte trees on `main` under one version key. The pinning guard treats every
+published commit carrying a version as an anchor — correctly, since a version is a cache
+key on machines that installed at any of those commits — and `main` was red from the
+moment `1.1.0-fh.7` landed. This release gives the shipping tree a key nothing else has
+ever published under.
+
+The recurrence is a merge-strategy problem, not a versioning one: a squash merge, or a
+bump confined to a branch's final commit, leaves exactly one anchor per version.
+
 ## 1.1.0-fh.8
 
 - Carry the app-server's exit reason across the broker as structured data. `review/start`/`turn/start` are streaming, so once the request has returned there is no pending call left to reject and the broker previously just closed its sockets — the outer client then reported only "connection closed", with not even the exit code. The reason now travels on a `broker/appServerExited` notification, validated on receipt and rendered from a local template: `{code}`/`{signal}` for an ordinary child exit, and `{protocol: "malformed-output"}` when the stream dies on unparseable JSONL — that one resolves before the child's `exit` fires, so it would otherwise be reported as an exit with no code at all.

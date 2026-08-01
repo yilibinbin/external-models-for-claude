@@ -47,13 +47,15 @@ fh.7 re-validation (2026-07-31): `claude plugin validate --strict .claude-plugin
 
 fh.8 re-validation (2026-08-01): `claude plugin validate --strict .claude-plugin/marketplace.json`, `claude plugin validate --strict plugins/codex` and `claude plugin validate --strict plugins/review-chain` were re-run against the bumped `1.1.0-fh.8` manifests and all three exited 0 ("Validation passed"). The bump is forced rather than cosmetic: `1.1.0-fh.7` shipped with the output-redaction work, so the app-server crash diagnostics cannot reuse that key without giving one version two byte trees. The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold.
 
+fh.9 re-validation (2026-08-01): `claude plugin validate --strict .claude-plugin/marketplace.json`, `claude plugin validate --strict plugins/codex` and `claude plugin validate --strict plugins/review-chain` were re-run against the bumped `1.1.0-fh.9` manifests and all three exited 0 ("Validation passed"). This bump carries no code change: it exists because fh.7 and fh.8 each landed as multi-commit merges whose intermediate commits published differing trees under one version key. The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold.
+
 ## Current version axis
 
-These are the values that ship today, each verified by the fh.8 re-validation above.
+These are the values that ship today, each verified by the fh.9 re-validation above.
 
 - Marketplace metadata version: `0.5.0`
-- Codex marketplace entry version: `1.1.0-fh.8`
-- Codex plugin manifest version: `1.1.0-fh.8`
+- Codex marketplace entry version: `1.1.0-fh.9`
+- Codex plugin manifest version: `1.1.0-fh.9`
 
 The marketplace metadata version is no longer pinned inside this plugin (see the `1.1.0-fh.5`
 changelog entry): pinning it here made every marketplace bump edit codex's shipped bytes under
