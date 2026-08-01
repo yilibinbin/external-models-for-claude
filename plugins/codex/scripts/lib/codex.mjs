@@ -345,6 +345,7 @@ function createTurnCaptureState(threadId, options = {}) {
     completed: false,
     finalAnswerSeen: false,
     finalAnswerText: "",
+    explicitFinalAnswerSeen: false,
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
@@ -458,6 +459,16 @@ function recordItem(state, item, lifecycle, threadId = null) {
         // as failures, which downstream became partial output, a failed job, and
         // a fail-closed Stop block.
         if (lifecycle === "completed" && (item.phase == null || item.phase === "final_answer")) {
+          // An EXPLICIT final_answer is authoritative and must not be replaced
+          // by a later phase-less message: phases may be omitted, so ordinary
+          // trailing commentary would otherwise overwrite a verdict -- turning
+          // a BLOCK into an ALLOW on the fail-closed path.
+          if (state.explicitFinalAnswerSeen && item.phase == null) {
+            return;
+          }
+          if (item.phase === "final_answer") {
+            state.explicitFinalAnswerSeen = true;
+          }
           state.finalAnswerSeen = true;
           // Capture the TEXT, not just a flag. The flag is sticky while
           // lastAgentMessage keeps being overwritten, so a legal

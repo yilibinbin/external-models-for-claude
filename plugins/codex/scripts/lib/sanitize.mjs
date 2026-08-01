@@ -648,12 +648,16 @@ function readValueAt(text, index, key) {
   // YAML block scalar: `KEY: |` puts the value on the FOLLOWING indented lines,
   // so stopping at the newline redacted the indicator and left the secret. Take
   // the indented block too.
-  if (/^[|>][-+0-9]*\s*$/.test(text.slice(index, end))) {
+  // Tolerate an inline comment after the indicator; `KEY: | # note` is valid
+  // YAML. The continuation test below also has to see through a unified-diff
+  // marker, since a config change arrives as `+API_KEY: |`.
+  if (/^[|>][-+0-9]*\s*(?:#.*)?$/.test(text.slice(index, end))) {
     let cursor = end;
     while (cursor < text.length) {
       const nextEnd = text.indexOf("\n", cursor + 1);
       const line = text.slice(cursor + 1, nextEnd === -1 ? text.length : nextEnd);
-      if (line.trim() && !/^\s/.test(line)) {
+      const body = line.replace(/^[+\- ]/, "");
+      if (body.trim() && !/^\s/.test(body)) {
         break;
       }
       cursor = nextEnd === -1 ? text.length : nextEnd;

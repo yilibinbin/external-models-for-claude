@@ -11200,3 +11200,81 @@ def test_codex_final_answer_text_is_captured_not_inferred_from_the_last_message(
     source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
     assert "state.finalAnswerText = item.text;" in source
     assert "finalAnswerText: \"\"," in source
+
+
+def test_codex_explicit_final_answer_is_not_replaced_by_later_commentary():
+    # Phases may be omitted, so a phase-less message counts as final -- but that
+    # made every trailing phase-less message overwrite an EXPLICIT verdict. A
+    # probe emitting 'BLOCK: confirmed defect' then a phase-less
+    # 'ALLOW: late commentary' ended with the ALLOW returned, which the stop
+    # classifier would accept: a BLOCK turned into an ALLOW on the fail-closed
+    # path.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "if (state.explicitFinalAnswerSeen && item.phase == null) {" in source
+    assert "state.explicitFinalAnswerSeen = true;" in source
+
+
+def test_codex_failed_review_never_renders_as_a_verdict():
+    # A failed turn produces no verdict, whatever its text parsed into. Review
+    # JSON emitted mid-flight rendered as 'Verdict: approve' with no blockers,
+    # and that rendering is persisted and replayed by /codex:result -- a failed
+    # review reading as an approval.
+    payload = run_node_script(
+        """
+        import { renderReviewResult } from './plugins/codex/scripts/lib/render.mjs';
+        const parsed = {
+          parsed: { verdict: 'approve', summary: 'ok', findings: [], next_steps: [] },
+          rawOutput: '{"verdict":"approve"}',
+        };
+        console.log(JSON.stringify({
+          failed: renderReviewResult(
+            { ...parsed, status: 1, failureMessage: 'transport reset' },
+            { reviewLabel: 'Review', targetLabel: 'HEAD', reasoningSummary: [] },
+          ),
+          succeeded: renderReviewResult(
+            { ...parsed, status: 0 },
+            { reviewLabel: 'Review', targetLabel: 'HEAD', reasoningSummary: [] },
+          ),
+        }));
+        """
+    )
+    assert "did not complete" in payload["failed"]
+    assert "transport reset" in payload["failed"]
+    assert "Verdict: approve" not in payload["failed"]
+    # A successful review still renders its verdict.
+    assert "Verdict: approve" in payload["succeeded"]
+
+
+def test_codex_yaml_block_survives_diff_prefixes_and_inline_comments():
+    # A config change arrives as a unified diff, and `KEY: | # note` is valid
+    # YAML. Both forms left the indented secret in place under a marker.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          diffPrefixed: sanitizeModelText('+API_KEY: |\\n+  TOPSECRET\\n+next: ok'),
+          withComment: sanitizeModelText('API_KEY: | # note\\n  TOPSECRET\\nnext: ok'),
+        }));
+        """
+    )
+    for name, value in payload.items():
+        assert "TOPSECRET" not in value, f"{name} leaked"
+        assert "next: ok" in value, f"{name} destroyed the following key"
+
+
+def test_codex_legacy_failed_sidecar_is_sanitized_on_read():
+    # The state directory is deliberately retained across upgrades, so a sidecar
+    # written by an earlier release holds unredacted output that no write-side
+    # fix can reach. /codex:result must redact it on the way out.
+    payload = run_node_script(
+        """
+        import { renderStoredJobResult } from './plugins/codex/scripts/lib/render.mjs';
+        console.log(JSON.stringify({
+          legacyFailed: renderStoredJobResult(
+            { id: 'j', status: 'failed', title: 't' },
+            { rendered: 'API_KEY=HUNTER2_SUPER_SECRET\\n' },
+          ),
+        }));
+        """
+    )
+    assert "HUNTER2_SUPER_SECRET" not in payload["legacyFailed"]

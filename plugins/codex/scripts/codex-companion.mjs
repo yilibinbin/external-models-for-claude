@@ -503,10 +503,15 @@ async function executeReviewRun(request) {
 
   const context = collectReviewContext(request.cwd, target);
   const result = await runAppServerTurn(context.repoRoot, buildAdversarialReviewTurnOptions(context, request, focusText));
+  const reviewFailureMessage = buildFailureMessage(result.error, result.stderr);
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
-    failureMessage: buildFailureMessage(result.error, result.stderr)
+    failureMessage: reviewFailureMessage
   });
+  // The renderer needs the outcome and the diagnostic; without them a failed
+  // turn whose text happened to parse rendered as an approval.
+  parsed.status = result.status;
+  parsed.failureMessage = reviewFailureMessage;
   const payload = {
     review: reviewName,
     target,

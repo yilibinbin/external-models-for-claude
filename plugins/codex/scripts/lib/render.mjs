@@ -1,3 +1,4 @@
+import { sanitizeModelText } from "./sanitize.mjs";
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -228,6 +229,23 @@ export function renderSetupReport(report) {
 }
 
 export function renderReviewResult(parsedResult, meta) {
+  // A FAILED turn never produces a verdict, whatever its text parsed into.
+  // Valid-looking review JSON emitted mid-flight rendered as "Verdict: approve"
+  // with no blockers, and that misleading rendering was persisted and replayed
+  // by /codex:result -- a failed review reading as an approval.
+  const failed = Number.isInteger(parsedResult?.status) && parsedResult.status !== 0;
+  if (failed) {
+    const lines = [`# Codex ${meta.reviewLabel}`, "", "Codex did not complete the review."];
+    const diagnostics = String(parsedResult?.failureMessage ?? parsedResult?.parseError ?? "").trim();
+    if (diagnostics) {
+      lines.push("", "diagnostics:", "", "```text", diagnostics, "```");
+    }
+    if (parsedResult.rawOutput) {
+      lines.push("", "partial output:", "", "```text", parsedResult.rawOutput.trimEnd(), "```");
+    }
+    return `${lines.join("\n").trimEnd()}\n`;
+  }
+
   if (!parsedResult.parsed) {
     const lines = [
       `# Codex ${meta.reviewLabel}`,
@@ -472,7 +490,11 @@ export function renderStoredJobResult(job, storedJob) {
   }
 
   if (storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
+    // Sanitize on READ as well as on write. The state directory is deliberately
+    // retained across upgrades, so a sidecar written by an earlier release holds
+    // unredacted output that no write-side fix can reach.
+    const stored = job.status === "failed" ? sanitizeModelText(storedJob.rendered) : storedJob.rendered;
+    const output = stored.endsWith("\n") ? stored : `${stored}\n`;
     if (!threadId) {
       return output;
     }
