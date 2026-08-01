@@ -8899,6 +8899,97 @@ def test_codex_sanitizer_fails_closed_on_unterminated_and_forged_markers():
     assert payload["idempotent"] == "API_KEY=[secret]"
 
 
+def test_codex_sanitizer_takes_nested_structured_values_whole():
+    # The balanced-span terminator set has to include the PARENT closers.
+    # Omitting `}`/`]` rejected the correct span whenever a sensitive object or
+    # array was the final child, so the bare rule replaced only the opening
+    # delimiter -- leaving the contents behind a marker that read as complete,
+    # and stable across a second pass.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const nested = sanitizeModelText('{"credentials":{"value":"TOPSECRET"}}');
+        console.log(JSON.stringify({
+          nested,
+          nestedTwice: sanitizeModelText(nested),
+          array: sanitizeModelText('{"token":["A","TOPSECRET2"]}'),
+          // Still terminates correctly when something follows.
+          followed: sanitizeModelText('credentials={"v":"TOPSECRET3"} tail'),
+        }));
+        """
+    )
+    assert "TOPSECRET" not in payload["nested"]
+    assert "TOPSECRET" not in payload["nestedTwice"]
+    assert "TOPSECRET2" not in payload["array"]
+    assert "TOPSECRET3" not in payload["followed"]
+    assert payload["followed"].endswith(" tail")
+
+
+def test_codex_stop_gate_reason_is_redacted_before_it_is_truncated():
+    # Same ordering error as truncating stderr before redacting it, in a second
+    # place: the reason was sliced to its length bound BEFORE any sanitizer ran,
+    # so a recognized token straddling the cutoff became an unrecognized
+    # fragment -- 38 of a 39-character key emitted with no marker, leaving one
+    # character to enumerate. The result goes into the permanent transcript.
+    payload = run_node_script(
+        """
+        import { parseStopReviewOutput } from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        const key = 'AIza' + 'B'.repeat(35);
+        const result = parseStopReviewOutput('BLOCK: ' + 'x'.repeat(3960) + ' ' + key);
+        console.log(JSON.stringify({ reason: result.reason }));
+        """
+    )
+    reason = payload["reason"]
+    assert "AIzaBBBB" not in reason, "a truncated key fragment survived"
+    assert "[secret]" in reason
+
+
+def test_codex_auth_probe_detail_is_redacted():
+    # `setup` prints this field and `setup --json` emits it. The value is
+    # child-supplied -- a JSON-RPC or config error quotes the offending value --
+    # so a normal setup command could surface a password.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    raw_detail = "detail: error instanceof Error ? error.message : String(error),"
+    assert raw_detail not in source, "an auth/setup probe copies a child error message verbatim"
+    assert source.count(
+        "detail: sanitizeModelText(error instanceof Error ? error.message : String(error)),"
+    ) == 2
+
+
+def test_codex_state_dir_and_file_modes_are_repaired_on_upgrade(tmp_path):
+    # `mode` is honoured only when a path is CREATED, so an install upgrading
+    # from a release that wrote 0755/0644 keeps those modes forever. Repairing
+    # only jobs/ left the parent traversable and state.json group-readable --
+    # and state.json holds exactly the summaries and error messages the rest of
+    # this change redacts.
+    plugin_data = tmp_path / "plugin-data"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { ensureStateDir, resolveStateDir, resolveStateFile, saveState }
+          from './plugins/codex/scripts/lib/state.mjs';
+        const workspace = process.argv[1];
+        // Seed the legacy modes an older release would have left behind.
+        ensureStateDir(workspace);
+        saveState(workspace, { jobs: [] });
+        fs.chmodSync(resolveStateDir(workspace), 0o755);
+        fs.chmodSync(resolveStateFile(workspace), 0o644);
+        ensureStateDir(workspace);
+        const modeOf = (p) => (fs.statSync(p).mode & 0o777).toString(8);
+        console.log(JSON.stringify({
+          dir: modeOf(resolveStateDir(workspace)),
+          file: modeOf(resolveStateFile(workspace)),
+        }));
+        """,
+        env={"CLAUDE_PLUGIN_DATA": str(plugin_data)},
+        args=[str(workspace)],
+    )
+    assert payload["dir"] == "700", f"state dir left at {payload['dir']}"
+    assert payload["file"] == "600", f"state.json left at {payload['file']}"
+
+
 def test_codex_sanitizer_is_linear_in_whitespace_runs():
     # The THIRD distinct quadratic found in this file, each through a different
     # door: a greedy prefix in the key pattern, a growing prefix slice per

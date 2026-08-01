@@ -68,12 +68,26 @@ export function ensureStateDir(cwd) {
   // session. It was created at the process umask -- 0755 on a default install.
   const jobsDir = resolveJobsDir(cwd);
   fs.mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
-  // Repairs a directory created 0755 by an earlier release (mode is honoured
-  // only on creation).
-  try {
-    fs.chmodSync(jobsDir, 0o700);
-  } catch {
-    // Best effort: a directory we cannot chmod is one we do not own.
+  // Repair modes created by an earlier release: `mode` is honoured only when the
+  // path is CREATED, so an upgraded install keeps 0755/0644 forever otherwise.
+  //
+  // The state ROOT and state.json need this as much as jobs/ does -- repairing
+  // only jobs/ left the parent traversable and state.json group-readable, and
+  // state.json carries the summaries and error messages that the rest of this
+  // change redacts. Measured on a real install: root 0755, state.json 0644,
+  // while jobs/ was already 0700.
+  for (const [target, mode] of [
+    [resolveStateDir(cwd), 0o700],
+    [jobsDir, 0o700],
+    [resolveStateFile(cwd), 0o600]
+  ]) {
+    try {
+      if (fs.existsSync(target)) {
+        fs.chmodSync(target, mode);
+      }
+    } catch {
+      // Best effort: a path we cannot chmod is one we do not own.
+    }
   }
 }
 

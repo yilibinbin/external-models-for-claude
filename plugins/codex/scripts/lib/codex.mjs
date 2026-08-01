@@ -830,7 +830,9 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   } catch (error) {
     return buildAuthStatus({
       loggedIn: false,
-      detail: error instanceof Error ? error.message : String(error),
+      // Child-supplied: a JSON-RPC or config error quotes the offending value,
+      // and this field is printed by `setup` and emitted by `setup --json`.
+      detail: sanitizeModelText(error instanceof Error ? error.message : String(error)),
       source: "app-server"
     });
   }
@@ -900,7 +902,9 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   } catch (error) {
     return buildAuthStatus({
       loggedIn: false,
-      detail: error instanceof Error ? error.message : String(error),
+      // Child-supplied: a JSON-RPC or config error quotes the offending value,
+      // and this field is printed by `setup` and emitted by `setup --json`.
+      detail: sanitizeModelText(error instanceof Error ? error.message : String(error)),
       source: "app-server"
     });
   } finally {

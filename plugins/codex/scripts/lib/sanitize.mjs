@@ -250,8 +250,13 @@ function readValueAt(text, index, key) {
   // -- a no-op -- and left `leftover` in place, reading as redacted.
   const balanced = readBalancedValue(text, index);
   if (balanced) {
+    // The terminator set must include the PARENT closers. Omitting `}`/`]`
+    // rejected the correct span whenever a sensitive object or array was the
+    // final child -- `{"credentials":{"value":"X"}}` fell back to the bare rule,
+    // which replaced only the opening brace and left the contents behind a
+    // marker that read as complete.
     const after = text[index + balanced.length];
-    if (after === undefined || /[\s"'`,;]/.test(after)) {
+    if (after === undefined || /[\s"'`,;}\]]/.test(after)) {
       return balanced;
     }
   }

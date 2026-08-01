@@ -131,7 +131,11 @@ export function parseStopReviewOutput(text) {
   }
   const verdict = match[1].toUpperCase();
   const blockDetail = verdict === "BLOCK" ? fullText.replace(/^\s*BLOCK:\s*/i, "").trim() : "";
-  const reason = blockDetail || match[2] || fullText || verdict;
+  // Redact BEFORE slicing. Cutting a recognized token turns it into an
+  // unrecognized fragment: a 39-char Google API key straddling the cutoff
+  // emitted 38 characters with no marker, leaving one character to enumerate.
+  // Same ordering error as truncating stderr before redacting it.
+  const reason = sanitizeModelText(blockDetail || match[2] || fullText || verdict);
   const suffix = "\n[truncated]";
   const boundedReason = reason.length > MAX_STOP_BLOCK_REASON_CHARS
     ? `${reason.slice(0, MAX_STOP_BLOCK_REASON_CHARS - suffix.length)}${suffix}`
