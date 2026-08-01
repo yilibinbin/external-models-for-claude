@@ -7,6 +7,15 @@ sinks unredacted. Scope and design were settled by a three-model serial
 adversarial review (Claude / Gemini via Antigravity / Codex) that rejected the
 first design outright; the items below are what survived it.
 
+- **The review summary redacts on every branch, not only the fallback.** The
+  summary is persisted into job state and re-displayed by `/codex:status` and
+  `/codex:result`, which is why `firstMeaningfulLine` redacts -- but the review
+  call site selected it as the last of three options. A model-authored `summary`
+  field and a `JSON.parse` error both bypassed it, and V8 quotes the offending
+  bytes verbatim in the parse error, so raw output leaked through the message
+  itself. The status table strips control characters per cell; the plain-text
+  `Summary:` lines do not. (Folds in the fix that was open separately as #15.)
+
 - **Redaction no longer has a key-length cliff.** Sensitivity is decided in JS
   against the captured key, not inside the regex. Every regex that scans the key
   needs a bounded prefix to stay linear, and a bounded prefix anchored by a

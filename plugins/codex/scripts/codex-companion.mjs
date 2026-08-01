@@ -503,15 +503,10 @@ async function executeReviewRun(request) {
 
   const context = collectReviewContext(request.cwd, target);
   const result = await runAppServerTurn(context.repoRoot, buildAdversarialReviewTurnOptions(context, request, focusText));
-  const reviewFailureMessage = buildFailureMessage(result.error, result.stderr);
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
-    failureMessage: reviewFailureMessage
+    failureMessage: buildFailureMessage(result.error, result.stderr)
   });
-  // The renderer needs the outcome and the diagnostic; without them a failed
-  // turn whose text happened to parse rendered as an approval.
-  parsed.status = result.status;
-  parsed.failureMessage = reviewFailureMessage;
   const payload = {
     review: reviewName,
     target,
@@ -542,7 +537,13 @@ async function executeReviewRun(request) {
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    // All three branches are persisted and re-displayed, so all three must be
+    // redacted -- see firstMeaningfulLine. The first is model-authored text and
+    // the second is a JSON.parse error, which quotes the offending bytes
+    // verbatim; only the fallback was covered before.
+    summary: sanitizeModelText(
+      parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`)
+    ),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label

@@ -11278,3 +11278,67 @@ def test_codex_legacy_failed_sidecar_is_sanitized_on_read():
         """
     )
     assert "HUNTER2_SUPER_SECRET" not in payload["legacyFailed"]
+
+
+def test_codex_review_summary_is_sanitized_on_every_branch():
+    """All three summary branches must redact, not just the fallback.
+
+    The summary is persisted into job state and re-displayed by /codex:status and
+    /codex:result -- which is why firstMeaningfulLine redacts. But the review call
+    site selects it as the LAST of three options, so a model-authored `summary`
+    field and a JSON.parse error both bypassed that. V8 quotes the offending bytes
+    verbatim in the parse error, so the raw output leaks through the message
+    itself. The status table strips control chars per cell, but the plain-text
+    `Summary:` lines do not.
+    """
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+
+    # The wrapper may sit on a preceding line, so inspect the whole expression.
+    idx = companion.index("parsed.parsed?.summary")
+    expr_start = companion.rindex("summary:", 0, idx)
+    expr_end = companion.index("\n", idx)
+    summary_expr = companion[expr_start:expr_end]
+
+    assert "sanitizeModelText(" in summary_expr, (
+        "the model-authored summary and the parse-error branch reach persisted job "
+        f"state unredacted:\n  {summary_expr.strip()}"
+    )
+
+    # The probe below is matched by the existing patterns wherever they run, so a
+    # failure here is a missing call, not a pattern gap.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        let parseError = '';
+        try {
+          JSON.parse('API_KEY=hunter2_super_secret_value');
+        } catch (error) {
+          parseError = error.message;
+        }
+        console.log(JSON.stringify({ parseError, redacted: sanitizeModelText(parseError) }));
+        """
+    )
+    assert "API_KEY=hu" in payload["parseError"], "V8 no longer quotes the input"
+    assert "API_KEY=hu" not in payload["redacted"]
+
+
+def test_codex_parse_result_already_carries_status_and_failure_message():
+    """parseStructuredOutput spreads its fallback, so the renderer already has both.
+
+    Round 10 added explicit re-assignments at the review call site on the theory
+    that the renderer never received them. It did; it just ignored them. Keep the
+    spread contract asserted so the re-assignments stay unnecessary.
+    """
+    payload = run_node_script(
+        """
+        import { parseStructuredOutput } from './plugins/codex/scripts/lib/codex.mjs';
+        console.log(JSON.stringify({
+          valid: parseStructuredOutput('{"verdict":"approve"}', { status: 1, failureMessage: 'boom' }),
+          empty: parseStructuredOutput('', { status: 1, failureMessage: 'boom' }),
+          invalid: parseStructuredOutput('not json', { status: 1, failureMessage: 'boom' }),
+        }));
+        """
+    )
+    for name, result in payload.items():
+        assert result["status"] == 1, f"{name} dropped status"
+        assert result["failureMessage"] == "boom", f"{name} dropped failureMessage"
