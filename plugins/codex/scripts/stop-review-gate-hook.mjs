@@ -254,6 +254,14 @@ function main() {
     throw new Error("test hook crash");
   }
   const input = readHookInput();
+  // The host sets stop_hook_active when Stop fires because a hook already
+  // blocked. Running another full review then costs a second eight-minute
+  // Codex turn per iteration -- and the new fail-closed path for a turn with no
+  // final answer makes that loop reachable, since it blocks without ever
+  // reaching a verdict. Allow the Stop through; the gate already had its say.
+  if (input.stop_hook_active) {
+    return;
+  }
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);

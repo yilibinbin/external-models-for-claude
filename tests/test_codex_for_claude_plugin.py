@@ -11059,3 +11059,58 @@ def test_codex_task_summary_is_redacted_before_truncation():
     assert 'sanitizeModelText(String(text ?? "").trim().replace(/\\s+/g, " "))' in source, (
         "shorten() must redact before truncating"
     )
+
+
+def test_codex_sanitizer_handles_diff_prefixed_pem_and_adjacent_quotes():
+    # A key committed to a repository reaches this channel through a unified
+    # diff, where every line carries a `+`. Requiring the marker to start the
+    # trimmed line missed exactly that case, and the orphan fallback declined too
+    # because the text still contained a BEGIN.
+    #
+    # The first attempt at the fix stripped any leading `+`/`-`, which ate the
+    # first dash of `-----BEGIN` itself -- hence the plain and truncated cases
+    # below.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          diffAdded: sanitizeModelText(
+            '+-----BEGIN PRIVATE KEY-----\\n+TUlJRXZRSUJBREFOQmdrcQ\\n+-----END PRIVATE KEY-----'
+          ),
+          plain: sanitizeModelText(
+            '-----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFOQmdrcQ\\n-----END PRIVATE KEY-----'
+          ),
+          truncated: sanitizeModelText('-----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFO\\n'),
+          // Adjacent quoted fragments are ordinary shell concatenation.
+          adjacentQuotes: sanitizeModelText('PASSWORD=""\\'hunter2\\''),
+        }));
+        """
+    )
+    assert "TUlJRXZRSUJBREFOQmdrcQ" not in payload["diffAdded"]
+    assert "TUlJRXZRSUJBREFOQmdrcQ" not in payload["plain"]
+    assert "TUlJRXZRSUJBREFO" not in payload["truncated"]
+    assert "hunter2" not in payload["adjacentQuotes"]
+
+
+def test_codex_turn_without_final_answer_is_not_status_zero():
+    # `turn/completed` can arrive with status 0 while no final answer was ever
+    # captured. Status drives the rendered framing, the persisted job status and
+    # multi-review role success, so leaving it at 0 recorded intermediate
+    # commentary as a completed result everywhere downstream.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "buildResultStatus(turnState) || (turnState.finalAnswerSeen ? 0 : 1)" in source, (
+        "a turn with no final answer must not report success"
+    )
+
+
+def test_codex_stop_gate_honours_the_host_loop_guard():
+    # The host sets stop_hook_active when Stop fires because a hook already
+    # blocked. Without honouring it, each iteration runs another full Codex
+    # review -- and the fail-closed path for a turn with no final answer makes
+    # that loop reachable, since it blocks without ever reaching a verdict.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "stop-review-gate-hook.mjs").read_text()
+    assert "if (input.stop_hook_active) {" in source
+    guard_at = source.index("input.stop_hook_active")
+    # The CALL site, not the definition, which sits earlier in the file.
+    review_at = source.index("= runStopReview(")
+    assert guard_at < review_at, "the loop guard must precede any review dispatch"

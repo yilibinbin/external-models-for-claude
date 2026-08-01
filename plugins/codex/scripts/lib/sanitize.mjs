@@ -329,6 +329,18 @@ const PEM_END_LINE = /^-----END [A-Z0-9 ]*-----/;
 // Scanning lines also closes a truncated block, which the old pattern returned
 // byte-for-byte because it required an END marker that a crashed writer never
 // emitted.
+// A key committed to a repository reaches this channel through a unified diff,
+// where every line carries a `+`/`-`/space marker. Requiring the marker to start
+// the trimmed line missed exactly that case -- and the orphan fallback then
+// declined too, because the text still contained a BEGIN.
+function stripDiffPrefix(line) {
+  const trimmed = line.trim();
+  // Strip a single diff marker ONLY when what remains is a PEM delimiter.
+  // A blanket strip ate the first dash of `-----BEGIN` itself.
+  const stripped = trimmed.replace(/^[+\- ]\s*/, "");
+  return stripped.startsWith("-----") ? stripped : trimmed;
+}
+
 function redactPemBlocks(text) {
   if (!text.includes("-----BEGIN ")) {
     return text;
@@ -336,13 +348,13 @@ function redactPemBlocks(text) {
   const out = [];
   let inBlock = false;
   for (const line of text.split("\n")) {
-    if (!inBlock && PEM_BEGIN_LINE.test(line.trim())) {
+    if (!inBlock && PEM_BEGIN_LINE.test(stripDiffPrefix(line))) {
       inBlock = true;
       out.push(REDACTED);
       continue;
     }
     if (inBlock) {
-      if (PEM_END_LINE.test(line.trim())) {
+      if (PEM_END_LINE.test(stripDiffPrefix(line))) {
         inBlock = false;
       }
       continue;
@@ -542,7 +554,12 @@ function readValueAt(text, index, key) {
     // closing quote is concatenation. Treating every non-space as a suffix made
     // `{"password":"x","file":"a.ts"}` collapse to `{"password":[secret]`,
     // dropping the file and line a persisted failure needs to stay actionable.
-    if (/^[^\s,;:}\])"'`]/.test(text.slice(index + quoted[0].length))) {
+    // Adjacent quoted fragments are ordinary shell concatenation:
+    // `PASSWORD=""'"'"'hunter2'"'"'` is one value in two pieces, and treating the
+    // second quote as a terminator left the whole password in the clear behind a
+    // marker. A quote directly against the closing quote continues the value; a
+    // quote after a delimiter does not.
+    if (/^[^\s,;:}\])]/.test(text.slice(index + quoted[0].length))) {
       const lineEnd = text.indexOf("\n", index);
       return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
     }

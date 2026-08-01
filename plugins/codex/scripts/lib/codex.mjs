@@ -1134,7 +1134,12 @@ export async function runAppServerTurn(cwd, options = {}) {
     // turn the last message is therefore intermediate commentary, not the
     // deliverable -- so it does not get the deliverable's byte-identical
     // exemption, and must not be persisted or rendered as the answer unredacted.
-    const turnStatus = buildResultStatus(turnState);
+    // A turn that never produced a final answer did not succeed, whatever
+    // `turn/completed` reported: lastAgentMessage is overwritten by every
+    // main-thread message, so status 0 with finalAnswerSeen false means the
+    // captured text is commentary. Downstream, status drives the rendered
+    // framing, the persisted job status, and multi-review role success.
+    const turnStatus = buildResultStatus(turnState) || (turnState.finalAnswerSeen ? 0 : 1);
     return {
       status: turnStatus,
       threadId,
