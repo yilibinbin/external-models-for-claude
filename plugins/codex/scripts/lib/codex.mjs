@@ -21,6 +21,7 @@
  *   finalTurn: Turn | null,
  *   completed: boolean,
  *   finalAnswerSeen: boolean,
+ *   finalAnswerText: string,
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
@@ -39,18 +40,39 @@ import { resolveTurnEffort } from "./effort-policy.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { sanitizeModelText } from "./sanitize.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 
-function cleanCodexStderr(stderr) {
-  return stderr
+// The single capture boundary for the child's diagnostic channel.
+//
+// Nobody ran a command to read stderr -- unlike the review text, it is exhaust,
+// so it can be redacted hard with no loss of anything the user asked for. Doing
+// it here rather than at each sink is deliberate: this is the one function both
+// stderr readers already pass through, and every downstream sink (the rendered
+// fence, the job sidecar, the job log, `parseError`) derives from this value.
+export function captureDiagnosticStderr(stderr) {
+  const cleaned = String(stderr ?? "")
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter((line) => line && !line.startsWith("WARNING: proceeding, even though we could not update PATH:"))
     .join("\n");
+  return sanitizeModelText(cleaned);
+}
+
+// `result.error?.message ?? result.stderr` short-circuits, so when an error
+// message is present the stderr branch -- and with it captureDiagnosticStderr --
+// never runs. The error message is child-supplied (a JSON-RPC error quotes the
+// offending payload), so it needs the same treatment as the branch it displaces.
+export function buildFailureMessage(error, stderr) {
+  const message = error?.message;
+  if (typeof message === "string" && message) {
+    return sanitizeModelText(message);
+  }
+  return captureDiagnosticStderr(stderr ?? "");
 }
 
 /** @returns {ThreadStartParams} */
@@ -82,8 +104,13 @@ function buildTurnInput(prompt) {
   return [{ type: "text", text: prompt, text_elements: [] }];
 }
 
+// Redact BEFORE truncating. Every preview in this file goes through here, and
+// cutting a recognized token turns it into an unrecognized fragment: a 39-char
+// key crossing the 96-char preview limit became a 38-char prefix with no marker,
+// leaving one character to enumerate. Third occurrence of this ordering error --
+// the same bug appeared in the stderr bound and in the stop-gate reason.
 function shorten(text, limit = 72) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  const normalized = sanitizeModelText(String(text ?? "").trim().replace(/\s+/g, " "));
   if (!normalized) {
     return "";
   }
@@ -317,6 +344,8 @@ function createTurnCaptureState(threadId, options = {}) {
     finalTurn: null,
     completed: false,
     finalAnswerSeen: false,
+    finalAnswerText: "",
+    explicitFinalAnswerSeen: false,
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
@@ -422,9 +451,34 @@ function recordItem(state, item, lifecycle, threadId = null) {
     if (item.text) {
       if (!threadId || threadId === state.threadId) {
         state.lastAgentMessage = item.text;
-        if (lifecycle === "completed" && item.phase === "final_answer") {
+        // `phase` is optional in the protocol -- providers are not required to
+        // emit MessagePhase, and an absent value must keep legacy behaviour. A
+        // completed message with NO phase is therefore a final answer; only an
+        // explicit non-final phase means it is not. Requiring
+        // phase === "final_answer" reclassified ordinary phase-less completions
+        // as failures, which downstream became partial output, a failed job, and
+        // a fail-closed Stop block.
+        if (lifecycle === "completed" && (item.phase == null || item.phase === "final_answer")) {
+          // An EXPLICIT final_answer is authoritative and must not be replaced
+          // by a later phase-less message: phases may be omitted, so ordinary
+          // trailing commentary would otherwise overwrite a verdict -- turning
+          // a BLOCK into an ALLOW on the fail-closed path.
+          if (state.explicitFinalAnswerSeen && item.phase == null) {
+            return;
+          }
+          if (item.phase === "final_answer") {
+            state.explicitFinalAnswerSeen = true;
+          }
           state.finalAnswerSeen = true;
-          scheduleInferredCompletion(state);
+          // Capture the TEXT, not just a flag. The flag is sticky while
+          // lastAgentMessage keeps being overwritten, so a legal
+          // completion-then-commentary sequence ended with the commentary
+          // standing in as the final answer -- and the Stop classifier would
+          // accept an ALLOW parsed from it.
+          state.finalAnswerText = item.text;
+          if (item.phase === "final_answer") {
+            scheduleInferredCompletion(state);
+          }
         }
       }
       if (lifecycle === "completed") {
@@ -434,7 +488,10 @@ function recordItem(state, item, lifecycle, threadId = null) {
           stderrMessage: null,
           phase: item.phase === "final_answer" ? "finalizing" : null,
           logTitle: sourceLabel ? `Subagent ${sourceLabel} message` : "Assistant message",
-          logBody: item.text
+          // Intermediate agent chatter, not the deliverable. The unredacted-body
+          // exemption covers the review output only (see "Review output" below);
+          // these are persisted to the job log just the same.
+          logBody: sanitizeModelText(item.text)
         });
       }
     }
@@ -449,6 +506,9 @@ function recordItem(state, item, lifecycle, threadId = null) {
         stderrMessage: null,
         phase: "finalizing",
         logTitle: "Review output",
+        // THE deliverable -- byte-identical by design. A review whose point is
+        // "line 12 commits AWS_SECRET_ACCESS_KEY=..." is destroyed by redaction
+        // exactly when it matters most. This is the only unredacted log body.
         logBody: item.review
       });
     }
@@ -457,7 +517,14 @@ function recordItem(state, item, lifecycle, threadId = null) {
 
   if (item.type === "reasoning" && lifecycle === "completed") {
     const nextSections = extractReasoningSections(item.summary);
-    state.reasoningSummary = mergeReasoningSections(state.reasoningSummary, nextSections);
+    // Redact where the sections are STORED, not only on the progress copy. The
+    // raw array is rendered verbatim by both review renderers and persisted into
+    // the payload and the job sidecar, so sanitizing the log copy alone left the
+    // original reachable through --json, the job log and /codex:result.
+    state.reasoningSummary = mergeReasoningSections(
+      state.reasoningSummary,
+      nextSections.map((section) => sanitizeModelText(section))
+    );
     if (nextSections.length > 0) {
       const sourceLabel = labelForThread(state, threadId);
       emitLogEvent(state.onProgress, {
@@ -466,7 +533,8 @@ function recordItem(state, item, lifecycle, threadId = null) {
           : `Reasoning summary captured: ${shorten(nextSections[0], 96)}`,
         stderrMessage: null,
         logTitle: sourceLabel ? `Subagent ${sourceLabel} reasoning summary` : "Reasoning summary",
-        logBody: nextSections.map((section) => `- ${section}`).join("\n")
+        // Reasoning is intermediate too: it quotes what the model read.
+        logBody: sanitizeModelText(nextSections.map((section) => `- ${section}`).join("\n"))
       });
     }
     return;
@@ -795,7 +863,9 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   } catch (error) {
     return buildAuthStatus({
       loggedIn: false,
-      detail: error instanceof Error ? error.message : String(error),
+      // Child-supplied: a JSON-RPC or config error quotes the offending value,
+      // and this field is printed by `setup` and emitted by `setup --json`.
+      detail: sanitizeModelText(error instanceof Error ? error.message : String(error)),
       source: "app-server"
     });
   }
@@ -865,7 +935,9 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   } catch (error) {
     return buildAuthStatus({
       loggedIn: false,
-      detail: error instanceof Error ? error.message : String(error),
+      // Child-supplied: a JSON-RPC or config error quotes the offending value,
+      // and this field is printed by `setup` and emitted by `setup --json`.
+      detail: sanitizeModelText(error instanceof Error ? error.message : String(error)),
       source: "app-server"
     });
   } finally {
@@ -968,7 +1040,7 @@ export async function runAppServerReview(cwd, options = {}) {
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr)
+      stderr: captureDiagnosticStderr(client.stderr)
     };
   });
 }
@@ -1085,15 +1157,35 @@ export async function runAppServerTurn(cwd, options = {}) {
       { onProgress: options.onProgress }
     );
 
+    // lastAgentMessage is overwritten by EVERY main-thread agent message, while
+    // final_answer completion is tracked separately. On a failed or interrupted
+    // turn the last message is therefore intermediate commentary, not the
+    // deliverable -- so it does not get the deliverable's byte-identical
+    // exemption, and must not be persisted or rendered as the answer unredacted.
+    // A turn that never produced a final answer did not succeed, whatever
+    // `turn/completed` reported: lastAgentMessage is overwritten by every
+    // main-thread message, so status 0 with finalAnswerSeen false means the
+    // captured text is commentary. Downstream, status drives the rendered
+    // framing, the persisted job status, and multi-review role success.
+    const turnStatus = buildResultStatus(turnState) || (turnState.finalAnswerSeen ? 0 : 1);
     return {
-      status: buildResultStatus(turnState),
+      status: turnStatus,
       threadId,
       turnId: turnState.turnId,
-      finalMessage: turnState.lastAgentMessage,
+      // Success is not enough on its own: `turn/completed` can land with status 0
+      // while no non-empty final_answer was ever captured, and lastAgentMessage
+      // is overwritten by EVERY main-thread message. Without finalAnswerSeen the
+      // value is commentary, so it loses the deliverable's byte-identical
+      // exemption just as a failed turn's does.
+      finalAnswerSeen: Boolean(turnState.finalAnswerSeen),
+      finalMessage:
+        turnStatus === 0 && turnState.finalAnswerSeen
+          ? turnState.finalAnswerText
+          : sanitizeModelText(turnState.finalAnswerText || turnState.lastAgentMessage),
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr),
+      stderr: captureDiagnosticStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions

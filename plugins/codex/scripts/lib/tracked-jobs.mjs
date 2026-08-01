@@ -2,6 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { JOB_HEARTBEAT_INTERVAL_MS } from "./job-lifecycle.mjs";
+import { sanitizeModelText } from "./sanitize.mjs";
 import {
   hasEndedSession,
   loadState,
@@ -24,25 +25,29 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
-function normalizeProgressEvent(value) {
+// `message` and `stderrMessage` reach the terminal, the job log and the
+// /codex:status preview, and they quote the model's shell commands and
+// assistant text verbatim. `logBody` is deliberately NOT redacted: it carries
+// the model's own review text, which is the deliverable.
+export function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return {
-      message: String(value.message ?? "").trim(),
+      message: sanitizeModelText(String(value.message ?? "").trim()),
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
       threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
-      stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
+      stderrMessage: value.stderrMessage == null ? null : sanitizeModelText(String(value.stderrMessage).trim()),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
       logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
     };
   }
 
   return {
-    message: String(value ?? "").trim(),
+    message: sanitizeModelText(String(value ?? "").trim()),
     phase: null,
     threadId: null,
     turnId: null,
-    stderrMessage: String(value ?? "").trim(),
+    stderrMessage: sanitizeModelText(String(value ?? "").trim()),
     logTitle: null,
     logBody: null
   };
@@ -121,7 +126,10 @@ function appendLogBlockIfJobCurrent(job, logFile, title, body) {
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
   const logFile = resolveJobLogFile(workspaceRoot, jobId);
-  fs.writeFileSync(logFile, "", "utf8");
+  // The job log accumulates the full rendered output and every model message
+  // body; it is world-readable at the default umask and has no TTL.
+  fs.writeFileSync(logFile, "", { encoding: "utf8", mode: 0o600 });
+  fs.chmodSync(logFile, 0o600);
   if (title) {
     appendLogLine(logFile, `Starting ${title}.`);
   }
@@ -447,7 +455,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       status: completionStatus,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
-      summary: execution.summary,
+      summary: sanitizeModelText(execution.summary),
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,
       completedAt
@@ -476,7 +484,9 @@ export async function runTrackedJob(job, runner, options = {}) {
     }
     return execution;
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+    // Persisted to state.json AND the job sidecar, and re-shown by
+    // /codex:result. Wrapping the single derivation covers both writes.
+    const errorMessage = sanitizeModelText(error instanceof Error ? error.message : String(error));
     heartbeatActive = false;
     if (heartbeat) {
       clearInterval(heartbeat);

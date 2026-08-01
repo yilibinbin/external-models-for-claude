@@ -15,6 +15,79 @@ import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
+import { sanitizeModelText } from "./sanitize.mjs";
+
+// Cap the captured stderr as it ARRIVES, not when it is read. The process
+// hosting a SpawnedCodexAppServerClient is long-lived -- in the default broker
+// topology it backs the whole session -- so an unbounded accumulator grows for
+// as long as the child keeps writing. Bounding on read cannot help: by then the
+// full string is already realized and about to be regex-scanned in one pass.
+//
+// The tail is kept because that is where a crash explains itself; the head is
+// what gets dropped.
+export const MAX_CAPTURED_STDERR_BYTES = 64 * 1024;
+export const COMPACTION_HEADROOM_BYTES = 32 * 1024;
+
+// Three rules, each earned from a measured failure:
+//
+// 1. Truncate at a LINE boundary, never mid-line. Cutting raw bytes can land
+//    between a key and its value, and the redactor keys off the key name -- so a
+//    headless `hunter2` survives a pass that would have caught `PASSWORD=hunter2`.
+// 2. Carry `discarding` across chunks. Dropping an overlong line once is not
+//    enough: stderr arrives in arbitrary chunks, so the REMAINDER of that line
+//    lands in the next event and is otherwise captured as a fresh, headless
+//    line. Measured: `PASSWORD=` + `HUNTER2` + `_SUFFIX\n` retained `_SUFFIX`.
+// 3. Redact before cutting, because a line boundary is NOT safe for a multiline
+//    secret (see below).
+//
+// If the retained tail contains no newline at all, the single line is longer
+// than the whole cap and there is no safe place to cut it, so it is dropped
+// entirely rather than kept headless.
+export function appendBoundedStderr(state, chunk) {
+  const previous =
+    state && typeof state === "object" ? state : { text: typeof state === "string" ? state : "", discarding: false };
+  let incoming = String(chunk ?? "");
+
+  if (previous.discarding) {
+    const newline = incoming.indexOf("\n");
+    if (newline === -1) {
+      return { text: previous.text, discarding: true };
+    }
+    incoming = incoming.slice(newline + 1);
+  }
+
+  const combined = `${previous.text}${incoming}`;
+  // Headroom before compacting. Cutting back to the cap on every overflow made
+  // the redaction pass run once per CHUNK once the buffer was full -- correct,
+  // but it re-scans the whole buffer each time. Compacting only at 1.5x amortises
+  // that to once per half-cap of new output. Measured without headroom: 500
+  // at-cap chunks cost 31 ms, which is survivable but scales with chunk count,
+  // not with bytes.
+  if (combined.length <= MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES) {
+    return { text: combined, discarding: false };
+  }
+
+  // Redact BEFORE cutting. A line boundary is not a safe boundary for a
+  // multiline secret: cutting inside a PEM block drops the key name and the
+  // BEGIN header while keeping body lines, which a key-based redactor cannot
+  // recognize afterwards. Running it here, while the header is still present,
+  // is the only point where the context needed to identify the value exists.
+  //
+  // Only on overflow, so the common path pays nothing.
+  const redacted = sanitizeModelText(combined);
+  const tail = redacted.slice(Math.max(0, redacted.length - MAX_CAPTURED_STDERR_BYTES));
+  const firstNewline = tail.indexOf("\n");
+  if (firstNewline === -1) {
+    return { text: "", discarding: true };
+  }
+  const kept = tail.slice(firstNewline + 1);
+  // If compaction ended mid-value, the retained text ends with the redaction
+  // marker and the REST of that value is still to come. Emitting it would
+  // produce `KEY=[secret] <credential>` -- a marker with a live suffix. Discard
+  // the continuation instead, so the redactor is never handed that shape.
+  const endsWithMarker = /\[secret\]\s*$/.test(kept);
+  return { text: kept, discarding: endsWithMarker };
+}
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -236,8 +309,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
 
+    this.stderrCapture = { text: "", discarding: false };
     this.proc.stderr.on("data", (chunk) => {
-      this.stderr += chunk;
+      this.stderrCapture = appendBoundedStderr(this.stderrCapture, chunk);
+      this.stderr = this.stderrCapture.text;
     });
 
     this.proc.on("error", (error) => {

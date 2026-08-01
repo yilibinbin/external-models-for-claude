@@ -1,6 +1,19 @@
+import { sanitizeModelText } from "./sanitize.mjs";
+
+// The reason is model-authored and ends up in the Claude transcript, which is
+// permanent and outside this plugin's control. Redaction keeps the finding and
+// drops the credential: the sanitizer preserves the key name and the location
+// and replaces only the value, so "src/config.ts:12 commits FOO_TOKEN=..."
+// stays actionable without carrying the secret into the transcript.
+//
+// All three return shapes reference this one binding, so wrapping it here
+// covers every classifier outcome. It does NOT cover handleHookException, which
+// never calls this function -- that is why emitHookDecision redacts as well.
 export function classifyStopGateResult(result, options = {}) {
   const failOpen = Boolean(options.failOpen);
-  const reason = String(result?.reason || "").trim() || "Codex stop review gate did not return a reason.";
+  const reason =
+    sanitizeModelText(String(result?.reason || "").trim()) ||
+    "Codex stop review gate did not return a reason.";
   const verdict = String(result?.verdict || "").trim().toUpperCase();
 
   if (result?.ok && verdict === "BLOCK") {

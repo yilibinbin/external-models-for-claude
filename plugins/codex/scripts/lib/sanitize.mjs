@@ -1,18 +1,328 @@
+// BEST-EFFORT REDACTION. Read this before relying on it.
+//
+// This module recognises credential SHAPES. Its coverage is therefore
+// enumerable, and an enumerable list is never complete: adversarial review of
+// this file found new bypasses in FIVE consecutive rounds -- long key names,
+// quoted keys, auth schemes it had not listed, unterminated quotes, structured
+// values, braces inside strings, PEM headers longer than the window it
+// inspected, forged `[secret]` markers, keys containing spaces. Each was real
+// and each was fixed; the point is that the sequence did not end because it
+// cannot.
+//
+// Threat model, stated so the limits are judged against the right bar: this
+// defends against ACCIDENTAL exposure -- a review quoting a config file, a
+// stack trace carrying an env dump. It does NOT defend against a producer
+// deliberately shaping output to evade it. Nothing shape-based can.
+//
+// So it must never be the ONLY thing standing between child output and a sink.
+// Where a structural bound exists, that bound is the defence and this is a
+// second layer: the raw stderr payload field is deleted rather than redacted,
+// the rendered fence is gated on failure rather than scrubbed, stderr is never
+// returned as the answer, and job state is written 0600.
+//
+// The channels that have no structural backstop -- the job `summary`, progress
+// lines, the stop-gate reason -- are the ones where this file's limits are the
+// system's limits. Treat a new bypass there as expected, not as a surprise.
 import { redactMachinePaths } from "./path-hygiene.mjs";
 
 // Secret shapes worth redacting from Codex-derived text before it is persisted
 // to job state and re-displayed (e.g. in /codex:status and /codex:result).
 const SECRET_PATTERNS = [
+  // A URI with inline credentials is a secret whatever the variable is called.
+  // Keying on the NAME could not keep up -- SQLALCHEMY_DATABASE_URI,
+  // DATABASE_REPLICA_URL, CELERY_BROKER_URL -- and naming more engines would
+  // also have caught BASE_URL, an ordinary endpoint. The value says it plainly.
+  // Scheme bounded and anchored on a non-scheme character. An unbounded
+  // `[a-z0-9+.-]*` retries at every word boundary of ordinary dotted output:
+  // measured 63/1105/4166 ms at 16k/64k/128k of `a.` -- the FIFTH quadratic in
+  // this file, introduced by the previous round's own fix.
+  // The userinfo may be password-only: `redis://:p4ss@host` is how Redis and
+  // Celery URLs carry an auth string, and requiring a username missed them.
+  /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]*:[^\s@/]+@[^\s"'`,}]*/gi,
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z_]{20,}\b/g,
-  /\bsk-[A-Za-z0-9_-]{20,}\b/g,
-  // JSON / quoted key:value form. The value class consumes backslash escapes so
-  // an embedded escaped quote does not end the value early and leak its suffix.
-  /(["'`]?\b(?:api[_-]?key|token|secret|password|passwd|pwd)\b["'`]?\s*[:=]\s*)(["'`])(?:\\.|(?!\2)[^\\])+\2/gi,
-  // bare (unquoted) key=value form; the negative lookahead keeps it idempotent.
-  /\b(?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*(?!\[secret\](?:[\s"'`,}\]]|$))[^\s"'`,}]+/gi
+  /\bsk-[A-Za-z0-9_-]{20,}\b/g
 ];
+
+// Key names whose assigned value is a credential, normalized to letters+digits
+// so one entry covers API_KEY / api-key / apiKey alike.
+//
+// Deciding this in JS rather than in the regex is load-bearing, not a style
+// choice. Every regex formulation that scans the key name needs a bounded
+// prefix to stay linear, and a bounded prefix anchored by a lookbehind fails
+// SILENTLY once the key outgrows the bound: no start position satisfies the
+// lookbehind, so no match is attempted at all. Measured on the rejected
+// candidate `(?<![\w.-])[\w.-]{0,64}(?:...)`: matched at a 60-char key, total
+// bypass at 64 and beyond -- squarely where deeply-namespaced enterprise names
+// like ACME_PLATFORM_INTERNAL_SERVICE_API_KEY live. Raising the bound only
+// moves the cliff. A substring test has no cliff at any length.
+// COMPOUND names only. Single words moved to STRONG_KEY_SEGMENTS below, because
+// a substring test on them flags ordinary identifiers: `token` matches
+// `tokenizer_model`, `cookie` matches `cookie_domain`. With unquoted values
+// running to end-of-line, each false positive erases the rest of its line.
+const SENSITIVE_KEY_FRAGMENTS = [
+  "apikey",
+  "privatekey",
+  "accesskey",
+  "databaseurl",
+  "dburl",
+  "connectionstring",
+  "connectionuri",
+  "redisurl",
+  "postgresurl",
+  "postgresqlurl",
+  "mysqlurl",
+  "mongodburi",
+  "mongourl",
+  "amqpurl",
+  "dockerauth",
+  "npmconfigauth",
+  "registryauth",
+  "authconfig"
+];
+
+
+// Assignments are found by scanning for the SEPARATOR and looking back for the
+// key, rather than by matching key-separator-value as one unit.
+//
+// A single combined pattern is wrong here: in `rpc failed: DATABASE_URL=pg://u:pw@h`
+// the key `failed` matches first and consumes `DATABASE_URL=pg://u:pw@h` as its
+// value, so the real assignment nested inside is never examined and the
+// credential survives. Scanning separators examines every `:`/`=` on its own
+// terms, so a non-sensitive assignment cannot swallow a sensitive one.
+// No leading `\s*`. A greedy whitespace prefix retries at every position inside
+// a whitespace run, which measured 55/834/3369 ms for 10k/40k/80k spaces -- the
+// THIRD distinct quadratic found in this file, and this one can wedge the
+// fail-closed stop gate, which sanitizes before it bounds. Leading whitespace is
+// already skipped walking backwards in readKeyBefore, so dropping it here costs
+// nothing.
+const SEPARATOR_SCAN = /[:=]\s*/g;
+// Sticky, so the value is read at an index without slicing the remainder. The
+// quoted class consumes backslash escapes so an embedded escaped quote cannot
+// end the value early and leak its suffix; the bare class admits `]` so an
+// already-redacted `[secret]` is read whole (see isRedactedValue).
+const QUOTED_VALUE = /(["'`])((?:\\.|(?!\1)[^\\])*)\1/y;
+const BARE_VALUE = /[^\s"'`,}]+/y;
+const QUOTE_CHARS = new Set(['"', "'", "`"]);
+const KEY_CHAR = /[\w.-]/;
+// PEM bodies are newline-delimited, so the line rule above would keep all but
+// the first line. Consume through the matching end marker instead.
+const PEM_END = /-----END [A-Z ]*-----/;
+// An `-----END` marker with no `-----BEGIN` before it means the body arrived
+// without its header -- which is what a truncated capture produces. Those lines
+// carry no key and no marker, so nothing else in this file can recognise them.
+const ORPHAN_PEM_END = /-----END [A-Z ]*-----/;
+
+const REDACTED = "[secret]";
+
+
+// Single-word segments that make a key sensitive. Matched per SEGMENT, not as a
+// substring of the whole key, because the short ones are substrings of ordinary
+// words: `key` is in `keyboard`, `auth` is in `author`, `pass` is in
+// `tests_passed`. Splitting on separators and camelCase boundaries first gives
+// SSH_KEY / AUTH_HEADER / DB_PASS without eating any of those.
+// A bare `key` / `pass` / `auth` segment is NOT enough: PRIMARY_KEY, FOREIGN_KEY,
+// PASS_RATE and DICT_KEYS are ordinary identifiers, and with unquoted values now
+// running to end-of-line, a false positive destroys the rest of the line.
+//
+// So a weak word only counts when a QUALIFIER precedes it. That keeps SSH_KEY,
+// DB_PASS, AUTH_HEADER, ENCRYPTION_KEY, CLIENT_KEY, TLSCert, JWTAuth while
+// leaving the identifiers above alone.
+const STRONG_KEY_SEGMENTS = new Set([
+  "token",
+  "authorization",
+  // A bare `auth` segment is a credential on its own (REDISCLI_AUTH). It cannot
+  // be reached from ordinary words: `author` does not split to `auth`, and
+  // SSH_AUTH_SOCK / auth_type are demoted by their trailing shape word.
+  "auth",
+  "secret",
+  "secrets",
+  "password",
+  "passwd",
+  "passphrase",
+  "pwd",
+  "credential",
+  "credentials",
+  "cookie",
+  "bearer",
+  "signature",
+  "apikey",
+  "privatekey"
+]);
+
+
+const KEY_QUALIFIERS = new Set([
+  // Symmetric / signing key prefixes. HMAC_KEY and FERNET_KEY split into a
+  // non-qualifying first segment plus a weak `key`, so neither promoted.
+  "hmac",
+  "fernet",
+  "aes",
+  "rsa",
+  "ecdsa",
+  "ed25519",
+  "hs256",
+  "rs256",
+  "signing",
+  "encrypt",
+  "decrypt",
+  "cipher",
+  "ssh",
+  "tls",
+  "ssl",
+  "api",
+  "private",
+  "public",
+  "secret",
+  "client",
+  "encryption",
+  "signing",
+  "access",
+  "db",
+  "database",
+  "jwt",
+  "auth",
+  "oauth",
+  "bearer",
+  "session",
+  "refresh",
+  "master",
+  "service",
+  "account"
+]);
+
+const WEAK_KEY_SEGMENTS = new Set([
+  "key",
+  // SESSION_ID / REFRESH_ID are credentials; REQUEST_ID / JOB_ID are not, and
+  // their first segment is not a qualifier, so pairing keeps them apart.
+  "id",
+  "keys",
+  "pass",
+  "cert",
+  "certificate",
+  "auth",
+  "header",
+  "token",
+  "credential"
+]);
+
+function keySegments(key) {
+  return String(key)
+    // lowerUpper AND ACRONYMWord: `SSHKey` / `DBPass` / `JWTAuth` / `TLSCert`
+    // split on neither rule without the second, so every acronym-prefixed
+    // credential name passed through as one unrecognised segment.
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+// Segments that make a key NON-sensitive despite an otherwise matching shape.
+// `token_count` is a number, `passwordless` is a boolean, `signature_status` is
+// an enum, and `SSH_AUTH_SOCK` is a socket path -- all ordinary diagnostics, and
+// with unquoted values running to end-of-line a false positive here erases the
+// rest of the line.
+const NON_SECRET_SEGMENTS = new Set([
+  "count",
+  "length",
+  "size",
+  "status",
+  "state",
+  "enabled",
+  "disabled",
+  "sock",
+  "socket",
+  "path",
+  "file",
+  "dir",
+  "type",
+  "kind",
+  "version",
+  "expiry",
+  "expires",
+  "ttl",
+  "domain",
+  "name",
+  "model",
+  "prefix",
+  "suffix",
+  "format",
+  "encoding"
+]);
+
+
+function isSensitiveKey(key) {
+  const segments = keySegments(key);
+  // A trailing qualifier of shape rather than of secrecy demotes the whole key.
+  if (segments.length > 1 && NON_SECRET_SEGMENTS.has(segments[segments.length - 1])) {
+    return false;
+  }
+  // `passwordless` is one segment and must not match `password` as a substring.
+  if (segments.length === 1 && /less$/.test(segments[0])) {
+    return false;
+  }
+  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (SENSITIVE_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment))) {
+    return true;
+  }
+  if (segments.some((segment) => STRONG_KEY_SEGMENTS.has(segment))) {
+    return true;
+  }
+  // A segment ENDING in a credential word: PGPASSWORD, REDISCLI_AUTH. Suffix
+  // rather than substring, so `tokenizer` (token + more) and `author` stay out.
+  if (
+    segments.some((segment) =>
+      [...STRONG_KEY_SEGMENTS, "auth"].some((word) => segment !== word && segment.endsWith(word))
+    )
+  ) {
+    return true;
+  }
+  // A qualifier anywhere BEFORE the weak word, not just immediately before it.
+  // HMAC_ROTATION_KEY / SIGNING_PRIMARY_KEY / TLS_SERVER_KEY put a descriptive
+  // word in between and matched nothing. PRIMARY_KEY and FOREIGN_KEY stay out
+  // because their leading segment is not a qualifier at all.
+  //
+  // One pass with a carried flag, not a prefix rescan per weak segment: the
+  // slice+some form reallocated the whole prefix each time and measured
+  // 58/803/2168 ms at 16/64/128 KB of repeated `key_` -- the SIXTH quadratic in
+  // this file, and introduced by the round that added the rule.
+  let sawQualifier = false;
+  for (const segment of segments) {
+    if (sawQualifier && WEAK_KEY_SEGMENTS.has(segment)) {
+      return true;
+    }
+    if (KEY_QUALIFIERS.has(segment)) {
+      sawQualifier = true;
+    }
+  }
+  return false;
+}
+
+// Keeps redaction idempotent: `summary` is now sanitized at the job-state
+// chokepoint on top of call sites that already sanitize, so a second pass must
+// be a no-op rather than nesting markers.
+function isRedactedValue(text, value, endIndex) {
+  if (value !== REDACTED) {
+    return false;
+  }
+  // The marker must be the WHOLE value. `API_KEY=[secret]leftover` otherwise
+  // skipped the assignment as already-handled and left `leftover` in place --
+  // which is also what a chunk boundary produces when a partial value is
+  // redacted and its remainder arrives in the next event.
+  // The marker counts as the whole value only when NOTHING but whitespace
+  // follows it on the same line. A space is not proof the value ended:
+  // compaction turns `Authorization: Bearer <jwt>` into
+  // `Authorization: [secret] <jwt>`, and the JWT then arrives looking like
+  // separate prose. Structural delimiters still close it, so a marker nested in
+  // JSON stays idempotent.
+  const rest = text.slice(endIndex);
+  if (rest === "" || /^["'`,;}\]]/.test(rest)) {
+    return true;
+  }
+  const restOfLine = rest.split("\n", 1)[0];
+  return restOfLine.trim() === "";
+}
 
 const ANSI_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 const CONTROL_PATTERN = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
@@ -21,14 +331,391 @@ export function stripTerminalControls(text) {
   return String(text ?? "").replace(ANSI_PATTERN, "").replace(CONTROL_PATTERN, "");
 }
 
+// Line-scanned rather than matched with a lazy wildcard. A `[\s\S]*?` between
+// BEGIN and END rescans every suffix when END never arrives: measured 213 ms at
+// 328 KB and 1081 ms at 656 KB of repeated unmatched BEGIN headers -- the FOURTH
+// distinct quadratic in this file, and the stop gate sanitizes before it bounds.
+//
+// Scanning lines also closes a truncated block, which the old pattern returned
+// byte-for-byte because it required an END marker that a crashed writer never
+// emitted.
+
+// Finds a PEM delimiter anywhere in the line, tolerating a unified-diff marker
+// in front of it. Anchoring at the line start missed both an inline delimiter
+// and a diff-prefixed one.
+function findPemDelimiter(line, kind) {
+  const marker = `-----${kind} `;
+  const at = line.indexOf(marker);
+  if (at === -1) {
+    return -1;
+  }
+  return line.slice(at).includes("-----", marker.length) ? at : -1;
+}
+
+function redactPemBlocks(text) {
+  if (!text.includes("-----BEGIN ")) {
+    return text;
+  }
+  const out = [];
+  let inBlock = false;
+  for (const line of text.split("\n")) {
+    if (!inBlock) {
+      const beginAt = findPemDelimiter(line, "BEGIN");
+      if (beginAt !== -1) {
+        inBlock = true;
+        // A delimiter can start mid-line: `Evidence follows: -----BEGIN ...`.
+        // Keep what came before it; the key itself starts at the marker.
+        const head = line.slice(0, beginAt).trimEnd();
+        out.push(head ? `${head} ${REDACTED}` : REDACTED);
+        continue;
+      }
+    }
+    if (inBlock) {
+      if (findPemDelimiter(line, "END") !== -1) {
+        inBlock = false;
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
 export function redactSecrets(text) {
   let output = String(text ?? "");
   for (const pattern of SECRET_PATTERNS) {
-    output = output.replace(pattern, (match, keyPrefix) =>
-      typeof keyPrefix === "string" ? `${keyPrefix}[secret]` : "[secret]"
-    );
+    output = output.replace(pattern, REDACTED);
   }
-  return output;
+  // A whole PEM block is a credential on its own. Everything else here keys off
+  // an assignment, so a bare block -- which is exactly how a key is pasted into
+  // a review or dumped by a tool -- passed through untouched.
+  output = redactPemBlocks(output);
+  return redactOrphanedKeyBody(redactAssignedValues(output));
+}
+
+// Key material whose BEGIN header was cut away by capture truncation. The body
+// lines carry no key name and no marker, so the assignment scanner cannot see
+// them; the closing marker is the only evidence left that they are key material.
+function redactOrphanedKeyBody(text) {
+  const end = ORPHAN_PEM_END.exec(text);
+  if (!end) {
+    return text;
+  }
+  const before = text.slice(0, end.index);
+  if (before.includes("-----BEGIN")) {
+    return text;
+  }
+  // Walk back over lines that LOOK like key body and stop at the first that does
+  // not. Deleting everything before the marker instead destroyed up to a full
+  // buffer of legitimate diagnostics, because a truncated key body is normally
+  // preceded by ordinary output.
+  const lines = before.split("\n");
+  // Collect the trailing run of blank / marker / base64 lines, then require the
+  // run to contain at least one FULL-WIDTH body line before deleting it.
+  //
+  // A uniform length floor was wrong in both directions: the last body line of a
+  // PEM is a remainder and can be four characters, so the floor aborted the walk
+  // at once and left the whole key; accepting any short base64 line instead
+  // would delete ordinary short output.
+  let firstBodyLine = lines.length;
+  let seenNonEmpty = 0;
+  while (firstBodyLine > 0) {
+    const candidate = lines[firstBodyLine - 1];
+    // A SHORT base64 line is only body when it sits immediately before the END
+    // marker -- that is the remainder line of a real PEM. Anywhere else a short
+    // alphanumeric run is ordinary prose: `diag` matches the base64 charset by
+    // accident, and accepting it deleted the diagnostic line above the key.
+    if (!looksLikeKeyBody(candidate, seenNonEmpty === 0)) {
+      break;
+    }
+    if (candidate.trim()) {
+      seenNonEmpty += 1;
+    }
+    firstBodyLine -= 1;
+  }
+  const collected = lines.slice(firstBodyLine);
+  if (!collected.some((line) => line.trim().length >= 16 && /^[A-Za-z0-9+/=]+$/.test(line.trim()))) {
+    // Nothing that looks like real key material precedes the marker.
+    return text;
+  }
+  const head = lines.slice(0, firstBodyLine).join("\n");
+  const tail = text.slice(end.index + end[0].length).replace(/^\n/, "");
+  return `${head ? `${head}\n` : ""}${REDACTED}\n${tail}`;
+}
+
+// PEM body lines are unbroken base64 runs. A redaction marker counts too, so a
+// body already collapsed by an earlier pass does not stop the walk.
+// Blank lines, existing markers and base64 runs of ANY length. The "is this
+// really key material" judgement is made on the collected run as a whole, not
+// line by line -- see redactOrphanedKeyBody.
+function looksLikeKeyBody(line, allowShort) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed === REDACTED || trimmed.endsWith(REDACTED)) {
+    return true;
+  }
+  if (!/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
+    return false;
+  }
+  return trimmed.length >= 16 || allowShort;
+}
+
+// Reads the key ending at `end`, walking backwards over key characters and, if
+// the key is quoted (`{"password": ...}`), over the surrounding quotes.
+//
+// The backward walk is bounded by the key's own length, so total work stays
+// linear in the input. Slicing the text before each separator instead was
+// measurably quadratic -- 20/80/160 KB of ordinary `status=ok` pairs took
+// 96/1465/6032 ms -- because every separator re-scanned an ever-growing prefix.
+function readKeyBefore(text, end, floor) {
+  let cursor = end;
+  while (cursor > floor && /\s/.test(text[cursor - 1])) {
+    cursor -= 1;
+  }
+  const closingQuote = cursor > floor && QUOTE_CHARS.has(text[cursor - 1]) ? text[cursor - 1] : "";
+  if (closingQuote) {
+    cursor -= 1;
+  }
+  const keyEnd = cursor;
+  if (closingQuote) {
+    // A quoted key may hold anything but its own quote -- `{"API KEY": ...}` is
+    // ordinary JSON, and a KEY_CHAR-only scan stopped at the space and skipped
+    // the assignment. Bounded to the line so this stays linear.
+    while (cursor > floor && text[cursor - 1] !== closingQuote && text[cursor - 1] !== "\n") {
+      cursor -= 1;
+    }
+    if (cursor === keyEnd || cursor === floor || text[cursor - 1] !== closingQuote) {
+      return null;
+    }
+    return text.slice(cursor, keyEnd);
+  }
+  while (cursor > floor && KEY_CHAR.test(text[cursor - 1])) {
+    cursor -= 1;
+  }
+  // A YAML key may contain spaces (`API KEY: |`, `AWS SECRET ACCESS KEY:`).
+  // Extend across single spaces while the words keep looking like a key, so the
+  // segment rules see the whole name. Stops at a line break, and at anything
+  // that is not a bare word, so prose ending in a colon is unaffected.
+  while (cursor > floor && text[cursor - 1] === " ") {
+    let probe = cursor - 1;
+    while (probe > floor && text[probe - 1] === " ") {
+      probe -= 1;
+    }
+    const wordEnd = probe;
+    while (probe > floor && /[A-Za-z0-9_]/.test(text[probe - 1])) {
+      probe -= 1;
+    }
+    if (probe === wordEnd) {
+      break;
+    }
+    cursor = probe;
+  }
+  return cursor === keyEnd ? null : text.slice(cursor, keyEnd);
+}
+
+function spanTo(text, index, end) {
+  return { value: text.slice(index, end), quote: "", length: end - index };
+}
+
+// Consumes a `{...}` / `[...]` value through its matching close, so a structured
+// credential is taken whole. Without this the bare rule stopped at the first
+// quote inside the braces and produced `credentials=[secret]"value":"TOPSECRET"}`
+// -- redacted-looking, still leaking, and stable across a second pass.
+function readBalancedValue(text, index) {
+  const OPEN = { "{": "}", "[": "]" };
+  const closer = OPEN[text[index]];
+  if (!closer) {
+    return null;
+  }
+  const opener = text[index];
+  let depth = 0;
+  let quote = "";
+  for (let cursor = index; cursor < text.length; cursor += 1) {
+    const char = text[cursor];
+    // Braces inside a quoted string are data, not structure. Counting them
+    // ended the value early: `credentials={"v":"TOP}SECRET"}` stopped at the
+    // brace inside the string and left `SECRET"}` behind.
+    if (quote) {
+      if (char === "\\") {
+        cursor += 1;
+      } else if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (QUOTE_CHARS.has(char)) {
+      quote = char;
+      continue;
+    }
+    if (char === opener) {
+      depth += 1;
+    } else if (char === closer) {
+      depth -= 1;
+      if (depth === 0) {
+        return spanTo(text, index, cursor + 1);
+      }
+    }
+  }
+  // Unbalanced: fail closed on the remainder for the same reason an unterminated
+  // quote does -- a line boundary is not the end of an unclosed structure.
+  return spanTo(text, index, text.length);
+}
+
+function readValueAt(text, index, key) {
+  QUOTED_VALUE.lastIndex = index;
+  const quoted = QUOTED_VALUE.exec(text);
+  if (quoted) {
+    // Shell concatenation: `API_KEY="TOP"SECRET` is one value written as two
+    // pieces. Accepting the first quoted span left the attached suffix in place
+    // behind a marker that read as complete.
+    // Structural delimiters end the value; only a WORD character attached to the
+    // closing quote is concatenation. Treating every non-space as a suffix made
+    // `{"password":"x","file":"a.ts"}` collapse to `{"password":[secret]`,
+    // dropping the file and line a persisted failure needs to stay actionable.
+    // Adjacent quoted fragments are ordinary shell concatenation:
+    // `PASSWORD=""'"'"'hunter2'"'"'` is one value in two pieces, and treating the
+    // second quote as a terminator left the whole password in the clear behind a
+    // marker. A quote directly against the closing quote continues the value; a
+    // quote after a delimiter does not.
+    if (/^[^\s,;:}\])]/.test(text.slice(index + quoted[0].length))) {
+      const lineEnd = text.indexOf("\n", index);
+      return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
+    }
+    return { value: quoted[2], quote: quoted[1], length: quoted[0].length };
+  }
+
+  // An opening quote with no closing delimiter: the quoted rule cannot match and
+  // the bare rule cannot START on a quote, so the value fell through untouched.
+  // A truncated provider error is exactly this shape. Fail closed on the line.
+  if (QUOTE_CHARS.has(text[index])) {
+    // Unterminated quoted value. Stopping at the newline left the actual secret
+    // on the FOLLOWING line while the output read as redacted, so fail closed on
+    // the remainder: the value opened and never closed, so everything after it
+    // is plausibly the value.
+    return spanTo(text, index, text.length);
+  }
+
+  // Only accept a balanced span when it ENDS the value. `API_KEY=[secret]leftover`
+  // otherwise parsed `[secret]` as the whole value, replaced it with `[secret]`
+  // -- a no-op -- and left `leftover` in place, reading as redacted.
+  const balanced = readBalancedValue(text, index);
+  if (balanced) {
+    // The terminator set must include the PARENT closers. Omitting `}`/`]`
+    // rejected the correct span whenever a sensitive object or array was the
+    // final child -- `{"credentials":{"value":"X"}}` fell back to the bare rule,
+    // which replaced only the opening brace and left the contents behind a
+    // marker that read as complete.
+    const after = text[index + balanced.length];
+    // A balanced span that is EXACTLY the redaction marker, with more content
+    // after it on the same line, is not a value -- it is a marker with a
+    // credential appended, which is what compaction and accidental
+    // concatenation produce. Accepting it would rewrite `[secret]` as
+    // `[secret]`, a no-op, and leave the suffix in place. Fall through to the
+    // line rule so the whole thing goes.
+    // Only an ATTACHED suffix counts as forged. Requiring merely "something else
+    // on the line" broke idempotence: re-sanitizing
+    // `credentials=[secret] at src/config.ts:12` swallowed the file and line,
+    // destroying exactly the context a stop-gate block exists to convey. The
+    // compaction case that motivated this is closed at its source instead --
+    // appendBoundedStderr now discards a continuation that follows a marker.
+    const markerWithSuffix =
+      balanced.value === REDACTED && /^\S/.test(text.slice(index + balanced.length));
+    if ((after === undefined || /[\s"'`,;}\]]/.test(after)) && !markerWithSuffix) {
+      return balanced;
+    }
+  }
+
+  // Tested against the text directly rather than a fixed-width slice: a 32-char
+  // window is shorter than `-----BEGIN ENCRYPTED PRIVATE KEY-----` and than the
+  // OPENSSH header, so those fell through to the bare rule and leaked the body.
+  if (text.startsWith("-----BEGIN", index)) {
+    const endMarker = PEM_END.exec(text.slice(index));
+    if (endMarker) {
+      return spanTo(text, index, index + endMarker.index + endMarker[0].length);
+    }
+    // Unterminated PEM: fail closed and take the remainder rather than leak it.
+    return spanTo(text, index, text.length);
+  }
+
+  // An UNQUOTED value runs to the end of the line, not to the next space.
+  // Stopping at the space redacted only the first word of
+  // `passphrase: correct horse battery staple` and left the rest -- and
+  // `KEY: value` running to end-of-line is exactly the shape of the env dumps
+  // and config echoes this channel actually carries. Over-redacting the tail of
+  // a prose sentence is the cheaper error here; this is the diagnostic and
+  // index channel, never the deliverable.
+  const lineEnd = text.indexOf("\n", index);
+  let end = lineEnd === -1 ? text.length : lineEnd;
+  // YAML block scalar: `KEY: |` puts the value on the FOLLOWING indented lines,
+  // so stopping at the newline redacted the indicator and left the secret. Take
+  // the indented block too.
+  // Tolerate an inline comment after the indicator; `KEY: | # note` is valid
+  // YAML. The continuation test below also has to see through a unified-diff
+  // marker, since a config change arrives as `+API_KEY: |`.
+  if (/^[|>][-+0-9]*\s*(?:#.*)?$/.test(text.slice(index, end))) {
+    // A block scalar continues while lines are indented MORE than the line
+    // holding the indicator -- that is the YAML rule, and it is the only test
+    // that works for a nested key as well as a top-level one. Comparing depths
+    // rather than "is indented at all" also survives a unified-diff marker: the
+    // marker is stripped from both sides only when the indicator itself carries
+    // one, so a raw YAML line indented by a single space keeps that space
+    // instead of having it eaten as a diff marker.
+    const headStart = text.lastIndexOf("\n", index) + 1;
+    const head = text.slice(headStart, end);
+    const diffMarked = /^[+-]/.test(head);
+    const stripMarker = (value) => (diffMarked && /^[+-]/.test(value) ? value.slice(1) : value);
+    const indentOf = (value) => /^\s*/.exec(value)[0].length;
+    const headIndent = indentOf(stripMarker(head));
+    let cursor = end;
+    while (cursor < text.length) {
+      const nextEnd = text.indexOf("\n", cursor + 1);
+      const line = text.slice(cursor + 1, nextEnd === -1 ? text.length : nextEnd);
+      const body = stripMarker(line);
+      if (body.trim() && indentOf(body) <= headIndent) {
+        break;
+      }
+      cursor = nextEnd === -1 ? text.length : nextEnd;
+      if (nextEnd === -1) {
+        break;
+      }
+    }
+    end = cursor;
+  }
+  return end > index ? spanTo(text, index, end) : null;
+}
+
+// The key name is preserved and only the value is dropped. A review whose point
+// is "line 12 commits AWS_SECRET_ACCESS_KEY" stays actionable -- the reader
+// already holds the value; what they need is which key, and where.
+function redactAssignedValues(text) {
+  const pieces = [];
+  let copiedThrough = 0;
+  SEPARATOR_SCAN.lastIndex = 0;
+
+  for (let match = SEPARATOR_SCAN.exec(text); match; match = SEPARATOR_SCAN.exec(text)) {
+    // Skip separators already inside a redacted region rather than
+    // reinterpreting text this pass just rewrote.
+    if (match.index < copiedThrough) {
+      continue;
+    }
+
+    const key = readKeyBefore(text, match.index, copiedThrough);
+    if (!key || !isSensitiveKey(key)) {
+      continue;
+    }
+
+    const separatorEnd = match.index + match[0].length;
+    const found = readValueAt(text, separatorEnd, key);
+    if (!found || isRedactedValue(text, found.value, separatorEnd + found.length)) {
+      continue;
+    }
+
+    pieces.push(text.slice(copiedThrough, separatorEnd), `${found.quote}${REDACTED}${found.quote}`);
+    copiedThrough = separatorEnd + found.length;
+    SEPARATOR_SCAN.lastIndex = copiedThrough;
+  }
+
+  pieces.push(text.slice(copiedThrough));
+  return pieces.join("");
 }
 
 // Redact secrets + local machine paths + terminal control chars from a piece of

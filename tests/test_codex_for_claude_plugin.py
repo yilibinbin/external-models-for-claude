@@ -428,7 +428,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.6" in notices
+    assert "Local extended version: 1.1.0-fh.7" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -7749,10 +7749,15 @@ def test_codex_multi_review_uses_role_prompt_tracking_and_leases():
     assert "resumeLast: false" in multi_body
     assert "persistThread: false" in multi_body
     assert "} catch (error) {" in multi_body
-    assert "redactMachinePaths(error instanceof Error ? error.message : String(error))" in multi_body
+    # Upgraded from redactMachinePaths to sanitizeModelText, which wraps it
+    # (sanitize.mjs: redactMachinePaths(redactSecrets(stripTerminalControls(x)))).
+    # Path redaction alone left credentials in a rejected role's error, and that
+    # message is both persisted in the payload and rendered. The original intent
+    # of this assertion is preserved and strengthened.
+    assert "sanitizeModelText(error instanceof Error ? error.message : String(error))" in multi_body
     assert "output: `Role failed: ${message}`" in multi_body
     assert "error: message" in multi_body
-    assert multi_body.index("redactMachinePaths(") < multi_body.index("output: `Role failed: ${message}`")
+    assert multi_body.index("sanitizeModelText(") < multi_body.index("output: `Role failed: ${message}`")
     assert multi_start < companion.index("async function main")
 
 
@@ -8662,6 +8667,1153 @@ def test_codex_summary_is_sanitized():
     assert "AB" in output
 
 
+def test_codex_sanitizer_has_no_key_length_cliff():
+    # Panel consensus (Claude C2 / Gemini G4 / Codex X5): a bounded-prefix pattern
+    # anchored with a lookbehind fails SILENTLY once the key name outgrows the
+    # bound -- no start position satisfies the lookbehind, so no match is even
+    # attempted. Measured on the rejected candidate: matched at a 60-char prefix,
+    # TOTAL BYPASS at 64 and beyond. Deeply-namespaced enterprise env names
+    # (ACME_PLATFORM_INTERNAL_SERVICE_API_KEY) live exactly in that range, so the
+    # sanitizer must not have a cliff at ANY length.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const n of [10, 60, 64, 120, 400]) {
+          const key = 'A'.repeat(n) + '_API_KEY';
+          out['n' + n] = sanitizeModelText(key + '=xyz123secretvalue');
+        }
+        console.log(JSON.stringify(out));
+        """
+    )
+    for key, redacted in payload.items():
+        assert "xyz123secretvalue" not in redacted, f"{key} leaked the value"
+        assert "[secret]" in redacted, f"{key} was not redacted"
+
+
+def test_codex_sanitizer_covers_credential_keys_without_a_listed_keyword():
+    # Panel consensus: `summary` and the progress channel get NO structural
+    # backstop, so the redactor IS the whole defence there -- its key policy is
+    # load-bearing. These three key names contain none of the original keywords
+    # (api_key|token|secret|password|passwd|pwd) and leaked verbatim on main.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const cases = {
+          db: 'DATABASE_URL=postgres://alice:s3cr3tpw@db.internal/app',
+          cookie: 'SESSION_COOKIE=abc123def456ghi789',
+          pkey: 'PRIVATE_KEY=MIIEvQIBADANBgkqhkiG9w0BAQ',
+          aws: 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG',
+        };
+        const out = {};
+        for (const [k, v] of Object.entries(cases)) out[k] = sanitizeModelText(v);
+        console.log(JSON.stringify(out));
+        """
+    )
+    assert "s3cr3tpw" not in payload["db"]
+    assert "abc123def456ghi789" not in payload["cookie"]
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQ" not in payload["pkey"]
+    assert "wJalrXUtnFEMI" not in payload["aws"]
+    for name, redacted in payload.items():
+        assert "[secret]" in redacted, f"{name} was not redacted"
+
+
+def test_codex_sanitizer_stays_idempotent_and_linear():
+    # Two properties that sank earlier attempts at this same fix, locked together
+    # because the fix trades one off against the other:
+    #  - idempotence: tracked-jobs now sanitizes `summary` on top of call sites
+    #    that already sanitize, so a second pass must be a no-op.
+    #  - linearity: an earlier revision shipped a greedy `[\\w.-]*` prefix that
+    #    backtracked quadratically (3946 ms on 40 KB) INSIDE an exit handler.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const shapes = [
+          '{"token": "abc123"}',
+          'token = abc123',
+          'AWS_SECRET_ACCESS_KEY=wJalr',
+          'found token=x in cfg',
+          '"api_key":"sk-1"',
+          'password: "p@ss"',
+        ];
+        const notIdempotent = shapes.filter((s) => {
+          const once = sanitizeModelText(s);
+          return sanitizeModelText(once) !== once;
+        });
+        const adversarial = ('A'.repeat(300) + '_API_KEY ').repeat(400);
+        const started = process.hrtime.bigint();
+        sanitizeModelText(adversarial);
+        const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+        console.log(JSON.stringify({ notIdempotent, elapsedMs, bytes: adversarial.length }));
+        """
+    )
+    assert payload["notIdempotent"] == []
+    assert payload["bytes"] > 100_000
+    # Generous ceiling: the point is linear-vs-quadratic, not a micro-benchmark.
+    # The rejected greedy variant took 3946 ms on a tenth of this input.
+    assert payload["elapsedMs"] < 500, f"redaction took {payload['elapsedMs']}ms"
+
+
+def test_codex_sanitizer_is_linear_in_ordinary_separators():
+    # A SECOND linearity axis, because the first one missed a real quadratic.
+    # The adversarial input above has few separators, so it never exercised the
+    # per-separator work; an implementation that re-scanned a growing prefix for
+    # each `:`/`=` passed it while measuring 96/1465/6032 ms on 20/80/160 KB of
+    # plain `status=ok` pairs -- the same blow-up class that sank the previous
+    # attempt at this fix, reintroduced through a different door.
+    #
+    # Structured model output and large JSON errors are exactly this shape, and
+    # the redactor runs inside the fail-closed stop gate, so a stall there is a
+    # timeout, not just slowness.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const timeFor = (kb) => {
+          const text = 'status=ok '.repeat(Math.floor((kb * 1024) / 10));
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(40), large: timeFor(320) }));
+        """
+    )
+    # 8x the input must not cost dramatically more than 8x the time. A quadratic
+    # implementation lands near 64x.
+    assert payload["large"] < 200, f"320KB took {payload['large']}ms"
+    growth = payload["large"] / max(payload["small"], 0.05)
+    assert growth < 24, f"scaling looks super-linear: {growth:.1f}x for 8x input"
+
+
+def test_codex_sanitizer_handles_quoted_keys_and_auth_headers():
+    # Both regressed against origin/main during this change and were caught in
+    # review, so they are pinned here.
+    #
+    # `Authorization: Bearer <jwt>` is the sharper of the two: redacting only the
+    # first token produced `Authorization: [secret] eyJhbGci...`, which is worse
+    # than doing nothing because it reads as already handled.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          json: sanitizeModelText('{"password":"hunter2"}'),
+          bearer: sanitizeModelText('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc'),
+          basic: sanitizeModelText('proxy-authorization: Basic dXNlcjpwYXNz'),
+        }));
+        """
+    )
+    assert "hunter2" not in payload["json"]
+    assert "[secret]" in payload["json"]
+    assert "eyJhbGciOiJIUzI1NiJ9.abc" not in payload["bearer"]
+    assert "dXNlcjpwYXNz" not in payload["basic"]
+
+
+def test_codex_sanitizer_redacts_whole_header_and_pem_values():
+    # Enumerating auth SCHEMES was the wrong axis and missed Negotiate and NTLM,
+    # while a cookie header holds several pairs and only the first was taken.
+    # Keying on the header NAME removes the enumeration entirely.
+    #
+    # PEM bodies then need their own rule, because they are newline-delimited and
+    # the line rule would keep everything after the first line.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          negotiate: sanitizeModelText('Authorization: Negotiate YIIFxAYGKwYBBQUCoIIFuDCC'),
+          ntlm: sanitizeModelText('authorization: NTLM TlRMTVNTUAABPAYGKw'),
+          cookies: sanitizeModelText('Cookie: a=1; session=abc123XYZ; b=2'),
+          pem: sanitizeModelText(
+            'PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\\nMIIEvQIBADAN\\nSECONDLINE\\n-----END RSA PRIVATE KEY-----'
+          ),
+        }));
+        """
+    )
+    assert "YIIFxAYGKwYBBQUCoIIFuDCC" not in payload["negotiate"]
+    assert "TlRMTVNTUAABPAYGKw" not in payload["ntlm"]
+    assert "abc123XYZ" not in payload["cookies"]
+    # Every line of the key body, not just the first.
+    assert "MIIEvQIBADAN" not in payload["pem"]
+    assert "SECONDLINE" not in payload["pem"]
+
+
+def test_codex_sanitizer_fails_closed_on_malformed_and_compound_values():
+    # Three shapes that produced output LOOKING redacted while still carrying the
+    # credential -- worse than no redaction, because a reader stops checking.
+    #
+    #   PASSWORD="HUNTER2               unterminated quote: the quoted rule needs a
+    #                                   closing delimiter and the bare rule cannot
+    #                                   start on a quote, so nothing matched
+    #   credentials={"value":"..."}     bare rule stopped at the first inner quote
+    #   AUTHORIZATION_HEADER=Bearer x   sensitive by substring, but whole-line
+    #                                   handling used endsWith and excluded it
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {
+          unterminated: sanitizeModelText('PASSWORD="HUNTER2'),
+          compound: sanitizeModelText('credentials={"value":"TOPSECRET"}'),
+          wrappedAuth: sanitizeModelText('AUTHORIZATION_HEADER=Bearer eyJhbGciXYZ'),
+          wrappedCookie: sanitizeModelText('COOKIE_HEADER=a=1; session=SECRET9'),
+        };
+        // A second pass must not resurrect anything either.
+        out.compoundTwice = sanitizeModelText(out.compound);
+        console.log(JSON.stringify(out));
+        """
+    )
+    assert "HUNTER2" not in payload["unterminated"]
+    assert "TOPSECRET" not in payload["compound"]
+    assert "TOPSECRET" not in payload["compoundTwice"]
+    assert "eyJhbGciXYZ" not in payload["wrappedAuth"]
+    assert "SECRET9" not in payload["wrappedCookie"]
+
+
+def test_codex_sanitizer_fails_closed_on_unterminated_and_forged_markers():
+    # Four shapes found by adversarial review, all of which rendered as redacted
+    # while still carrying the value -- the failure mode that matters most,
+    # because a reader who sees `[secret]` stops checking.
+    #
+    #   API_KEY="\\nSECRET       unterminated quote: stopping at the newline left
+    #                           the value on the FOLLOWING line
+    #   API_KEY=[secret]SECRET   a forged marker parsed as a complete bracketed
+    #                           value, so redaction replaced `[secret]` with
+    #                           `[secret]` -- a no-op -- and kept the tail. A
+    #                           chunk boundary produces this shape too.
+    #   {"API KEY": "SECRET"}    a quoted key may hold a space; the key scan
+    #                           stopped there and skipped the assignment
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          unterminatedQuote: sanitizeModelText('API_KEY="\\nSECRETVALUE1'),
+          forgedMarker: sanitizeModelText('API_KEY=[secret]SECRETVALUE2'),
+          spacedKey: sanitizeModelText('{"API KEY": "SECRETVALUE3"}'),
+          unterminatedBrace: sanitizeModelText('API_KEY={\\nSECRETVALUE4'),
+          // The genuine marker must still be treated as already redacted.
+          idempotent: sanitizeModelText(sanitizeModelText('API_KEY=abc123')),
+        }));
+        """
+    )
+    for name, value in payload.items():
+        if name == "idempotent":
+            continue
+        assert "SECRETVALUE" not in value, f"{name} leaked: {value!r}"
+    assert payload["idempotent"] == "API_KEY=[secret]"
+
+
+def test_codex_sanitizer_takes_nested_structured_values_whole():
+    # The balanced-span terminator set has to include the PARENT closers.
+    # Omitting `}`/`]` rejected the correct span whenever a sensitive object or
+    # array was the final child, so the bare rule replaced only the opening
+    # delimiter -- leaving the contents behind a marker that read as complete,
+    # and stable across a second pass.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const nested = sanitizeModelText('{"credentials":{"value":"TOPSECRET"}}');
+        console.log(JSON.stringify({
+          nested,
+          nestedTwice: sanitizeModelText(nested),
+          array: sanitizeModelText('{"token":["A","TOPSECRET2"]}'),
+          // Still terminates correctly when something follows.
+          followed: sanitizeModelText('credentials={"v":"TOPSECRET3"} tail'),
+        }));
+        """
+    )
+    assert "TOPSECRET" not in payload["nested"]
+    assert "TOPSECRET" not in payload["nestedTwice"]
+    assert "TOPSECRET2" not in payload["array"]
+    assert "TOPSECRET3" not in payload["followed"]
+    assert payload["followed"].endswith(" tail")
+
+
+def test_codex_stop_gate_reason_is_redacted_before_it_is_truncated():
+    # Same ordering error as truncating stderr before redacting it, in a second
+    # place: the reason was sliced to its length bound BEFORE any sanitizer ran,
+    # so a recognized token straddling the cutoff became an unrecognized
+    # fragment -- 38 of a 39-character key emitted with no marker, leaving one
+    # character to enumerate. The result goes into the permanent transcript.
+    payload = run_node_script(
+        """
+        import { parseStopReviewOutput } from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        const key = 'AIza' + 'B'.repeat(35);
+        const result = parseStopReviewOutput('BLOCK: ' + 'x'.repeat(3960) + ' ' + key);
+        console.log(JSON.stringify({ reason: result.reason }));
+        """
+    )
+    reason = payload["reason"]
+    assert "AIzaBBBB" not in reason, "a truncated key fragment survived"
+    assert "[secret]" in reason
+
+
+def test_codex_auth_probe_detail_is_redacted():
+    # `setup` prints this field and `setup --json` emits it. The value is
+    # child-supplied -- a JSON-RPC or config error quotes the offending value --
+    # so a normal setup command could surface a password.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    raw_detail = "detail: error instanceof Error ? error.message : String(error),"
+    assert raw_detail not in source, "an auth/setup probe copies a child error message verbatim"
+    assert source.count(
+        "detail: sanitizeModelText(error instanceof Error ? error.message : String(error)),"
+    ) == 2
+
+
+def test_codex_state_dir_and_file_modes_are_repaired_on_upgrade(tmp_path):
+    # `mode` is honoured only when a path is CREATED, so an install upgrading
+    # from a release that wrote 0755/0644 keeps those modes forever. Repairing
+    # only jobs/ left the parent traversable and state.json group-readable --
+    # and state.json holds exactly the summaries and error messages the rest of
+    # this change redacts.
+    plugin_data = tmp_path / "plugin-data"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { ensureStateDir, resolveStateDir, resolveStateFile, saveState }
+          from './plugins/codex/scripts/lib/state.mjs';
+        const workspace = process.argv[1];
+        // Seed the legacy modes an older release would have left behind.
+        ensureStateDir(workspace);
+        saveState(workspace, { jobs: [] });
+        fs.chmodSync(resolveStateDir(workspace), 0o755);
+        fs.chmodSync(resolveStateFile(workspace), 0o644);
+        ensureStateDir(workspace);
+        const modeOf = (p) => (fs.statSync(p).mode & 0o777).toString(8);
+        console.log(JSON.stringify({
+          dir: modeOf(resolveStateDir(workspace)),
+          file: modeOf(resolveStateFile(workspace)),
+        }));
+        """,
+        env={"CLAUDE_PLUGIN_DATA": str(plugin_data)},
+        args=[str(workspace)],
+    )
+    assert payload["dir"] == "700", f"state dir left at {payload['dir']}"
+    assert payload["file"] == "600", f"state.json left at {payload['file']}"
+
+
+def test_codex_sanitizer_matches_key_segments_without_eating_ordinary_words():
+    # The short credential words are substrings of ordinary ones -- `key` in
+    # `keyboard`, `auth` in `author`, `pass` in `tests_passed` -- so a
+    # whole-key substring test cannot have them. Matching per SEGMENT (split on
+    # separators and camelCase) gets the real keys and none of the decoys.
+    #
+    # These four leaked verbatim before: they carry no fragment from the
+    # original list, and they are among the most common credential env names
+    # there are.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'DB_PASS=hunter2', 'SSH_KEY=AAAAB3Nza', 'AUTH_HEADER=xyz123',
+          'ENCRYPTION_KEY=k1', 'CLIENT_KEY=c1',
+          'let keyboard = 1', 'AUTHOR=alice', 'TESTS_PASSED=3',
+          'status: ok', 'version=1.2.3',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original in ("DB_PASS=hunter2", "SSH_KEY=AAAAB3Nza", "AUTH_HEADER=xyz123",
+                     "ENCRYPTION_KEY=k1", "CLIENT_KEY=c1"):
+        assert "[secret]" in payload[original], f"{original} leaked"
+    # Decoys must be untouched -- a redactor that eats ordinary output is a
+    # redactor people turn off.
+    for original in ("let keyboard = 1", "AUTHOR=alice", "TESTS_PASSED=3",
+                     "status: ok", "version=1.2.3"):
+        assert payload[original] == original, f"over-redacted {original!r}"
+
+
+def test_codex_sanitizer_takes_unquoted_values_to_end_of_line():
+    # Stopping at the first space redacted only `correct` and left
+    # `horse battery staple`. `KEY: value` running to end-of-line is the shape
+    # of the env dumps and config echoes this channel actually carries.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          multiword: sanitizeModelText('passphrase: correct horse battery staple'),
+          nextLineKept: sanitizeModelText('password: hunter2\\nnext line survives'),
+        }));
+        """
+    )
+    assert "horse" not in payload["multiword"]
+    assert "staple" not in payload["multiword"]
+    # The redaction stops at the newline; it does not swallow the rest of the text.
+    assert "next line survives" in payload["nextLineKept"]
+    assert "hunter2" not in payload["nextLineKept"]
+
+
+def test_codex_orphaned_key_body_is_redacted_by_its_closing_marker():
+    # When capture truncation cuts away a PEM's BEGIN header, the body lines
+    # carry no key name and no marker -- nothing else in the redactor can see
+    # them. The closing marker is the only remaining evidence that they are key
+    # material.
+    #
+    # This is the finding that refuted my own defence: I had argued the
+    # forged-marker rule already covered it, and two probes agreed. It does not
+    # cover the SECOND and later body lines.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        import { captureDiagnosticStderr } from './plugins/codex/scripts/lib/codex.mjs';
+        let state = appendBoundedStderr(
+          '',
+          'f\\n'.repeat(Math.ceil(MAX_CAPTURED_STDERR_BYTES / 2)) +
+            'PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\\n',
+        );
+        state = appendBoundedStderr(
+          state,
+          'MIIBODYLEAK\\nSECONDBODYLEAK\\n-----END RSA PRIVATE KEY-----\\n',
+        );
+        console.log(JSON.stringify({ captured: captureDiagnosticStderr(state.text) }));
+        """
+    )
+    assert "MIIBODYLEAK" not in payload["captured"]
+    assert "SECONDBODYLEAK" not in payload["captured"]
+
+
+def test_codex_stderr_compaction_does_not_run_per_chunk():
+    # Compacting to the cap on every overflow re-scans the whole buffer once per
+    # CHUNK once it is full -- correct, but the cost then scales with chunk
+    # count rather than with bytes. Headroom amortises it.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        let state = {
+          text: ('y'.repeat(63) + '\\n').repeat(Math.floor(MAX_CAPTURED_STDERR_BYTES / 64)),
+          discarding: false,
+        };
+        const started = process.hrtime.bigint();
+        for (let i = 0; i < 500; i += 1) state = appendBoundedStderr(state, 'z'.repeat(63) + '\\n');
+        console.log(JSON.stringify({
+          elapsedMs: Number(process.hrtime.bigint() - started) / 1e6,
+          length: state.text.length,
+        }));
+        """
+    )
+    # Without headroom this measured 31 ms; the bound is generous because the
+    # point is the scaling, not the constant.
+    assert payload["elapsedMs"] < 15, f"500 at-cap chunks took {payload['elapsedMs']}ms"
+
+
+def test_codex_sanitizer_covers_connection_strings_and_acronym_keys():
+    # Two gaps the segment rule still had when it first landed.
+    #
+    # Connection-string names contain no word from the segment list, yet the URL
+    # itself carries `user:password@host`.
+    #
+    # `SSHKey` / `DBPass` / `JWTAuth` / `TLSCert` split on neither the
+    # lowerUpper rule nor a separator, so an acronym-prefixed credential name
+    # arrived as one unrecognised segment. ACRONYM->Word needs its own rule.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'REDIS_URL=redis://u:p4ssw0rd@h:6379',
+          'POSTGRES_URL=postgres://u:p4ssw0rd@h/db',
+          'MONGODB_URI=mongodb://u:p4ssw0rd@h',
+          'SSHKey=AAAAB3LEAK', 'DBPass=hunter2', 'JWTAuth=eyJLEAK', 'TLSCert=MIIBLEAK',
+          'let keyboard = 1', 'AUTHOR=alice', 'TESTS_PASSED=3', 'version=1.2.3',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, value in payload.items():
+        if original in ("let keyboard = 1", "AUTHOR=alice", "TESTS_PASSED=3", "version=1.2.3"):
+            assert value == original, f"over-redacted {original!r}"
+        else:
+            assert "[secret]" in value, f"{original} leaked"
+            assert "p4ssw0rd" not in value and "LEAK" not in value and "hunter2" not in value
+
+
+def test_codex_orphaned_key_body_redaction_covers_middle_lines(tmp_path):
+    # The first attempt at this replaced only the line immediately before the
+    # END marker, so every MIDDLE body line survived -- between two `[secret]`
+    # markers, which is output that reads as fully redacted while carrying most
+    # of the key. Three body lines are used here for exactly that reason.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        import { captureDiagnosticStderr } from './plugins/codex/scripts/lib/codex.mjs';
+        const cap = MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES;
+        let state = appendBoundedStderr(
+          '',
+          'f\\n'.repeat(Math.ceil(cap / 2)) + 'PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\\n',
+        );
+        state = appendBoundedStderr(
+          state,
+          // Realistic PEM body: 64-char base64 lines. Short toy strings are
+          // indistinguishable from ordinary short diagnostics.
+          'RklSU1RMRUFLRklSU1RMRUFLRklSU1RMRUFLRklSU1RMRUFLRklSU1RMRUFLQUJD\\n' +
+            'U0VDT05ETEVBS1NFQ09ORExFQUtTRUNPTkRMRUFLU0VDT05ETEVBS1NFQ09ORExF\\n' +
+            'VEhJUkRMRUFLVEhJUkRMRUFLVEhJUkRMRUFLVEhJUkRMRUFLVEhJUkRMRUFLQUJD\\n' +
+            '-----END RSA PRIVATE KEY-----\\ntail line\\n',
+        );
+        console.log(JSON.stringify({ captured: captureDiagnosticStderr(state.text) }));
+        """
+    )
+    captured = payload["captured"]
+    # base64-shaped, because that is what a PEM body actually looks like and
+    # what the walk-back recognises; arbitrary words are legitimate diagnostics.
+    for marker in ("RklSU1RMRUFLRklS", "U0VDT05ETEVBS1NF", "VEhJUkRMRUFLVEhJ"):
+        assert marker not in captured, f"{marker} survived"
+    # Legitimate output after the marker must survive.
+    assert "tail line" in captured
+
+
+def test_codex_failed_turn_does_not_render_partial_output_as_the_answer():
+    # On a failed turn the last agent message is mid-flight commentary. Returning
+    # it alone presented a failed run as a successful one AND hid the diagnostic
+    # entirely -- a probe rendered only "Still investigating the failure."
+    payload = run_node_script(
+        """
+        import { renderTaskResult } from './plugins/codex/scripts/lib/render.mjs';
+        console.log(JSON.stringify({
+          failed: renderTaskResult(
+            { rawOutput: 'Still investigating.', failureMessage: 'transport failed: reset', status: 1 },
+            {},
+          ),
+          succeeded: renderTaskResult({ rawOutput: 'the answer' }, {}),
+        }));
+        """
+    )
+    failed = payload["failed"]
+    assert failed.strip() != "Still investigating."
+    assert "did not complete" in failed
+    # Both halves are shown, each labelled for what it is.
+    assert "partial output" in failed and "Still investigating." in failed
+    assert "diagnostics" in failed and "transport failed: reset" in failed
+    # The success path is untouched.
+    assert payload["succeeded"].strip() == "the answer"
+
+
+def test_codex_state_permissions_are_repaired_on_the_read_path(tmp_path):
+    # ensureStateDir only runs before a WRITE. The Stop hook and SessionStart
+    # reach state through loadState/getConfig/listJobs and can return without
+    # ever writing, so a read-only upgrade left 0755 dirs and a 0644 state.json
+    # -- which holds the summaries and error messages this change redacts.
+    plugin_data = tmp_path / "plugin-data"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { ensureStateDir, loadState, resolveStateDir, resolveStateFile, saveState }
+          from './plugins/codex/scripts/lib/state.mjs';
+        const workspace = process.argv[1];
+        ensureStateDir(workspace);
+        saveState(workspace, { jobs: [] });
+        fs.chmodSync(resolveStateDir(workspace), 0o755);
+        fs.chmodSync(resolveStateFile(workspace), 0o644);
+        loadState(workspace);  // read only -- must still repair
+        const modeOf = (p) => (fs.statSync(p).mode & 0o777).toString(8);
+        console.log(JSON.stringify({
+          dir: modeOf(resolveStateDir(workspace)),
+          file: modeOf(resolveStateFile(workspace)),
+        }));
+        """,
+        env={"CLAUDE_PLUGIN_DATA": str(plugin_data)},
+        args=[str(workspace)],
+    )
+    assert payload["dir"] == "700"
+    assert payload["file"] == "600"
+
+
+def test_codex_sanitizer_does_not_flag_ordinary_key_named_identifiers():
+    # A bare `key`/`pass`/`auth` segment is not enough to call a name sensitive.
+    # PRIMARY_KEY, FOREIGN_KEY, PASS_RATE and DICT_KEYS are ordinary identifiers,
+    # and because unquoted values run to end-of-line, a false positive here
+    # destroys the REST OF THE LINE, not just one token. A weak word therefore
+    # only counts when a qualifier precedes it.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'SSH_KEY=AAAAB3LEAK', 'DB_PASS=hunter2', 'AUTH_HEADER=xyz123',
+          'ENCRYPTION_KEY=k1', 'CLIENT_KEY=c1', 'SSHKey=LEAK1', 'DBPass=LEAK2',
+          'JWTAuth=LEAK3', 'TLSCert=LEAK4',
+          'PRIMARY_KEY=id', 'FOREIGN_KEY=user_id and more', 'PASS_RATE=0.98',
+          'DICT_KEYS=abc', 'let keyboard = 1', 'AUTHOR=alice', 'TESTS_PASSED=3',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    must_redact = ("SSH_KEY=AAAAB3LEAK", "DB_PASS=hunter2", "AUTH_HEADER=xyz123",
+                   "ENCRYPTION_KEY=k1", "CLIENT_KEY=c1", "SSHKey=LEAK1",
+                   "DBPass=LEAK2", "JWTAuth=LEAK3", "TLSCert=LEAK4")
+    must_keep = ("PRIMARY_KEY=id", "FOREIGN_KEY=user_id and more", "PASS_RATE=0.98",
+                 "DICT_KEYS=abc", "let keyboard = 1", "AUTHOR=alice", "TESTS_PASSED=3")
+    for original in must_redact:
+        assert "[secret]" in payload[original], f"{original} leaked"
+    for original in must_keep:
+        assert payload[original] == original, f"over-redacted {original!r}"
+
+
+def test_codex_orphaned_key_body_does_not_destroy_preceding_output():
+    # Deleting everything before an orphaned END marker discarded up to a full
+    # buffer of legitimate diagnostics -- a truncated key body is normally
+    # preceded by ordinary output. The walk back now stops at the first line that
+    # does not look like key body.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          noBody: sanitizeModelText(
+            'important diagnostic\\nanother line\\n-----END RSA PRIVATE KEY-----\\ntail'
+          ),
+          withBody: sanitizeModelText(
+            'diag line\\nMIIBAAKCAQEAvfake\\nQUJDREVGR0hJSktM\\n-----END RSA PRIVATE KEY-----\\ntail'
+          ),
+        }));
+        """
+    )
+    # Nothing that looks like key material precedes the marker: leave the text.
+    assert "important diagnostic" in payload["noBody"]
+    assert "another line" in payload["noBody"]
+    # Real body lines go; the diagnostic line before them stays.
+    assert "diag line" in payload["withBody"]
+    assert "MIIBAAKCAQEAvfake" not in payload["withBody"]
+    assert "QUJDREVGR0hJSktM" not in payload["withBody"]
+    assert "tail" in payload["withBody"]
+
+
+def test_codex_successful_turn_with_stderr_is_not_reported_as_failed():
+    # failureMessage is built from the child's stderr whenever no error object
+    # exists, so a successful turn that emitted an ordinary warning had a
+    # non-empty failureMessage. Branching on that relabelled the answer as
+    # "partial output" and reported the run as failed. Branch on the status.
+    payload = run_node_script(
+        """
+        import { renderTaskResult } from './plugins/codex/scripts/lib/render.mjs';
+        console.log(JSON.stringify({
+          okWithWarning: renderTaskResult(
+            { rawOutput: 'the answer', failureMessage: 'npm warn deprecated', status: 0 },
+            {},
+          ),
+          failed: renderTaskResult(
+            { rawOutput: 'partial', failureMessage: 'transport failed', status: 1 },
+            {},
+          ),
+        }));
+        """
+    )
+    assert payload["okWithWarning"].strip() == "the answer"
+    assert "did not complete" not in payload["okWithWarning"]
+    assert "did not complete" in payload["failed"]
+
+
+def test_codex_permission_repair_skips_the_write_when_modes_are_correct(tmp_path):
+    # Repair runs on every state READ now. An unconditional chmod rewrites the
+    # inode ctime each time -- a pointless disk write that can keep file watchers
+    # firing for a whole session.
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { ensureStateDir, repairStatePermissions, resolveStateFile, saveState }
+          from './plugins/codex/scripts/lib/state.mjs';
+        const workspace = process.argv[1];
+        ensureStateDir(workspace);
+        saveState(workspace, { jobs: [] });
+        const stateFile = resolveStateFile(workspace);
+        const before = fs.statSync(stateFile).ctimeMs;
+        repairStatePermissions(workspace);
+        repairStatePermissions(workspace);
+        console.log(JSON.stringify({ unchanged: fs.statSync(stateFile).ctimeMs === before }));
+        """,
+        env={"CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")},
+        args=[str(workspace)],
+    )
+    assert payload["unchanged"] is True, "repair rewrote a file whose mode was already correct"
+
+
+def test_codex_sanitizer_is_linear_in_whitespace_runs():
+    # The THIRD distinct quadratic found in this file, each through a different
+    # door: a greedy prefix in the key pattern, a growing prefix slice per
+    # separator, and now a greedy `\\s*` at the head of the separator pattern,
+    # which retries at every position inside a whitespace run.
+    #
+    # This one is the worst placed: the fail-closed stop gate sanitizes BEFORE it
+    # applies its length bound, so degraded child output can wedge session
+    # termination rather than merely being slow.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const timeFor = (n) => {
+          const text = 'a' + ' '.repeat(n) + 'b';
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(10000), large: timeFor(160000) }));
+        """
+    )
+    # 16x the run length. The quadratic version measured 55 ms -> 3369 ms for 8x.
+    assert payload["large"] < 200, f"160k whitespace took {payload['large']}ms"
+
+
+def test_codex_sanitizer_takes_structured_and_long_header_values_whole():
+    # Both shapes produced redacted-LOOKING output that still carried the value.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          // A brace inside a quoted string is data, not structure; counting it
+          // ended the value early and left the tail behind.
+          braceInString: sanitizeModelText('credentials={"v":"TOP}SECRET"}'),
+          // `-----BEGIN ENCRYPTED PRIVATE KEY-----` is longer than the 32-char
+          // window the PEM check used to inspect, so it fell through entirely.
+          encryptedPem: sanitizeModelText(
+            'PRIVATE_KEY=-----BEGIN ENCRYPTED PRIVATE KEY-----\\nBODYLINE\\n-----END ENCRYPTED PRIVATE KEY-----'
+          ),
+        }));
+        """
+    )
+    assert "SECRET" not in payload["braceInString"]
+    assert "BODYLINE" not in payload["encryptedPem"]
+
+
+def test_codex_stderr_multiline_secret_is_redacted_before_truncation():
+    # A line boundary is not a safe boundary for a multiline secret: cutting
+    # inside a PEM block drops the key name AND the BEGIN header while keeping
+    # body lines, which a key-based redactor cannot recognize afterwards.
+    # Redaction therefore runs while that context still exists -- on overflow
+    # only, so the common path pays nothing.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        const pem = 'PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\\nBODYLINE_ONE\\nBODYLINE_TWO\\n-----END RSA PRIVATE KEY-----\\n';
+        const fillerLines = Math.floor(
+          (MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES - pem.length + 40) / 7,
+        );
+        let state = appendBoundedStderr('', 'filler\\n'.repeat(fillerLines) + pem);
+        state = appendBoundedStderr(state, 'more\\n'.repeat(20));
+        console.log(JSON.stringify({ text: state.text }));
+        """
+    )
+    assert "BODYLINE" not in payload["text"]
+
+
+def test_codex_failed_turn_does_not_promote_intermediate_chatter_unredacted():
+    # lastAgentMessage is overwritten by EVERY main-thread agent message while
+    # final_answer completion is tracked separately, and the result returned it
+    # unconditionally. On a failed or interrupted turn that value is intermediate
+    # commentary, not the deliverable, so it loses the byte-identical exemption.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    # Tightened in a later round: status 0 alone is not enough, because
+    # `turn/completed` can land without a non-empty final_answer ever being
+    # captured while lastAgentMessage still holds commentary.
+    # Tightened again: the returned text is the CAPTURED final answer, not
+    # whatever message happened to arrive last. finalAnswerSeen is sticky while
+    # lastAgentMessage keeps being overwritten, so a legal
+    # completion-then-commentary sequence otherwise ends with the commentary
+    # standing in as the answer.
+    assert re.search(
+        r"turnStatus === 0 && turnState\.finalAnswerSeen\s*\?\s*turnState\.finalAnswerText\s*"
+        r":\s*sanitizeModelText\(turnState\.finalAnswerText \|\| turnState\.lastAgentMessage\)",
+        source,
+    ), "a completed turn must return the captured final answer, not the last message"
+
+
+def test_codex_reasoning_summary_is_redacted_where_it_is_stored():
+    # The reasoning array is rendered verbatim by both review renderers and
+    # persisted into the payload and the job sidecar. Sanitizing only the
+    # progress-log copy left the original reachable through --json, the job log
+    # and /codex:result.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert re.search(
+        r"mergeReasoningSections\(\s*state\.reasoningSummary,\s*nextSections\.map\("
+        r"\(section\) => sanitizeModelText\(section\)\)",
+        source,
+    ), "reasoning sections must be redacted where they are stored, not only when logged"
+
+
+def test_codex_stderr_discard_state_survives_chunk_boundaries():
+    # Dropping an overlong line once is not enough. stderr arrives in arbitrary
+    # chunks, so the REMAINDER of the same physical line lands in the next data
+    # event and -- without carried state -- is captured as a fresh line, headless,
+    # with the key that would have identified it already discarded.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        let state = appendBoundedStderr(
+          '',
+          'x'.repeat(MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES - 9) + 'PASSWORD=',
+        );
+        state = appendBoundedStderr(state, 'HUNTER2');
+        state = appendBoundedStderr(state, '_SUFFIX\\ntail line\\n');
+        console.log(JSON.stringify({ text: state.text }));
+        """
+    )
+    assert "_SUFFIX" not in payload["text"], "continuation of a discarded line was captured headless"
+    assert "tail line" in payload["text"], "capture must resume after the terminating newline"
+
+
+def test_codex_job_log_redacts_intermediate_model_output_but_not_the_review():
+    # `logBody` carries three different things, and only one of them is the
+    # deliverable the panel agreed to leave byte-identical:
+    #   codex.mjs  item.text      -> intermediate agent/subagent chatter
+    #   codex.mjs  item.review    -> THE review output
+    #   codex.mjs  reasoning      -> reasoning summary
+    # Exempting the field wholesale exempted all three. The exemption is applied
+    # at the source instead, so only the review body stays raw.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "logBody: sanitizeModelText(item.text)" in source
+    assert re.search(r"logBody: sanitizeModelText\(nextSections", source)
+    assert "logBody: item.review" in source, "the deliverable must stay byte-identical"
+
+
+def test_codex_stderr_truncation_cannot_orphan_a_credential_value():
+    # Truncating raw bytes can land between a key and its value, and the redactor
+    # keys off the key name -- so a headless `hunter2` survives a pass that would
+    # have caught `PASSWORD=hunter2`. Truncating mid-line is strictly worse than
+    # not truncating, so the cut is made at a line boundary.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        import { captureDiagnosticStderr } from './plugins/codex/scripts/lib/codex.mjs';
+        // Place the credential so the cap boundary falls between key and value.
+        const filler = 'diagnostic line\\n'.repeat(Math.ceil(MAX_CAPTURED_STDERR_BYTES / 16));
+        let buffer = appendBoundedStderr('', 'x'.repeat(MAX_CAPTURED_STDERR_BYTES - 9) + 'PASSWORD=hunter2\\n');
+        buffer = appendBoundedStderr(buffer, filler);
+        console.log(JSON.stringify({ captured: captureDiagnosticStderr(buffer) }));
+        """
+    )
+    assert "hunter2" not in payload["captured"]
+
+
+def test_codex_sanitizer_preserves_non_secret_text():
+    # The anti-over-correction guard. The panel's central conflict was whether
+    # model-authored text may be rewritten at all; the settlement keeps the
+    # deliverable intact and redacts only values. A key policy broad enough to
+    # catch DATABASE_URL must still not eat ordinary prose or code.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'const timeout = 30',
+          'status: ok',
+          'Found 3 issues in src/app.ts',
+          'let keyboard = 1',
+          'version=1.2.3',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, result in payload.items():
+        assert result == original, f"over-redacted: {original!r} -> {result!r}"
+
+
+def test_codex_stderr_is_bounded_during_accumulation_not_after():
+    # Panel consensus (Gemini G3 primary + Codex X3): bounding stderr only when
+    # it is READ leaves the unbounded string fully realized in memory and fully
+    # regex-scanned first. It must be bounded as it ARRIVES.
+    #
+    # This matters most on the default path: BrokerCodexAppServerClient inherits
+    # `this.stderr = ""` and never accumulates, while the SpawnedCodexAppServerClient
+    # backing the broker process keeps appending for the whole session -- so a
+    # read-side cap is a no-op exactly where the growth happens.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        let state = { text: '', discarding: false };
+        // 4 MB arriving in realistic chunks, newline-delimited so the cut has a
+        // safe boundary to land on (see the discard-state test for the case
+        // where it does not).
+        for (let i = 0; i < 4096; i += 1) state = appendBoundedStderr(state, 'x'.repeat(1023) + '\\n');
+        const tailMarker = 'TAIL_MARKER_KEPT';
+        state = appendBoundedStderr(state, tailMarker);
+        console.log(JSON.stringify({
+          length: state.text.length,
+          cap: MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES,
+          keepsTail: state.text.endsWith(tailMarker),
+        }));
+        """
+    )
+    # The bound is cap + compaction headroom: compacting to exactly the cap on
+    # every overflow would re-scan the whole buffer once per chunk.
+    assert payload["length"] <= payload["cap"], "buffer grew past the cap while accumulating"
+    # The tail is what diagnoses a crash; the head is what gets dropped.
+    assert payload["keepsTail"] is True
+
+
+def test_codex_diagnostic_stderr_is_redacted_at_the_capture_boundary():
+    # Panel consensus: `cleanCodexStderr` is the one seam both stderr readers
+    # (codex.mjs:971 and :1096) already pass through, so redaction belongs there
+    # rather than at each of the downstream sinks -- a sink-side fix needs N call
+    # sites and silently regresses when an N+1th is added, which is exactly how
+    # the `summary` bypass came to exist.
+    payload = run_node_script(
+        """
+        import { captureDiagnosticStderr } from './plugins/codex/scripts/lib/codex.mjs';
+        const raw = [
+          'WARNING: proceeding, even though we could not update PATH: /opt/bin',
+          'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG',
+          'tracing enabled',
+        ].join('\\n');
+        console.log(JSON.stringify({ cleaned: captureDiagnosticStderr(raw) }));
+        """
+    )
+    cleaned = payload["cleaned"]
+    assert "wJalrXUtnFEMIK7MDENG" not in cleaned
+    assert "[secret]" in cleaned
+    # The pre-existing PATH-warning filter is preserved.
+    assert "WARNING: proceeding" not in cleaned
+    # Genuine diagnostics survive -- the point of keeping the channel at all.
+    assert "tracing enabled" in cleaned
+
+
+def test_codex_failure_message_redacts_the_error_branch_too():
+    # Codex X2, confirmed by Gemini and reproduced by the broker: in
+    # `result.error?.message ?? result.stderr` the `??` SHORT-CIRCUITS, so when an
+    # error message is present `result.stderr` is never evaluated and the capture
+    # boundary never runs. The design's claim that this chain needs no change
+    # ("the value is already redacted") was false for the error branch.
+    payload = run_node_script(
+        """
+        import { buildFailureMessage } from './plugins/codex/scripts/lib/codex.mjs';
+        console.log(JSON.stringify({
+          fromError: buildFailureMessage(
+            { message: 'rpc failed: DATABASE_URL=postgres://u:p4ssw0rd@h/db' },
+            'unused stderr',
+          ),
+          fromStderr: buildFailureMessage(null, 'GITHUB_TOKEN=ghp_AAAABBBBCCCCDDDD'),
+          neither: buildFailureMessage(null, ''),
+        }));
+        """
+    )
+    assert "p4ssw0rd" not in payload["fromError"]
+    assert "[secret]" in payload["fromError"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in payload["fromStderr"]
+    assert payload["neither"] == ""
+
+
+def test_codex_payload_carries_no_raw_child_stderr_field():
+    # Panel consensus: `payload.codex.stderr` is write-only exhaust -- verified
+    # zero readers across plugins/ tests/ docs/ templates/ -- yet it reaches the
+    # job sidecar (tracked-jobs writes `result: execution.payload`), the terminal
+    # under `--json`, and `/codex:result --json`, which emits the stored job
+    # wholesale.
+    #
+    # Deleting the field closes all three sinks with no pattern matching at all,
+    # which is why this is asserted structurally rather than by probing content:
+    # a redaction test would still pass if someone re-added the field carrying
+    # text the patterns happen to miss.
+    # Scoped to the persisted `codex: { ... }` payload blocks on purpose. The
+    # renderer is separately passed a stderr argument and legitimately keeps it:
+    # that path is fixed by gating the fence on failure, not by removing the
+    # data. A blanket source-wide ban would conflate the two fixes.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "codex-companion.mjs").read_text()
+    payload_blocks = re.findall(r"codex: \{(.*?)\n\s*\}", source, re.DOTALL)
+    assert payload_blocks, "expected at least one persisted codex payload block"
+    for block in payload_blocks:
+        assert "stderr" not in block, (
+            "a raw child-stderr field was re-added to a persisted payload; "
+            "it reaches the job sidecar, --json, and /codex:result with no "
+            "renderer in between. Diagnostics belong in the redacted failure message."
+        )
+
+
+def test_codex_native_review_emits_no_stderr_fence_on_success():
+    # The fence was guarded only on stderr being non-empty, never on the run
+    # having failed, so a CLEAN review shipped the child's stderr to the
+    # terminal, the job sidecar and the job log. A successful review has no
+    # diagnostic to show.
+    payload = run_node_script(
+        """
+        import { renderNativeReviewResult } from './plugins/codex/scripts/lib/render.mjs';
+        const stderr = 'tracing: connecting\\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7';
+        console.log(JSON.stringify({
+          ok: renderNativeReviewResult(
+            { status: 0, stdout: 'No issues found.', stderr },
+            { reviewLabel: 'review', targetLabel: 'HEAD', reasoningSummary: [] },
+          ),
+          failed: renderNativeReviewResult(
+            { status: 1, stdout: '', stderr },
+            { reviewLabel: 'review', targetLabel: 'HEAD', reasoningSummary: [] },
+          ),
+        }));
+        """
+    )
+    assert "```text" not in payload["ok"], "success path still emits the stderr fence"
+    assert "tracing: connecting" not in payload["ok"]
+    assert "No issues found." in payload["ok"]
+    # The diagnostic channel still works where it is actually needed.
+    assert "```text" in payload["failed"]
+    assert "tracing: connecting" in payload["failed"]
+
+
+def test_codex_task_result_never_returns_bare_stderr_as_the_answer():
+    # When a turn produced no final message, the child's stderr WAS the rendered
+    # answer -- unlabelled and indistinguishable from model output, then persisted
+    # and re-shown by /codex:result. It must be presented as diagnostics instead.
+    payload = run_node_script(
+        """
+        import { renderTaskResult } from './plugins/codex/scripts/lib/render.mjs';
+        console.log(JSON.stringify({
+          withDiagnostics: renderTaskResult(
+            { rawOutput: '', failureMessage: 'connection reset by peer' },
+            { title: 'task' },
+          ),
+          bare: renderTaskResult({ rawOutput: '', failureMessage: '' }, { title: 'task' }),
+          success: renderTaskResult({ rawOutput: 'the answer' }, { title: 'task' }),
+        }));
+        """
+    )
+    rendered = payload["withDiagnostics"]
+    assert "did not return a final message" in rendered
+    assert rendered.strip() != "connection reset by peer", "raw stderr is still the answer"
+    # Present, but explicitly labelled as diagnostics rather than as output.
+    assert "diagnostics" in rendered.lower()
+    assert "connection reset by peer" in rendered
+    assert "did not return a final message" in payload["bare"]
+    # The success path is untouched.
+    assert payload["success"].strip() == "the answer"
+
+
+def test_codex_progress_events_redact_message_but_not_log_body():
+    # Progress lines quote the model's shell commands and assistant text verbatim
+    # and reach the terminal, the job log and the /codex:status preview -- on
+    # success, on every run, independent of transport. `logBody` is deliberately
+    # exempt: it carries the model's own review text, which follows the
+    # unredacted-deliverable policy the panel settled on.
+    payload = run_node_script(
+        """
+        import { normalizeProgressEvent } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        const secret = 'GITHUB_TOKEN=ghp_AAAABBBBCCCCDDDD';
+        console.log(JSON.stringify({
+          fromObject: normalizeProgressEvent({
+            message: 'ran: export ' + secret,
+            stderrMessage: 'warn ' + secret,
+            logBody: 'review body mentioning ' + secret,
+          }),
+          fromString: normalizeProgressEvent('ran: export ' + secret),
+        }));
+        """
+    )
+    obj = payload["fromObject"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in obj["message"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in obj["stderrMessage"]
+    # The deliverable survives byte-for-byte.
+    assert "ghp_AAAABBBBCCCCDDDD" in obj["logBody"]
+    # The plain-string branch sets stderrMessage from the same raw value, so
+    # leaving it unredacted would defeat the object-branch fix entirely.
+    string_event = payload["fromString"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in string_event["message"]
+    assert "ghp_AAAABBBBCCCCDDDD" not in string_event["stderrMessage"]
+
+
+def test_codex_persisted_index_fields_pass_through_the_redactor():
+    # `summary` and `errorMessage` are written straight into state.json and the
+    # job sidecar with no renderer in between, so the wrap has to sit at the
+    # write site. Asserted structurally because that is the invariant: a future
+    # producer added upstream must not be able to bypass it, which is exactly how
+    # the multi-review summary came to skip the redactor three call sites later.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "tracked-jobs.mjs").read_text()
+    assert "summary: sanitizeModelText(execution.summary)" in source
+    assert re.search(r"const errorMessage = sanitizeModelText\(", source)
+
+
+def test_codex_stop_gate_classifier_redacts_the_reason_on_every_branch():
+    # The BLOCK reason is injected into the Claude transcript
+    # (~/.claude/projects/**.jsonl), which is permanent and outside this plugin's
+    # control, and is re-fed to the model.
+    #
+    # This is where the panel's central conflict landed. Gemini argued the reason
+    # must be sanitized; the design argued a review saying "line 12 commits
+    # AWS_SECRET_ACCESS_KEY=..." is destroyed by redaction. Both hold, because
+    # the redactor drops the VALUE and keeps the KEY: the finding stays
+    # actionable (which key, which file, which line) and the credential does not
+    # enter the transcript. Asserted here so neither half can regress.
+    payload = run_node_script(
+        """
+        import { classifyStopGateResult } from './plugins/codex/scripts/lib/stop-gate-result.mjs';
+        const reason = 'src/config.ts:12 commits AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG';
+        console.log(JSON.stringify({
+          block: classifyStopGateResult({ ok: true, verdict: 'BLOCK', reason }),
+          allow: classifyStopGateResult({ ok: true, verdict: 'ALLOW', reason }),
+          failure: classifyStopGateResult({ ok: false, reason }),
+        }));
+        """
+    )
+    for branch, decision in payload.items():
+        text = decision["reason"]
+        assert "wJalrXUtnFEMIK7MDENG" not in text, f"{branch} leaked the credential"
+        # The finding must survive: the key name and its location are the point.
+        assert "AWS_SECRET_ACCESS_KEY" in text, f"{branch} over-redacted the finding"
+        assert "src/config.ts:12" in text, f"{branch} lost the location"
+
+
+def test_codex_stop_gate_exception_path_is_redacted_too(tmp_path):
+    # `handleHookException` emits a block decision WITHOUT going through
+    # classifyStopGateResult, so redacting the classifier alone leaves this
+    # degraded path open. It is not hypothetical: readHookInput JSON.parse()s the
+    # Stop payload, and V8 embeds a snippet of the offending input -- i.e. the
+    # hook's stdin, which carries last_assistant_message -- in the error message.
+    #
+    # Hence sanitization sits at the EMIT boundary, which every path crosses.
+    plugin_data = tmp_path / "plugin-data"
+    gate_on = tmp_path / "gate_on"
+    gate_on.mkdir()
+    _enable_stop_gate(gate_on, plugin_data)
+
+    # The input shape matters. V8 reports most malformed JSON by POSITION only
+    # ("Expected ',' or '}' ... at position 60"), which quotes nothing -- a test
+    # built on that shape passes without any fix. It quotes the offending bytes
+    # only in the "Unexpected token" form, so that is what is exercised here.
+    secret = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIII"
+    result = _run_stop_gate_hook(gate_on, plugin_data, secret)
+    assert result.returncode == 0, result.stderr
+    decision = json.loads(result.stdout)
+    assert decision["decision"] == "block", "must still fail closed"
+    quoted_prefix = secret[:10]
+    assert quoted_prefix not in decision["reason"]
+    assert quoted_prefix not in result.stderr, "the stderr note leaks what the decision redacts"
+
+
+def test_codex_job_state_files_are_not_group_or_world_readable(tmp_path):
+    # The sidecar and the job log hold review text and (before this change) raw
+    # child stderr, they outlive the session, and they had no TTL. They were
+    # created at the process umask -- 0644 on a default install.
+    #
+    # Modes are passed explicitly rather than relying on umask so the assertion
+    # holds for any developer or CI runner. Scope note: the panel REJECTED
+    # relocating the state root in this change, because losing the old state
+    # makes loadState default stopReviewGate to false -- a fail-closed security
+    # gate silently becoming fail-open. Only the modes are hardened here.
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { writeJobFile } from './plugins/codex/scripts/lib/state.mjs';
+        import { createJobLogFile } from './plugins/codex/scripts/lib/tracked-jobs.mjs';
+        const workspace = process.argv[1];
+        const jobFile = writeJobFile(workspace, 'probe-job', { id: 'probe-job', status: 'completed' });
+        const logFile = createJobLogFile(workspace, 'probe-job');
+        const modeOf = (p) => (fs.statSync(p).mode & 0o777).toString(8);
+        console.log(JSON.stringify({
+          job: modeOf(jobFile),
+          log: modeOf(logFile),
+          jobsDir: modeOf(path.dirname(jobFile)),
+        }));
+        """.replace("path.dirname(jobFile)", "jobFile.replace(/\\/[^/]+$/, '')"),
+        env={"CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")},
+        args=[str(tmp_path)],
+    )
+    assert payload["job"] == "600", f"job sidecar is {payload['job']}"
+    assert payload["log"] == "600", f"job log is {payload['log']}"
+    assert payload["jobsDir"] == "700", f"jobs dir is {payload['jobsDir']}"
+
+
 # ===== effort-policy.mjs (codex intelligence-tier capability adaptation, spec v6) =====
 
 def _run_effort_policy(body):
@@ -9541,3 +10693,704 @@ def test_codex_run_command_lets_callers_opt_out_of_the_shell():
     assert "shell: options.shell ??" in process_lib
     # The Windows default must survive for the .cmd-shim spawns.
     assert 'process.platform === "win32" ? (process.env.SHELL || true) : false' in process_lib
+
+
+def test_codex_bare_pem_block_and_registry_auth_are_redacted():
+    # A whole PEM block is a credential on its own: everything else in the
+    # redactor keys off an assignment, so a bare block -- exactly how a key gets
+    # pasted into a review or dumped by a tool -- passed through untouched.
+    #
+    # DOCKER_AUTH_CONFIG and NPM_CONFIG__AUTH hold base64 registry credentials
+    # and match neither the qualifier+weak pairing nor the fragment list.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          barePem: sanitizeModelText(
+            '-----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFOQmdrcWhraUc5\\n-----END PRIVATE KEY-----'
+          ),
+          dockerAuth: sanitizeModelText('DOCKER_AUTH_CONFIG=eyJhdXRocyI6LEVBSw'),
+          npmAuth: sanitizeModelText('NPM_CONFIG__AUTH=bnBtOnRva2Vu'),
+        }));
+        """
+    )
+    assert "TUlJRXZRSUJBREFO" not in payload["barePem"]
+    assert "eyJhdXRocyI6LEVBSw" not in payload["dockerAuth"]
+    assert "bnBtOnRva2Vu" not in payload["npmAuth"]
+
+
+def test_codex_shape_qualified_keys_are_not_treated_as_secrets():
+    # `token_count` is a number, `passwordless` a boolean, `signature_status` an
+    # enum, `SSH_AUTH_SOCK` a socket path. All four matched the credential rules
+    # and, because unquoted values run to end-of-line, erased the rest of their
+    # line -- degrading exactly the diagnostics this channel exists to carry.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'token_count=42', 'passwordless=true', 'signature_status=valid and more',
+          'SSH_AUTH_SOCK=/tmp/agent.sock',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, value in payload.items():
+        assert value == original, f"over-redacted {original!r} -> {value!r}"
+
+
+def test_codex_progress_preview_redacts_before_it_shortens():
+    # Third occurrence of the same ordering error -- after the stderr bound and
+    # the stop-gate reason. Every preview in codex.mjs funnels through shorten(),
+    # so a token crossing the 96-character preview limit became an unrecognized
+    # fragment that then reached the terminal, the job log and /codex:status.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "sanitizeModelText(String(text ?? \"\").trim().replace(/\\s+/g, \" \"))" in source, (
+        "shorten() must redact before truncating"
+    )
+
+
+def test_codex_sanitizer_two_sided_invariant():
+    # The single most-regressed property in this change: five of the panel's
+    # findings were fixes in one direction breaking the other. Both sets are
+    # asserted together so neither can be traded away silently.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'SESSION_ID=abc123LEAK', 'BEARER=eyJLEAK', 'Authorization: Bearer eyJLEAK',
+          'Cookie: a=1; s=cLEAK', 'SESSION_COOKIE=cLEAK', 'GITHUB_TOKEN=ghLEAK',
+          'AWS_SECRET_ACCESS_KEY=wLEAK', 'SSH_KEY=aLEAK', 'DB_PASS=hLEAK',
+          'DOCKER_AUTH_CONFIG=eLEAK', 'NPM_CONFIG__AUTH=nLEAK',
+          'REDIS_URL=redis://u:pLEAK@h', 'DATABASE_URL=postgres://u:pLEAK@h/db',
+          'tokenizer_model=gpt-4 and notes', 'cookie_domain=example.com here',
+          'token_name=primary', 'token_count=42', 'passwordless=true',
+          'signature_status=valid', 'SSH_AUTH_SOCK=/tmp/a.sock',
+          'REQUEST_ID=r-123', 'JOB_ID=j-9', 'PRIMARY_KEY=id', 'FOREIGN_KEY=u and more',
+          'PASS_RATE=0.98', 'DICT_KEYS=abc', 'let keyboard = 1', 'AUTHOR=alice',
+          'TESTS_PASSED=3', 'version=1.2.3', 'status: ok',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, value in payload.items():
+        if "LEAK" in original:
+            assert "LEAK" not in value, f"must redact but leaked: {original!r}"
+            assert "[secret]" in value
+        else:
+            assert value == original, f"must survive byte-identical: {original!r} -> {value!r}"
+
+
+def test_codex_orphaned_key_body_walk_stops_at_ordinary_prose():
+    # `diag` matches the base64 charset by accident, so accepting any short
+    # alphanumeric run as key body deleted the diagnostic line above the key. A
+    # short line is body ONLY immediately before the END marker -- which is
+    # exactly where a real PEM's remainder line sits.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          shortTail: sanitizeModelText(
+            'diag\\nQUJDREVGR0hJSktMTU5PUFFS\\nQUJD\\n-----END RSA PRIVATE KEY-----\\ntail'
+          ),
+          noBody: sanitizeModelText(
+            'important diagnostic\\nanother line\\n-----END RSA PRIVATE KEY-----\\ntail'
+          ),
+        }));
+        """
+    )
+    # The short remainder line and the full-width line both go; `diag` stays.
+    assert "diag" in payload["shortTail"]
+    assert "QUJDREVGR0hJSktMTU5PUFFS" not in payload["shortTail"]
+    assert "QUJD\n" not in payload["shortTail"]
+    # Nothing key-shaped precedes the marker: leave the text entirely alone.
+    assert "important diagnostic" in payload["noBody"]
+    assert "another line" in payload["noBody"]
+
+
+def test_codex_sanitizer_symmetric_keys_and_marker_suffixes():
+    # HMAC_KEY / FERNET_KEY / AES_KEY split into a non-qualifying first segment
+    # plus a weak `key`, so nothing promoted them -- ordinary env dumps kept real
+    # signing and encryption keys.
+    #
+    # `API_KEY=[secret] TOPSECRET` is what compaction and accidental
+    # concatenation produce. Treating whitespace as a value terminator made the
+    # marker look complete, so the assignment was skipped and the suffix stayed.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'HMAC_KEY=AAAALEAK', 'FERNET_KEY=bbbbLEAK', 'AES_KEY=cLEAK', 'SIGNING_KEY=dLEAK',
+          // ATTACHED suffix -- unambiguously a marker with a credential stuck to
+          // it, which is what shell concatenation produces.
+          'API_KEY=[secret]TOPSECRETVALUE',
+        ]) out[s] = sanitizeModelText(s);
+        // A SPACE-separated marker is deliberately left alone: that is this
+        // module's OWN output shape, and treating it as forged made
+        // sanitize(sanitize(x)) !== sanitize(x) -- re-running the redactor on
+        // 'credentials=[secret] at src/config.ts:12' swallowed the file and
+        // line, destroying exactly the context a stop-gate block conveys. The
+        // compaction path that could produce a live suffix is closed at its
+        // source instead: appendBoundedStderr discards a continuation that
+        // follows a marker.
+        out.idempotentWithContext = sanitizeModelText('credentials=[secret] at src/config.ts:12');
+        // The genuine marker must still count as already redacted.
+        out.idempotent = sanitizeModelText('API_KEY=[secret]');
+        console.log(JSON.stringify(out));
+        """
+    )
+    idempotent = payload.pop("idempotent")
+    with_context = payload.pop("idempotentWithContext")
+    for original, value in payload.items():
+        assert "LEAK" not in value and "TOPSECRET" not in value, f"{original} leaked"
+    assert idempotent == "API_KEY=[secret]"
+    # The finding survives re-sanitization with its location intact.
+    assert with_context == "credentials=[secret] at src/config.ts:12"
+
+
+def test_codex_sanitizer_compound_credential_names_with_infixes():
+    # A qualifier does not have to sit immediately before the weak word:
+    # HMAC_ROTATION_KEY, SIGNING_PRIMARY_KEY and TLS_SERVER_KEY put a
+    # descriptive word in between and matched nothing. PGPASSWORD and
+    # REDISCLI_AUTH need the suffix rule -- the credential word ends the segment
+    # rather than being the whole of it.
+    #
+    # The negatives matter as much: `tokenizer` starts with `token` and `author`
+    # contains `auth`, and a substring rule would eat both.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'PGPASSWORD=hLEAK', 'REDISCLI_AUTH=rLEAK', 'HMAC_ROTATION_KEY=kLEAK',
+          'SIGNING_PRIMARY_KEY=sLEAK', 'TLS_SERVER_KEY=tLEAK',
+          'SSH_AUTH_SOCK=/tmp/a.sock', 'AUTHOR=alice', 'auth_type=basic',
+          'oauth_state=xyz', 'tokenizer_model=gpt-4 and notes', 'PRIMARY_KEY=id',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, value in payload.items():
+        if "LEAK" in original:
+            assert "LEAK" not in value, f"{original} leaked"
+        else:
+            assert value == original, f"over-redacted {original!r} -> {value!r}"
+
+
+def test_codex_quoted_value_with_attached_suffix_is_taken_whole():
+    # `API_KEY="TOP"SECRET` is one value written as two pieces -- ordinary shell
+    # concatenation, not adversarial shaping. Accepting the first quoted span
+    # left the attached suffix behind a marker that read as complete.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          attached: sanitizeModelText('API_KEY="TOP"SECRETLEAK'),
+          // A SPACE ends the value in shell, and this is also this module's own
+          // output shape, so it must survive re-sanitization unchanged.
+          separated: sanitizeModelText('API_KEY="[secret]" and notes'),
+        }));
+        """
+    )
+    assert "LEAK" not in payload["attached"]
+    assert payload["separated"] == 'API_KEY="[secret]" and notes'
+
+
+def test_codex_sanitizer_handles_yaml_blocks_uris_and_truncated_pem():
+    # Three shapes ordinary tooling produces:
+    #   `KEY: |` puts the value on the FOLLOWING indented lines, so stopping at
+    #   the newline redacted the indicator and left the secret under a marker.
+    #   A URI with inline credentials is a secret whatever the variable is
+    #   called -- keying on the NAME could not keep up with SQLALCHEMY_DATABASE_URI
+    #   or CELERY_BROKER_URL, and casting the net wider by name also caught
+    #   BASE_URL, an ordinary endpoint.
+    #   A crashed writer emits a PEM header with no END marker.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          yamlBlock: sanitizeModelText('API_KEY: |\\n  TOPSECRET\\nnext: ok'),
+          sqlalchemy: sanitizeModelText('SQLALCHEMY_DATABASE_URI=postgresql://admin:p4ss@db/prod'),
+          celery: sanitizeModelText('CELERY_BROKER_URL=amqp://u:p4ss@h'),
+          inProse: sanitizeModelText('connect to mongodb://root:p4ss@h/db now'),
+          truncatedPem: sanitizeModelText('-----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFO\\n'),
+          plainEndpoint: sanitizeModelText('BASE_URL=https://api.example.com'),
+          docsLink: sanitizeModelText('see https://example.com/docs'),
+        }));
+        """
+    )
+    assert "TOPSECRET" not in payload["yamlBlock"]
+    # The key that follows the block must survive.
+    assert "next: ok" in payload["yamlBlock"]
+    for name in ("sqlalchemy", "celery", "inProse"):
+        assert "p4ss" not in payload[name], f"{name} leaked"
+    assert "TUlJRXZRSUJBREFO" not in payload["truncatedPem"]
+    # An endpoint with no credentials is not a secret.
+    assert payload["plainEndpoint"] == "BASE_URL=https://api.example.com"
+    assert payload["docsLink"] == "see https://example.com/docs"
+
+
+def test_codex_sanitizer_is_linear_on_unmatched_pem_headers():
+    # The FOURTH distinct quadratic in this file: a lazy wildcard between BEGIN
+    # and END rescans every suffix when END never arrives. Measured 213 ms at
+    # 328 KB and 1081 ms at 656 KB before the line scanner replaced it -- and the
+    # stop gate sanitizes before it bounds, so this stalls the fail-closed path.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const block = '-----BEGIN PRIVATE KEY-----\\n'.repeat(12000);
+        const timeFor = (n) => {
+          const text = block.repeat(n);
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(1), large: timeFor(4) }));
+        """
+    )
+    assert payload["large"] < 200, f"1.3MB of unmatched headers took {payload['large']}ms"
+
+
+def test_codex_failed_job_replay_keeps_its_failure_framing():
+    # /codex:result preferred the stored rawOutput over the stored rendering, so
+    # a failed job replayed as its mid-flight commentary alone -- dropping both
+    # the "did not complete" notice and the diagnostics needed to act on it.
+    payload = run_node_script(
+        """
+        import { renderStoredJobResult } from './plugins/codex/scripts/lib/render.mjs';
+        const stored = {
+          result: { rawOutput: 'Still investigating.' },
+          rendered: 'Codex did not complete the turn.\\n\\ndiagnostics:\\n\\ntransport failed\\n',
+        };
+        console.log(JSON.stringify({
+          failed: renderStoredJobResult({ id: 'j1', status: 'failed', title: 't' }, stored),
+          completed: renderStoredJobResult({ id: 'j2', status: 'completed', title: 't' }, stored),
+        }));
+        """
+    )
+    assert "did not complete" in payload["failed"]
+    assert "transport failed" in payload["failed"]
+    # A completed job still replays its raw answer.
+    assert payload["completed"].strip() == "Still investigating."
+
+
+def test_codex_sanitizer_is_linear_on_dotted_output():
+    # The FIFTH quadratic, and it was introduced by the previous round's own fix:
+    # an unbounded `[a-z0-9+.-]*` scheme scan retries at every word boundary of
+    # ordinary dotted output. Measured 63/1105/4166 ms at 16k/64k/128k of 'a.'.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const timeFor = (n) => {
+          const text = 'a.'.repeat(n / 2);
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(16000), large: timeFor(512000) }));
+        """
+    )
+    assert payload["large"] < 200, f"512k of dotted output took {payload['large']}ms"
+
+
+def test_codex_sanitizer_keeps_sibling_json_fields_and_yaml_spaced_keys():
+    # Two opposite errors in one place.
+    #
+    # Treating every non-space after a quoted value as concatenation swallowed
+    # JSON commas, so `{"password":"x","file":"a.ts","line":12}` collapsed to
+    # `{"password":[secret]` -- the file and line a persisted failure needs are
+    # exactly what got dropped.
+    #
+    # Meanwhile a YAML key may contain spaces, and walking only word characters
+    # saw `KEY` in `API KEY:` and matched nothing at all.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          json: sanitizeModelText('{"password":"hunter2","file":"src/config.ts","line":12}'),
+          semicolon: sanitizeModelText('PASSWORD="hunter2"; status=failed'),
+          spacedKey: sanitizeModelText('API KEY: |\\n  HUNTER2\\nnext: ok'),
+          prose: sanitizeModelText('the value: 42'),
+        }));
+        """
+    )
+    assert "hunter2" not in payload["json"]
+    # Siblings survive.
+    assert "src/config.ts" in payload["json"] and '"line":12' in payload["json"]
+    assert "hunter2" not in payload["semicolon"] and "status=failed" in payload["semicolon"]
+    assert "HUNTER2" not in payload["spacedKey"] and "next: ok" in payload["spacedKey"]
+    # A colon in prose is not an assignment.
+    assert payload["prose"] == "the value: 42"
+
+
+def test_codex_stop_gate_fails_closed_without_a_final_answer():
+    # `turn/completed` can arrive with status 0 while the captured text is
+    # intermediate commentary. An ALLOW parsed from commentary would open a
+    # fail-closed gate on a turn that never actually reached a verdict.
+    payload = run_node_script(
+        """
+        import { classifyStopTaskProcessResult }
+          from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        console.log(JSON.stringify({
+          commentary: classifyStopTaskProcessResult({
+            status: 0,
+            stdout: JSON.stringify({
+              rawOutput: 'ALLOW: intermediate commentary',
+              finalAnswerSeen: false,
+            }),
+          }),
+          genuine: classifyStopTaskProcessResult({
+            status: 0,
+            stdout: JSON.stringify({ rawOutput: 'ALLOW: looks good', finalAnswerSeen: true }),
+          }),
+        }));
+        """
+    )
+    assert payload["commentary"]["ok"] is False
+    assert payload["commentary"]["kind"] == "no-final-answer"
+    # A genuine final answer is still authoritative.
+    assert payload["genuine"]["ok"] is True
+    assert payload["genuine"]["verdict"] == "ALLOW"
+
+
+def test_codex_task_summary_is_redacted_before_truncation():
+    # The task summary is built from the raw PROMPT and written into running
+    # state and the job sidecar BEFORE execution, so the completion-time
+    # sanitizer never sees it. Truncating first turns a recognized key into an
+    # unrecognized fragment -- the fifth place this ordering error was found.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "codex-companion.mjs").read_text()
+    assert 'sanitizeModelText(String(text ?? "").trim().replace(/\\s+/g, " "))' in source, (
+        "shorten() must redact before truncating"
+    )
+
+
+def test_codex_sanitizer_handles_diff_prefixed_pem_and_adjacent_quotes():
+    # A key committed to a repository reaches this channel through a unified
+    # diff, where every line carries a `+`. Requiring the marker to start the
+    # trimmed line missed exactly that case, and the orphan fallback declined too
+    # because the text still contained a BEGIN.
+    #
+    # The first attempt at the fix stripped any leading `+`/`-`, which ate the
+    # first dash of `-----BEGIN` itself -- hence the plain and truncated cases
+    # below.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          diffAdded: sanitizeModelText(
+            '+-----BEGIN PRIVATE KEY-----\\n+TUlJRXZRSUJBREFOQmdrcQ\\n+-----END PRIVATE KEY-----'
+          ),
+          plain: sanitizeModelText(
+            '-----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFOQmdrcQ\\n-----END PRIVATE KEY-----'
+          ),
+          truncated: sanitizeModelText('-----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFO\\n'),
+          // Adjacent quoted fragments are ordinary shell concatenation.
+          adjacentQuotes: sanitizeModelText('PASSWORD=""\\'hunter2\\''),
+        }));
+        """
+    )
+    assert "TUlJRXZRSUJBREFOQmdrcQ" not in payload["diffAdded"]
+    assert "TUlJRXZRSUJBREFOQmdrcQ" not in payload["plain"]
+    assert "TUlJRXZRSUJBREFO" not in payload["truncated"]
+    assert "hunter2" not in payload["adjacentQuotes"]
+
+
+def test_codex_turn_without_final_answer_is_not_status_zero():
+    # `turn/completed` can arrive with status 0 while no final answer was ever
+    # captured. Status drives the rendered framing, the persisted job status and
+    # multi-review role success, so leaving it at 0 recorded intermediate
+    # commentary as a completed result everywhere downstream.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "buildResultStatus(turnState) || (turnState.finalAnswerSeen ? 0 : 1)" in source, (
+        "a turn with no final answer must not report success"
+    )
+
+
+def test_codex_stop_gate_honours_the_host_loop_guard():
+    # The host sets stop_hook_active when Stop fires because a hook already
+    # blocked. Without honouring it, each iteration runs another full Codex
+    # review -- and the fail-closed path for a turn with no final answer makes
+    # that loop reachable, since it blocks without ever reaching a verdict.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "stop-review-gate-hook.mjs").read_text()
+    assert "if (input.stop_hook_active) {" in source
+    guard_at = source.index("input.stop_hook_active")
+    # The CALL site, not the definition, which sits earlier in the file.
+    review_at = source.index("= runStopReview(")
+    assert guard_at < review_at, "the loop guard must precede any review dispatch"
+
+
+def test_codex_sanitizer_finds_inline_pem_delimiters():
+    # A delimiter can start mid-line -- `Evidence follows: -----BEGIN ...` is an
+    # ordinary diagnostic. Anchoring at the line start missed it, and the orphan
+    # fallback then declined too, merely because the text contained a BEGIN.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          inline: sanitizeModelText(
+            'Evidence follows: -----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFO\\n-----END PRIVATE KEY-----'
+          ),
+        }));
+        """
+    )
+    assert "TUlJRXZRSUJBREFO" not in payload["inline"]
+    # The lead-in text is not key material and stays.
+    assert "Evidence follows:" in payload["inline"]
+
+
+def test_codex_sanitizer_is_linear_in_weak_key_segments():
+    # The SIXTH quadratic, introduced by the round that added "a qualifier
+    # anywhere before the weak word": the prefix was re-sliced and rescanned for
+    # every weak segment. Measured 58/803/2168 ms at 16/64/128 KB of `key_`.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const timeFor = (kb) => {
+          const text = 'key_'.repeat((kb * 1024) / 4) + '=x';
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(16), large: timeFor(256) }));
+        """
+    )
+    assert payload["large"] < 200, f"256KB of weak segments took {payload['large']}ms"
+
+
+def test_codex_phaseless_completion_is_still_a_final_answer():
+    # `phase` is optional in the protocol: providers are not required to emit
+    # MessagePhase, and an absent value must keep legacy behaviour. Requiring
+    # phase === "final_answer" reclassified ordinary phase-less completions as
+    # failures, which downstream became partial output, a failed job, a failed
+    # multi-review role, and a fail-closed Stop block.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert 'item.phase == null || item.phase === "final_answer"' in source, (
+        "a completed message with no phase must count as a final answer"
+    )
+
+
+def test_codex_sanitizer_redacts_password_only_uris():
+    # `redis://:p4ss@host` is how Redis and Celery URLs carry an auth string --
+    # the userinfo is password-only, and requiring a username missed them
+    # entirely. CELERY_BROKER_URL also misses every key rule, so the value
+    # pattern is the only thing standing between it and a persisted diagnostic.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          passwordOnly: sanitizeModelText('CELERY_BROKER_URL=redis://:p4ssW0rd@cache.internal/0'),
+          withUser: sanitizeModelText('REDIS_URL=redis://u:p4ssW0rd@h'),
+          plain: sanitizeModelText('BASE_URL=https://api.example.com'),
+        }));
+        """
+    )
+    assert "p4ssW0rd" not in payload["passwordOnly"]
+    assert "p4ssW0rd" not in payload["withUser"]
+    assert payload["plain"] == "BASE_URL=https://api.example.com"
+
+
+def test_codex_final_answer_text_is_captured_not_inferred_from_the_last_message():
+    # finalAnswerSeen is sticky, while every later main-thread message still
+    # overwrites lastAgentMessage. A legal sequence -- a phase-less completion
+    # followed by an explicit commentary message -- therefore ended with the
+    # COMMENTARY returned as the final answer, and the Stop classifier would
+    # accept an ALLOW parsed from it, defeating fail-closed behaviour.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "state.finalAnswerText = item.text;" in source
+    assert "finalAnswerText: \"\"," in source
+
+
+def test_codex_explicit_final_answer_is_not_replaced_by_later_commentary():
+    # Phases may be omitted, so a phase-less message counts as final -- but that
+    # made every trailing phase-less message overwrite an EXPLICIT verdict. A
+    # probe emitting 'BLOCK: confirmed defect' then a phase-less
+    # 'ALLOW: late commentary' ended with the ALLOW returned, which the stop
+    # classifier would accept: a BLOCK turned into an ALLOW on the fail-closed
+    # path.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    assert "if (state.explicitFinalAnswerSeen && item.phase == null) {" in source
+    assert "state.explicitFinalAnswerSeen = true;" in source
+
+
+def test_codex_failed_review_never_renders_as_a_verdict():
+    # A failed turn produces no verdict, whatever its text parsed into. Review
+    # JSON emitted mid-flight rendered as 'Verdict: approve' with no blockers,
+    # and that rendering is persisted and replayed by /codex:result -- a failed
+    # review reading as an approval.
+    payload = run_node_script(
+        """
+        import { renderReviewResult } from './plugins/codex/scripts/lib/render.mjs';
+        const parsed = {
+          parsed: { verdict: 'approve', summary: 'ok', findings: [], next_steps: [] },
+          rawOutput: '{"verdict":"approve"}',
+        };
+        console.log(JSON.stringify({
+          failed: renderReviewResult(
+            { ...parsed, status: 1, failureMessage: 'transport reset' },
+            { reviewLabel: 'Review', targetLabel: 'HEAD', reasoningSummary: [] },
+          ),
+          succeeded: renderReviewResult(
+            { ...parsed, status: 0 },
+            { reviewLabel: 'Review', targetLabel: 'HEAD', reasoningSummary: [] },
+          ),
+        }));
+        """
+    )
+    assert "did not complete" in payload["failed"]
+    assert "transport reset" in payload["failed"]
+    assert "Verdict: approve" not in payload["failed"]
+    # A successful review still renders its verdict.
+    assert "Verdict: approve" in payload["succeeded"]
+
+
+def test_codex_yaml_block_survives_diff_prefixes_and_inline_comments():
+    # A config change arrives as a unified diff, and `KEY: | # note` is valid
+    # YAML. Both forms left the indented secret in place under a marker.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          diffPrefixed: sanitizeModelText('+API_KEY: |\\n+  TOPSECRET\\n+next: ok'),
+          withComment: sanitizeModelText('API_KEY: | # note\\n  TOPSECRET\\nnext: ok'),
+        }));
+        """
+    )
+    for name, value in payload.items():
+        assert "TOPSECRET" not in value, f"{name} leaked"
+        assert "next: ok" in value, f"{name} destroyed the following key"
+
+
+def test_codex_legacy_failed_sidecar_is_sanitized_on_read():
+    # The state directory is deliberately retained across upgrades, so a sidecar
+    # written by an earlier release holds unredacted output that no write-side
+    # fix can reach. /codex:result must redact it on the way out.
+    payload = run_node_script(
+        """
+        import { renderStoredJobResult } from './plugins/codex/scripts/lib/render.mjs';
+        console.log(JSON.stringify({
+          legacyFailed: renderStoredJobResult(
+            { id: 'j', status: 'failed', title: 't' },
+            { rendered: 'API_KEY=HUNTER2_SUPER_SECRET\\n' },
+          ),
+        }));
+        """
+    )
+    assert "HUNTER2_SUPER_SECRET" not in payload["legacyFailed"]
+
+
+def test_codex_review_summary_is_sanitized_on_every_branch():
+    """All three summary branches must redact, not just the fallback.
+
+    The summary is persisted into job state and re-displayed by /codex:status and
+    /codex:result -- which is why firstMeaningfulLine redacts. But the review call
+    site selects it as the LAST of three options, so a model-authored `summary`
+    field and a JSON.parse error both bypassed that. V8 quotes the offending bytes
+    verbatim in the parse error, so the raw output leaks through the message
+    itself. The status table strips control chars per cell, but the plain-text
+    `Summary:` lines do not.
+    """
+    companion = read_text(PLUGIN / "scripts" / "codex-companion.mjs")
+
+    # The wrapper may sit on a preceding line, so inspect the whole expression.
+    idx = companion.index("parsed.parsed?.summary")
+    expr_start = companion.rindex("summary:", 0, idx)
+    expr_end = companion.index("\n", idx)
+    summary_expr = companion[expr_start:expr_end]
+
+    assert "sanitizeModelText(" in summary_expr, (
+        "the model-authored summary and the parse-error branch reach persisted job "
+        f"state unredacted:\n  {summary_expr.strip()}"
+    )
+
+    # The probe below is matched by the existing patterns wherever they run, so a
+    # failure here is a missing call, not a pattern gap.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        let parseError = '';
+        try {
+          JSON.parse('API_KEY=hunter2_super_secret_value');
+        } catch (error) {
+          parseError = error.message;
+        }
+        console.log(JSON.stringify({ parseError, redacted: sanitizeModelText(parseError) }));
+        """
+    )
+    assert "API_KEY=hu" in payload["parseError"], "V8 no longer quotes the input"
+    assert "API_KEY=hu" not in payload["redacted"]
+
+
+def test_codex_parse_result_already_carries_status_and_failure_message():
+    """parseStructuredOutput spreads its fallback, so the renderer already has both.
+
+    Round 10 added explicit re-assignments at the review call site on the theory
+    that the renderer never received them. It did; it just ignored them. Keep the
+    spread contract asserted so the re-assignments stay unnecessary.
+    """
+    payload = run_node_script(
+        """
+        import { parseStructuredOutput } from './plugins/codex/scripts/lib/codex.mjs';
+        console.log(JSON.stringify({
+          valid: parseStructuredOutput('{"verdict":"approve"}', { status: 1, failureMessage: 'boom' }),
+          empty: parseStructuredOutput('', { status: 1, failureMessage: 'boom' }),
+          invalid: parseStructuredOutput('not json', { status: 1, failureMessage: 'boom' }),
+        }));
+        """
+    )
+    for name, result in payload.items():
+        assert result["status"] == 1, f"{name} dropped status"
+        assert result["failureMessage"] == "boom", f"{name} dropped failureMessage"
+
+
+def test_codex_yaml_block_scalar_uses_indentation_depth_not_diff_stripping():
+    # Round 10 stripped a leading [+- ] from continuation lines so a unified diff
+    # would parse. That ate the single indent space of raw YAML: `KEY: |` followed
+    # by a one-space-indented secret terminated the block immediately and the
+    # secret survived. Two- and four-space indents masked it by leaving a space
+    # behind. The block now continues while a line is indented deeper than the
+    # indicator's own line, which is the actual YAML rule and also holds for a
+    # nested key.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          indent1: sanitizeModelText('API_KEY: |\\n TOPSECRET\\nnext: ok'),
+          indent2: sanitizeModelText('API_KEY: |\\n  TOPSECRET\\nnext: ok'),
+          indent4: sanitizeModelText('API_KEY: |\\n    TOPSECRET\\nnext: ok'),
+          nested: sanitizeModelText('outer:\\n  API_KEY: |\\n    TOPSECRET\\n  next: ok'),
+          diffAdded: sanitizeModelText('+API_KEY: |\\n+  TOPSECRET\\n+next: ok'),
+          diffContext: sanitizeModelText(' API_KEY: |\\n   TOPSECRET\\n next: ok'),
+          diffBlankLine: sanitizeModelText('+API_KEY: |\\n+\\n+  TOPSECRET\\n+next: ok'),
+        }));
+        """
+    )
+    for name, value in payload.items():
+        assert "TOPSECRET" not in value, f"{name} leaked"
+        # Over-redaction is the opposite failure: the block must stop at the next
+        # key rather than swallowing it.
+        assert "next: ok" in value, f"{name} swallowed the following key"
+
+
+def test_codex_structured_review_early_return_sanitizes_a_failed_job():
+    # renderStoredJobResult has TWO branches that replay storedJob.rendered. The
+    # structured-review early return fires first, so redacting only the later one
+    # left a failed structured review replaying its stored output unredacted --
+    # exactly the legacy-sidecar case the later branch was added for.
+    payload = run_node_script(
+        """
+        import { renderStoredJobResult } from './plugins/codex/scripts/lib/render.mjs';
+        const storedJob = {
+          rendered: 'API_KEY=HUNTER2_SUPER_SECRET\\n',
+          result: { verdict: 'approve', summary: 's', findings: [], next_steps: [] },
+        };
+        console.log(JSON.stringify({
+          failed: renderStoredJobResult({ id: 'j', status: 'failed', title: 't' }, storedJob),
+          completed: renderStoredJobResult({ id: 'j', status: 'completed', title: 't' }, storedJob),
+        }));
+        """
+    )
+    assert "HUNTER2_SUPER_SECRET" not in payload["failed"]
+    # A successful deliverable stays byte-identical -- that exemption is the point.
+    assert "HUNTER2_SUPER_SECRET" in payload["completed"]
