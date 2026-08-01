@@ -168,6 +168,13 @@ export function classifyStopTaskProcessResult(result) {
     }
     return processFailure();
   }
+  // A turn that completed WITHOUT a final answer is not an authoritative
+  // verdict: `turn/completed` can land with status 0 while the captured text is
+  // intermediate commentary, and an ALLOW parsed from commentary would open a
+  // fail-closed gate. Treat it as a process failure.
+  if (payload && payload.finalAnswerSeen === false) {
+    return { ok: false, kind: "no-final-answer", reason: "Codex stop review did not produce a final answer." };
+  }
   const parsed = parseStopReviewOutput(payload?.rawOutput || "");
   if (parsed.ok) {
     if (parsed.verdict === "BLOCK") {

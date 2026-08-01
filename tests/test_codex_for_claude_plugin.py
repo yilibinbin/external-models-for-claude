@@ -10969,3 +10969,93 @@ def test_codex_failed_job_replay_keeps_its_failure_framing():
     assert "transport failed" in payload["failed"]
     # A completed job still replays its raw answer.
     assert payload["completed"].strip() == "Still investigating."
+
+
+def test_codex_sanitizer_is_linear_on_dotted_output():
+    # The FIFTH quadratic, and it was introduced by the previous round's own fix:
+    # an unbounded `[a-z0-9+.-]*` scheme scan retries at every word boundary of
+    # ordinary dotted output. Measured 63/1105/4166 ms at 16k/64k/128k of 'a.'.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const timeFor = (n) => {
+          const text = 'a.'.repeat(n / 2);
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(16000), large: timeFor(512000) }));
+        """
+    )
+    assert payload["large"] < 200, f"512k of dotted output took {payload['large']}ms"
+
+
+def test_codex_sanitizer_keeps_sibling_json_fields_and_yaml_spaced_keys():
+    # Two opposite errors in one place.
+    #
+    # Treating every non-space after a quoted value as concatenation swallowed
+    # JSON commas, so `{"password":"x","file":"a.ts","line":12}` collapsed to
+    # `{"password":[secret]` -- the file and line a persisted failure needs are
+    # exactly what got dropped.
+    #
+    # Meanwhile a YAML key may contain spaces, and walking only word characters
+    # saw `KEY` in `API KEY:` and matched nothing at all.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          json: sanitizeModelText('{"password":"hunter2","file":"src/config.ts","line":12}'),
+          semicolon: sanitizeModelText('PASSWORD="hunter2"; status=failed'),
+          spacedKey: sanitizeModelText('API KEY: |\\n  HUNTER2\\nnext: ok'),
+          prose: sanitizeModelText('the value: 42'),
+        }));
+        """
+    )
+    assert "hunter2" not in payload["json"]
+    # Siblings survive.
+    assert "src/config.ts" in payload["json"] and '"line":12' in payload["json"]
+    assert "hunter2" not in payload["semicolon"] and "status=failed" in payload["semicolon"]
+    assert "HUNTER2" not in payload["spacedKey"] and "next: ok" in payload["spacedKey"]
+    # A colon in prose is not an assignment.
+    assert payload["prose"] == "the value: 42"
+
+
+def test_codex_stop_gate_fails_closed_without_a_final_answer():
+    # `turn/completed` can arrive with status 0 while the captured text is
+    # intermediate commentary. An ALLOW parsed from commentary would open a
+    # fail-closed gate on a turn that never actually reached a verdict.
+    payload = run_node_script(
+        """
+        import { classifyStopTaskProcessResult }
+          from './plugins/codex/scripts/stop-review-gate-hook.mjs';
+        console.log(JSON.stringify({
+          commentary: classifyStopTaskProcessResult({
+            status: 0,
+            stdout: JSON.stringify({
+              rawOutput: 'ALLOW: intermediate commentary',
+              finalAnswerSeen: false,
+            }),
+          }),
+          genuine: classifyStopTaskProcessResult({
+            status: 0,
+            stdout: JSON.stringify({ rawOutput: 'ALLOW: looks good', finalAnswerSeen: true }),
+          }),
+        }));
+        """
+    )
+    assert payload["commentary"]["ok"] is False
+    assert payload["commentary"]["kind"] == "no-final-answer"
+    # A genuine final answer is still authoritative.
+    assert payload["genuine"]["ok"] is True
+    assert payload["genuine"]["verdict"] == "ALLOW"
+
+
+def test_codex_task_summary_is_redacted_before_truncation():
+    # The task summary is built from the raw PROMPT and written into running
+    # state and the job sidecar BEFORE execution, so the completion-time
+    # sanitizer never sees it. Truncating first turns a recognized key into an
+    # unrecognized fragment -- the fifth place this ordering error was found.
+    source = (ROOT / "plugins" / "codex" / "scripts" / "codex-companion.mjs").read_text()
+    assert 'sanitizeModelText(String(text ?? "").trim().replace(/\\s+/g, " "))' in source, (
+        "shorten() must redact before truncating"
+    )

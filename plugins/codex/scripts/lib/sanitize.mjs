@@ -32,7 +32,11 @@ const SECRET_PATTERNS = [
   // Keying on the NAME could not keep up -- SQLALCHEMY_DATABASE_URI,
   // DATABASE_REPLICA_URL, CELERY_BROKER_URL -- and naming more engines would
   // also have caught BASE_URL, an ordinary endpoint. The value says it plainly.
-  /\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@[^\s"'`,}]*/gi,
+  // Scheme bounded and anchored on a non-scheme character. An unbounded
+  // `[a-z0-9+.-]*` retries at every word boundary of ordinary dotted output:
+  // measured 63/1105/4166 ms at 16k/64k/128k of `a.` -- the FIFTH quadratic in
+  // this file, introduced by the previous round's own fix.
+  /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]+:[^\s@/]+@[^\s"'`,}]*/gi,
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z_]{20,}\b/g,
@@ -458,6 +462,24 @@ function readKeyBefore(text, end, floor) {
   while (cursor > floor && KEY_CHAR.test(text[cursor - 1])) {
     cursor -= 1;
   }
+  // A YAML key may contain spaces (`API KEY: |`, `AWS SECRET ACCESS KEY:`).
+  // Extend across single spaces while the words keep looking like a key, so the
+  // segment rules see the whole name. Stops at a line break, and at anything
+  // that is not a bare word, so prose ending in a colon is unaffected.
+  while (cursor > floor && text[cursor - 1] === " ") {
+    let probe = cursor - 1;
+    while (probe > floor && text[probe - 1] === " ") {
+      probe -= 1;
+    }
+    const wordEnd = probe;
+    while (probe > floor && /[A-Za-z0-9_]/.test(text[probe - 1])) {
+      probe -= 1;
+    }
+    if (probe === wordEnd) {
+      break;
+    }
+    cursor = probe;
+  }
   return cursor === keyEnd ? null : text.slice(cursor, keyEnd);
 }
 
@@ -516,7 +538,11 @@ function readValueAt(text, index, key) {
     // Shell concatenation: `API_KEY="TOP"SECRET` is one value written as two
     // pieces. Accepting the first quoted span left the attached suffix in place
     // behind a marker that read as complete.
-    if (/^\S/.test(text.slice(index + quoted[0].length))) {
+    // Structural delimiters end the value; only a WORD character attached to the
+    // closing quote is concatenation. Treating every non-space as a suffix made
+    // `{"password":"x","file":"a.ts"}` collapse to `{"password":[secret]`,
+    // dropping the file and line a persisted failure needs to stay actionable.
+    if (/^[^\s,;:}\])"'`]/.test(text.slice(index + quoted[0].length))) {
       const lineEnd = text.indexOf("\n", index);
       return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
     }

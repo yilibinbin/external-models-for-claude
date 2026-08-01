@@ -185,8 +185,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Redact BEFORE truncating. The task summary is built from the raw PROMPT and
+// written into running state and the job sidecar before execution even starts,
+// so the completion-time sanitizer never sees it. Cutting first turns a
+// recognized key into an unrecognized fragment -- the FIFTH place this ordering
+// error has been found in this change.
 function shorten(text, limit = 96) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  const normalized = sanitizeModelText(String(text ?? "").trim().replace(/\s+/g, " "));
   if (!normalized) {
     return "";
   }
@@ -599,6 +604,10 @@ async function executeTaskRun(request) {
   const payload = {
     status: result.status,
     threadId: result.threadId,
+    // The stop gate fails closed on a turn that completed without ever
+    // producing a final answer: `turn/completed` can arrive with status 0 while
+    // the captured text is intermediate commentary.
+    finalAnswerSeen: Boolean(result.finalAnswerSeen),
     rawOutput,
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary

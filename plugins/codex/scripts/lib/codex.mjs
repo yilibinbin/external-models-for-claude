@@ -1144,6 +1144,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       // is overwritten by EVERY main-thread message. Without finalAnswerSeen the
       // value is commentary, so it loses the deliverable's byte-identical
       // exemption just as a failed turn's does.
+      finalAnswerSeen: Boolean(turnState.finalAnswerSeen),
       finalMessage:
         turnStatus === 0 && turnState.finalAnswerSeen
           ? turnState.lastAgentMessage
