@@ -9097,6 +9097,124 @@ def test_codex_stderr_compaction_does_not_run_per_chunk():
     assert payload["elapsedMs"] < 15, f"500 at-cap chunks took {payload['elapsedMs']}ms"
 
 
+def test_codex_sanitizer_covers_connection_strings_and_acronym_keys():
+    # Two gaps the segment rule still had when it first landed.
+    #
+    # Connection-string names contain no word from the segment list, yet the URL
+    # itself carries `user:password@host`.
+    #
+    # `SSHKey` / `DBPass` / `JWTAuth` / `TLSCert` split on neither the
+    # lowerUpper rule nor a separator, so an acronym-prefixed credential name
+    # arrived as one unrecognised segment. ACRONYM->Word needs its own rule.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'REDIS_URL=redis://u:p4ssw0rd@h:6379',
+          'POSTGRES_URL=postgres://u:p4ssw0rd@h/db',
+          'MONGODB_URI=mongodb://u:p4ssw0rd@h',
+          'SSHKey=AAAAB3LEAK', 'DBPass=hunter2', 'JWTAuth=eyJLEAK', 'TLSCert=MIIBLEAK',
+          'let keyboard = 1', 'AUTHOR=alice', 'TESTS_PASSED=3', 'version=1.2.3',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, value in payload.items():
+        if original in ("let keyboard = 1", "AUTHOR=alice", "TESTS_PASSED=3", "version=1.2.3"):
+            assert value == original, f"over-redacted {original!r}"
+        else:
+            assert "[secret]" in value, f"{original} leaked"
+            assert "p4ssw0rd" not in value and "LEAK" not in value and "hunter2" not in value
+
+
+def test_codex_orphaned_key_body_redaction_covers_middle_lines(tmp_path):
+    # The first attempt at this replaced only the line immediately before the
+    # END marker, so every MIDDLE body line survived -- between two `[secret]`
+    # markers, which is output that reads as fully redacted while carrying most
+    # of the key. Three body lines are used here for exactly that reason.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        import { captureDiagnosticStderr } from './plugins/codex/scripts/lib/codex.mjs';
+        const cap = MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES;
+        let state = appendBoundedStderr(
+          '',
+          'f\\n'.repeat(Math.ceil(cap / 2)) + 'PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\\n',
+        );
+        state = appendBoundedStderr(
+          state,
+          'FIRSTLEAK\\nSECONDLEAK\\nTHIRDLEAK\\n-----END RSA PRIVATE KEY-----\\ntail line\\n',
+        );
+        console.log(JSON.stringify({ captured: captureDiagnosticStderr(state.text) }));
+        """
+    )
+    captured = payload["captured"]
+    for marker in ("FIRSTLEAK", "SECONDLEAK", "THIRDLEAK"):
+        assert marker not in captured, f"{marker} survived"
+    # Legitimate output after the marker must survive.
+    assert "tail line" in captured
+
+
+def test_codex_failed_turn_does_not_render_partial_output_as_the_answer():
+    # On a failed turn the last agent message is mid-flight commentary. Returning
+    # it alone presented a failed run as a successful one AND hid the diagnostic
+    # entirely -- a probe rendered only "Still investigating the failure."
+    payload = run_node_script(
+        """
+        import { renderTaskResult } from './plugins/codex/scripts/lib/render.mjs';
+        console.log(JSON.stringify({
+          failed: renderTaskResult(
+            { rawOutput: 'Still investigating.', failureMessage: 'transport failed: reset' },
+            {},
+          ),
+          succeeded: renderTaskResult({ rawOutput: 'the answer' }, {}),
+        }));
+        """
+    )
+    failed = payload["failed"]
+    assert failed.strip() != "Still investigating."
+    assert "did not complete" in failed
+    # Both halves are shown, each labelled for what it is.
+    assert "partial output" in failed and "Still investigating." in failed
+    assert "diagnostics" in failed and "transport failed: reset" in failed
+    # The success path is untouched.
+    assert payload["succeeded"].strip() == "the answer"
+
+
+def test_codex_state_permissions_are_repaired_on_the_read_path(tmp_path):
+    # ensureStateDir only runs before a WRITE. The Stop hook and SessionStart
+    # reach state through loadState/getConfig/listJobs and can return without
+    # ever writing, so a read-only upgrade left 0755 dirs and a 0644 state.json
+    # -- which holds the summaries and error messages this change redacts.
+    plugin_data = tmp_path / "plugin-data"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    payload = run_node_script(
+        """
+        import fs from 'node:fs';
+        import { ensureStateDir, loadState, resolveStateDir, resolveStateFile, saveState }
+          from './plugins/codex/scripts/lib/state.mjs';
+        const workspace = process.argv[1];
+        ensureStateDir(workspace);
+        saveState(workspace, { jobs: [] });
+        fs.chmodSync(resolveStateDir(workspace), 0o755);
+        fs.chmodSync(resolveStateFile(workspace), 0o644);
+        loadState(workspace);  // read only -- must still repair
+        const modeOf = (p) => (fs.statSync(p).mode & 0o777).toString(8);
+        console.log(JSON.stringify({
+          dir: modeOf(resolveStateDir(workspace)),
+          file: modeOf(resolveStateFile(workspace)),
+        }));
+        """,
+        env={"CLAUDE_PLUGIN_DATA": str(plugin_data)},
+        args=[str(workspace)],
+    )
+    assert payload["dir"] == "700"
+    assert payload["file"] == "600"
+
+
 def test_codex_sanitizer_is_linear_in_whitespace_runs():
     # The THIRD distinct quadratic found in this file, each through a different
     # door: a greedy prefix in the key pattern, a growing prefix slice per

@@ -61,6 +61,17 @@ const SENSITIVE_KEY_FRAGMENTS = [
   "databaseurl",
   "dburl",
   "connectionstring",
+  // Connection strings carry `user:password@host` inline, so the URL itself is
+  // the credential. Named per-engine because none of them contains a word from
+  // the segment list.
+  "redisurl",
+  "postgresurl",
+  "postgresqlurl",
+  "mysqlurl",
+  "mongodburi",
+  "mongourl",
+  "amqpurl",
+  "connectionuri",
   "authorization",
   "signature"
 ];
@@ -135,7 +146,11 @@ const SENSITIVE_KEY_SEGMENTS = new Set([
 
 function keySegments(key) {
   return String(key)
+    // lowerUpper AND ACRONYMWord: `SSHKey` / `DBPass` / `JWTAuth` / `TLSCert`
+    // split on neither rule without the second, so every acronym-prefixed
+    // credential name passed through as one unrecognised segment.
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .filter(Boolean);
@@ -191,13 +206,15 @@ function redactOrphanedKeyBody(text) {
   if (before.includes("-----BEGIN")) {
     return text;
   }
-  const lastNewline = before.lastIndexOf("\n");
-  const keep = lastNewline === -1 ? "" : `${before.slice(0, lastNewline + 1)}`;
-  // Preserve the line that introduced the redaction, drop the body between it
-  // and the marker.
-  const priorLine = keep.lastIndexOf("\n", keep.length - 2);
-  const head = priorLine === -1 ? "" : keep.slice(0, priorLine + 1);
-  return `${head}${REDACTED}\n${text.slice(end.index + end[0].length).replace(/^\n/, "")}`;
+  // Everything from the last already-redacted marker (or the start of the text)
+  // up to the END marker is orphaned key body. An earlier attempt replaced only
+  // the line immediately before the marker, which left every MIDDLE body line
+  // intact between two `[secret]` markers -- output that reads as fully redacted
+  // while carrying most of the key.
+  const anchor = before.lastIndexOf(`${REDACTED}\n`);
+  const head = anchor === -1 ? "" : before.slice(0, anchor + REDACTED.length + 1);
+  const tail = text.slice(end.index + end[0].length).replace(/^\n/, "");
+  return `${head}${REDACTED}\n${tail}`;
 }
 
 // Reads the key ending at `end`, walking backwards over key characters and, if

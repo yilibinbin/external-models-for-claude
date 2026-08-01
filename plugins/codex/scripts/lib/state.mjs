@@ -76,9 +76,13 @@ export function ensureStateDir(cwd) {
   // state.json carries the summaries and error messages that the rest of this
   // change redacts. Measured on a real install: root 0755, state.json 0644,
   // while jobs/ was already 0700.
+  repairStatePermissions(cwd);
+}
+
+export function repairStatePermissions(cwd) {
   for (const [target, mode] of [
     [resolveStateDir(cwd), 0o700],
-    [jobsDir, 0o700],
+    [resolveJobsDir(cwd), 0o700],
     [resolveStateFile(cwd), 0o600]
   ]) {
     try {
@@ -92,6 +96,12 @@ export function ensureStateDir(cwd) {
 }
 
 export function loadState(cwd) {
+  // Repair legacy modes on the READ path too. ensureStateDir only runs before a
+  // write, and the Stop hook plus SessionStart reach state through loadState /
+  // getConfig / listJobs and can return without ever writing -- leaving 0755
+  // dirs and 0644 state.json (which holds summaries and error messages) readable
+  // for as long as the install is only read from.
+  repairStatePermissions(cwd);
   const stateFile = resolveStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
     return defaultState();

@@ -337,8 +337,31 @@ export function renderNativeReviewResult(result, meta) {
 
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
-  if (rawOutput) {
+  const failure = String(parsedResult?.failureMessage ?? "").trim();
+  // A non-empty failureMessage means the turn did not complete. rawOutput is
+  // then whatever the agent last said mid-flight -- commentary, not an answer --
+  // and returning it alone presented a failed run as a successful one while
+  // hiding the diagnostic entirely. Label both instead of choosing wrongly.
+  if (rawOutput && !failure) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+  }
+  if (rawOutput && failure) {
+    return [
+      "Codex did not complete the turn.",
+      "",
+      "partial output:",
+      "",
+      "```text",
+      rawOutput.trimEnd(),
+      "```",
+      "",
+      "diagnostics:",
+      "",
+      "```text",
+      failure,
+      "```",
+      ""
+    ].join("\n");
   }
 
   // The failure message must never BE the answer. It is frequently the child's
@@ -347,7 +370,7 @@ export function renderTaskResult(parsedResult, meta) {
   // indistinguishable from model output -- then persisted it and re-showed it
   // via /codex:result. State the outcome, then label the diagnostics as such.
   const lines = ["Codex did not return a final message."];
-  const diagnostics = String(parsedResult?.failureMessage ?? "").trim();
+  const diagnostics = failure;
   if (diagnostics) {
     lines.push("", "diagnostics:", "", "```text", diagnostics, "```");
   }
