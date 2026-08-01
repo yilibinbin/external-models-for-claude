@@ -11549,6 +11549,18 @@ def test_codex_app_server_exit_message_never_quotes_child_output(tmp_path):
         assert secret.split("=", 1)[1] not in payload["message"], payload["message"]
 
 
+def broker_exit_receiver_block(source):
+    """The broker/appServerExited handler, sliced to its closing brace.
+
+    A fixed character window silently drops assertions off the end as soon as the block
+    grows -- a comment added above `describeExit` was enough to make the check vacuous
+    rather than failing. Bind to the block instead.
+    """
+    start = source.index("BROKER_APP_SERVER_EXIT_METHOD) {")
+    block = source[start:]
+    return block[: block.index("\n    }\n")]
+
+
 def test_codex_broker_exit_notification_ignores_free_text():
     """A free-text field on the broker notification must be inert.
 
@@ -11559,7 +11571,7 @@ def test_codex_broker_exit_notification_ignores_free_text():
     source = read_text(PLUGIN / "scripts" / "lib" / "app-server.mjs")
 
     # The receiver must not read a message/text field from the notification params.
-    receiver = source[source.index("BROKER_APP_SERVER_EXIT_METHOD) {") :][:1200]
+    receiver = broker_exit_receiver_block(source)
     assert "params?.message" not in receiver, receiver[:400]
     assert "describeExit" in receiver, receiver[:400]
     # And the broker must not send one.
@@ -11637,3 +11649,44 @@ def test_codex_broker_propagates_protocol_death_reason(tmp_path):
             proc.wait(timeout=5)
     finally:
         shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def test_codex_broker_does_not_announce_a_clean_exit_as_a_crash():
+    """An orderly shutdown must not be broadcast as a crash.
+
+    `broker/shutdown` calls `appClient.close()`, which ends the child's stdin; the child
+    then exits 0 and `exitPromise` resolves down the same path a crash takes. Guarding
+    the broadcast on `Number.isInteger(code)` alone therefore fired on every clean
+    shutdown, and each connected client synthesised
+
+        codex app-server exited unexpectedly (exit 0).
+
+    which contradicts itself and manufactures an `exitError` where the spawned client's
+    own rule (`code === 0` -> no error) produces none. That error is what rejects pending
+    requests, so a normal shutdown surfaced as a crash. Both sides now exclude 0.
+    """
+    broker = read_text(PLUGIN / "scripts" / "app-server-broker.mjs")
+    guard = broker[broker.index("const reason = appClient.exitReason;") :][:600]
+    assert "reason.code !== 0" in guard, guard[:400]
+
+    source = read_text(PLUGIN / "scripts" / "lib" / "app-server.mjs")
+    receiver = broker_exit_receiver_block(source)
+    assert "code !== 0" in receiver, receiver[:400]
+
+
+def test_codex_broker_exit_signal_name_is_length_bounded():
+    """The signal alphabet is not a bound on its own.
+
+    The receiver interpolates the accepted signal into the error message verbatim. An
+    unbounded `[A-Z0-9]*` accepts a 200 KB string of that alphabet and carries every byte
+    into the message — reopening, at up to arbitrary length, the child-byte channel this
+    notification was designed to close. Real signal names fit far inside the cap
+    (SIGVTALRM, the longest, is 9 characters).
+    """
+    source = read_text(PLUGIN / "scripts" / "lib" / "app-server.mjs")
+    receiver = broker_exit_receiver_block(source)
+
+    assert "/^[A-Z][A-Z0-9]*$/" not in receiver, "the signal validator is unbounded"
+    match = re.search(r"/\^\[A-Z\]\[A-Z0-9\]\{0,(\d+)\}\$/", receiver)
+    assert match, receiver[:600]
+    assert int(match.group(1)) <= 30, f"cap of {match.group(1)} is not a bound worth having"

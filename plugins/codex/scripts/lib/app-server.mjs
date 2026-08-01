@@ -300,9 +300,15 @@ class AppServerClientBase {
         const { protocol } = message.params ?? {};
         if (typeof protocol === "string" && PROTOCOL_EXIT_REASONS.has(protocol)) {
           reason.protocol = protocol;
-        } else if (typeof signal === "string" && /^[A-Z][A-Z0-9]*$/.test(signal)) {
+          // Bounded on purpose. The alphabet alone is not a bound: an unbounded
+          // `[A-Z0-9]*` accepts a 200 KB string and embeds it verbatim in the message
+          // below, which is the byte channel this notification exists to avoid. Every
+          // real signal name fits well inside 15 (SIGVTALRM is the longest at 9).
+        } else if (typeof signal === "string" && /^[A-Z][A-Z0-9]{0,14}$/.test(signal)) {
           reason.signal = signal;
-        } else if (Number.isInteger(code)) {
+        } else if (Number.isInteger(code) && code !== 0) {
+          // Symmetric with the sender: code 0 is not a crash, so it must not become
+          // "exited unexpectedly (exit 0)" if it arrives anyway.
           reason.code = code;
         }
         this.exitError = createProtocolError(

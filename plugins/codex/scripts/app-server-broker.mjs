@@ -260,8 +260,16 @@ async function main() {
     // embed child stdout (a JSONL parse failure quotes the offending bytes), so
     // relaying it would make this socket a child-byte channel. The receiver validates
     // these fields and builds its own text.
+    // A clean exit is not a crash. shutdown() ends the child's stdin, so an orderly
+    // `broker/shutdown` lands here with {code: 0} -- broadcasting that told every
+    // connected client the server "exited unexpectedly (exit 0)", contradicting
+    // itself and manufacturing an exitError where the spawned client's own rule
+    // (code === 0 -> no error) produces none. Mirror that rule here.
     const reason = appClient.exitReason;
-    if (reason && (reason.protocol || reason.signal || Number.isInteger(reason.code))) {
+    const crashed = Boolean(
+      reason && (reason.protocol || reason.signal || (Number.isInteger(reason.code) && reason.code !== 0))
+    );
+    if (crashed) {
       for (const socket of sockets) {
         send(socket, { method: BROKER_APP_SERVER_EXIT_METHOD, params: reason });
       }
