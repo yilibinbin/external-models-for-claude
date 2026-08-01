@@ -8990,6 +8990,113 @@ def test_codex_state_dir_and_file_modes_are_repaired_on_upgrade(tmp_path):
     assert payload["file"] == "600", f"state.json left at {payload['file']}"
 
 
+def test_codex_sanitizer_matches_key_segments_without_eating_ordinary_words():
+    # The short credential words are substrings of ordinary ones -- `key` in
+    # `keyboard`, `auth` in `author`, `pass` in `tests_passed` -- so a
+    # whole-key substring test cannot have them. Matching per SEGMENT (split on
+    # separators and camelCase) gets the real keys and none of the decoys.
+    #
+    # These four leaked verbatim before: they carry no fragment from the
+    # original list, and they are among the most common credential env names
+    # there are.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'DB_PASS=hunter2', 'SSH_KEY=AAAAB3Nza', 'AUTH_HEADER=xyz123',
+          'ENCRYPTION_KEY=k1', 'CLIENT_KEY=c1',
+          'let keyboard = 1', 'AUTHOR=alice', 'TESTS_PASSED=3',
+          'status: ok', 'version=1.2.3',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original in ("DB_PASS=hunter2", "SSH_KEY=AAAAB3Nza", "AUTH_HEADER=xyz123",
+                     "ENCRYPTION_KEY=k1", "CLIENT_KEY=c1"):
+        assert "[secret]" in payload[original], f"{original} leaked"
+    # Decoys must be untouched -- a redactor that eats ordinary output is a
+    # redactor people turn off.
+    for original in ("let keyboard = 1", "AUTHOR=alice", "TESTS_PASSED=3",
+                     "status: ok", "version=1.2.3"):
+        assert payload[original] == original, f"over-redacted {original!r}"
+
+
+def test_codex_sanitizer_takes_unquoted_values_to_end_of_line():
+    # Stopping at the first space redacted only `correct` and left
+    # `horse battery staple`. `KEY: value` running to end-of-line is the shape
+    # of the env dumps and config echoes this channel actually carries.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          multiword: sanitizeModelText('passphrase: correct horse battery staple'),
+          nextLineKept: sanitizeModelText('password: hunter2\\nnext line survives'),
+        }));
+        """
+    )
+    assert "horse" not in payload["multiword"]
+    assert "staple" not in payload["multiword"]
+    # The redaction stops at the newline; it does not swallow the rest of the text.
+    assert "next line survives" in payload["nextLineKept"]
+    assert "hunter2" not in payload["nextLineKept"]
+
+
+def test_codex_orphaned_key_body_is_redacted_by_its_closing_marker():
+    # When capture truncation cuts away a PEM's BEGIN header, the body lines
+    # carry no key name and no marker -- nothing else in the redactor can see
+    # them. The closing marker is the only remaining evidence that they are key
+    # material.
+    #
+    # This is the finding that refuted my own defence: I had argued the
+    # forged-marker rule already covered it, and two probes agreed. It does not
+    # cover the SECOND and later body lines.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        import { captureDiagnosticStderr } from './plugins/codex/scripts/lib/codex.mjs';
+        let state = appendBoundedStderr(
+          '',
+          'f\\n'.repeat(Math.ceil(MAX_CAPTURED_STDERR_BYTES / 2)) +
+            'PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\\n',
+        );
+        state = appendBoundedStderr(
+          state,
+          'MIIBODYLEAK\\nSECONDBODYLEAK\\n-----END RSA PRIVATE KEY-----\\n',
+        );
+        console.log(JSON.stringify({ captured: captureDiagnosticStderr(state.text) }));
+        """
+    )
+    assert "MIIBODYLEAK" not in payload["captured"]
+    assert "SECONDBODYLEAK" not in payload["captured"]
+
+
+def test_codex_stderr_compaction_does_not_run_per_chunk():
+    # Compacting to the cap on every overflow re-scans the whole buffer once per
+    # CHUNK once it is full -- correct, but the cost then scales with chunk
+    # count rather than with bytes. Headroom amortises it.
+    payload = run_node_script(
+        """
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
+          from './plugins/codex/scripts/lib/app-server.mjs';
+        let state = {
+          text: ('y'.repeat(63) + '\\n').repeat(Math.floor(MAX_CAPTURED_STDERR_BYTES / 64)),
+          discarding: false,
+        };
+        const started = process.hrtime.bigint();
+        for (let i = 0; i < 500; i += 1) state = appendBoundedStderr(state, 'z'.repeat(63) + '\\n');
+        console.log(JSON.stringify({
+          elapsedMs: Number(process.hrtime.bigint() - started) / 1e6,
+          length: state.text.length,
+        }));
+        """
+    )
+    # Without headroom this measured 31 ms; the bound is generous because the
+    # point is the scaling, not the constant.
+    assert payload["elapsedMs"] < 15, f"500 at-cap chunks took {payload['elapsedMs']}ms"
+
+
 def test_codex_sanitizer_is_linear_in_whitespace_runs():
     # The THIRD distinct quadratic found in this file, each through a different
     # door: a greedy prefix in the key pattern, a growing prefix slice per
@@ -9044,10 +9151,12 @@ def test_codex_stderr_multiline_secret_is_redacted_before_truncation():
     # only, so the common path pays nothing.
     payload = run_node_script(
         """
-        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES }
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
           from './plugins/codex/scripts/lib/app-server.mjs';
         const pem = 'PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\\nBODYLINE_ONE\\nBODYLINE_TWO\\n-----END RSA PRIVATE KEY-----\\n';
-        const fillerLines = Math.floor((MAX_CAPTURED_STDERR_BYTES - pem.length + 40) / 7);
+        const fillerLines = Math.floor(
+          (MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES - pem.length + 40) / 7,
+        );
         let state = appendBoundedStderr('', 'filler\\n'.repeat(fillerLines) + pem);
         state = appendBoundedStderr(state, 'more\\n'.repeat(20));
         console.log(JSON.stringify({ text: state.text }));
@@ -9088,9 +9197,12 @@ def test_codex_stderr_discard_state_survives_chunk_boundaries():
     # with the key that would have identified it already discarded.
     payload = run_node_script(
         """
-        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES }
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
           from './plugins/codex/scripts/lib/app-server.mjs';
-        let state = appendBoundedStderr('', 'x'.repeat(MAX_CAPTURED_STDERR_BYTES - 9) + 'PASSWORD=');
+        let state = appendBoundedStderr(
+          '',
+          'x'.repeat(MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES - 9) + 'PASSWORD=',
+        );
         state = appendBoundedStderr(state, 'HUNTER2');
         state = appendBoundedStderr(state, '_SUFFIX\\ntail line\\n');
         console.log(JSON.stringify({ text: state.text }));
@@ -9121,7 +9233,7 @@ def test_codex_stderr_truncation_cannot_orphan_a_credential_value():
     # not truncating, so the cut is made at a line boundary.
     payload = run_node_script(
         """
-        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES }
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
           from './plugins/codex/scripts/lib/app-server.mjs';
         import { captureDiagnosticStderr } from './plugins/codex/scripts/lib/codex.mjs';
         // Place the credential so the cap boundary falls between key and value.
@@ -9168,7 +9280,7 @@ def test_codex_stderr_is_bounded_during_accumulation_not_after():
     # read-side cap is a no-op exactly where the growth happens.
     payload = run_node_script(
         """
-        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES }
+        import { appendBoundedStderr, MAX_CAPTURED_STDERR_BYTES, COMPACTION_HEADROOM_BYTES }
           from './plugins/codex/scripts/lib/app-server.mjs';
         let state = { text: '', discarding: false };
         // 4 MB arriving in realistic chunks, newline-delimited so the cut has a
@@ -9179,11 +9291,13 @@ def test_codex_stderr_is_bounded_during_accumulation_not_after():
         state = appendBoundedStderr(state, tailMarker);
         console.log(JSON.stringify({
           length: state.text.length,
-          cap: MAX_CAPTURED_STDERR_BYTES,
+          cap: MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES,
           keepsTail: state.text.endsWith(tailMarker),
         }));
         """
     )
+    # The bound is cap + compaction headroom: compacting to exactly the cap on
+    # every overflow would re-scan the whole buffer once per chunk.
     assert payload["length"] <= payload["cap"], "buffer grew past the cap while accumulating"
     # The tail is what diagnoses a crash; the head is what gets dropped.
     assert payload["keepsTail"] is True

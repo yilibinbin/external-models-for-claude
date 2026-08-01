@@ -97,6 +97,10 @@ const LINE_VALUED_KEYS = ["authorization", "cookie", "setcookie"];
 // PEM bodies are newline-delimited, so the line rule above would keep all but
 // the first line. Consume through the matching end marker instead.
 const PEM_END = /-----END [A-Z ]*-----/;
+// An `-----END` marker with no `-----BEGIN` before it means the body arrived
+// without its header -- which is what a truncated capture produces. Those lines
+// carry no key and no marker, so nothing else in this file can recognise them.
+const ORPHAN_PEM_END = /-----END [A-Z ]*-----/;
 
 const REDACTED = "[secret]";
 
@@ -109,9 +113,40 @@ function isLineValuedKey(key) {
   return LINE_VALUED_KEYS.some((name) => normalized.includes(name));
 }
 
+// Single-word segments that make a key sensitive. Matched per SEGMENT, not as a
+// substring of the whole key, because the short ones are substrings of ordinary
+// words: `key` is in `keyboard`, `auth` is in `author`, `pass` is in
+// `tests_passed`. Splitting on separators and camelCase boundaries first gives
+// SSH_KEY / AUTH_HEADER / DB_PASS without eating any of those.
+const SENSITIVE_KEY_SEGMENTS = new Set([
+  "key",
+  "keys",
+  "auth",
+  "pass",
+  "pwd",
+  "token",
+  "secret",
+  "secrets",
+  "credential",
+  "credentials",
+  "cert",
+  "signature"
+]);
+
+function keySegments(key) {
+  return String(key)
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
 function isSensitiveKey(key) {
   const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
-  return SENSITIVE_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment));
+  if (SENSITIVE_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment))) {
+    return true;
+  }
+  return keySegments(key).some((segment) => SENSITIVE_KEY_SEGMENTS.has(segment));
 }
 
 // Keeps redaction idempotent: `summary` is now sanitized at the job-state
@@ -141,7 +176,28 @@ export function redactSecrets(text) {
   for (const pattern of SECRET_PATTERNS) {
     output = output.replace(pattern, REDACTED);
   }
-  return redactAssignedValues(output);
+  return redactOrphanedKeyBody(redactAssignedValues(output));
+}
+
+// Key material whose BEGIN header was cut away by capture truncation. The body
+// lines carry no key name and no marker, so the assignment scanner cannot see
+// them; the closing marker is the only evidence left that they are key material.
+function redactOrphanedKeyBody(text) {
+  const end = ORPHAN_PEM_END.exec(text);
+  if (!end) {
+    return text;
+  }
+  const before = text.slice(0, end.index);
+  if (before.includes("-----BEGIN")) {
+    return text;
+  }
+  const lastNewline = before.lastIndexOf("\n");
+  const keep = lastNewline === -1 ? "" : `${before.slice(0, lastNewline + 1)}`;
+  // Preserve the line that introduced the redaction, drop the body between it
+  // and the marker.
+  const priorLine = keep.lastIndexOf("\n", keep.length - 2);
+  const head = priorLine === -1 ? "" : keep.slice(0, priorLine + 1);
+  return `${head}${REDACTED}\n${text.slice(end.index + end[0].length).replace(/^\n/, "")}`;
 }
 
 // Reads the key ending at `end`, walking backwards over key characters and, if
@@ -273,14 +329,16 @@ function readValueAt(text, index, key) {
     return spanTo(text, index, text.length);
   }
 
-  if (isLineValuedKey(key)) {
-    const lineEnd = text.indexOf("\n", index);
-    return spanTo(text, index, lineEnd === -1 ? text.length : lineEnd);
-  }
-
-  BARE_VALUE.lastIndex = index;
-  const bare = BARE_VALUE.exec(text);
-  return bare ? { value: bare[0], quote: "", length: bare[0].length } : null;
+  // An UNQUOTED value runs to the end of the line, not to the next space.
+  // Stopping at the space redacted only the first word of
+  // `passphrase: correct horse battery staple` and left the rest -- and
+  // `KEY: value` running to end-of-line is exactly the shape of the env dumps
+  // and config echoes this channel actually carries. Over-redacting the tail of
+  // a prose sentence is the cheaper error here; this is the diagnostic and
+  // index channel, never the deliverable.
+  const lineEnd = text.indexOf("\n", index);
+  const end = lineEnd === -1 ? text.length : lineEnd;
+  return end > index ? spanTo(text, index, end) : null;
 }
 
 // The key name is preserved and only the value is dropped. A review whose point

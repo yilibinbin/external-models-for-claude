@@ -26,6 +26,7 @@ import { sanitizeModelText } from "./sanitize.mjs";
 // The tail is kept because that is where a crash explains itself; the head is
 // what gets dropped.
 export const MAX_CAPTURED_STDERR_BYTES = 64 * 1024;
+export const COMPACTION_HEADROOM_BYTES = 32 * 1024;
 
 // Three rules, each earned from a measured failure:
 //
@@ -56,7 +57,13 @@ export function appendBoundedStderr(state, chunk) {
   }
 
   const combined = `${previous.text}${incoming}`;
-  if (combined.length <= MAX_CAPTURED_STDERR_BYTES) {
+  // Headroom before compacting. Cutting back to the cap on every overflow made
+  // the redaction pass run once per CHUNK once the buffer was full -- correct,
+  // but it re-scans the whole buffer each time. Compacting only at 1.5x amortises
+  // that to once per half-cap of new output. Measured without headroom: 500
+  // at-cap chunks cost 31 ms, which is survivable but scales with chunk count,
+  // not with bytes.
+  if (combined.length <= MAX_CAPTURED_STDERR_BYTES + COMPACTION_HEADROOM_BYTES) {
     return { text: combined, discarding: false };
   }
 
