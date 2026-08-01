@@ -93,6 +93,11 @@ const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.m
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
+// Transport-level notification the broker sends to every connected client when its
+// backing app-server dies, so a streaming turn can report the real cause. Internal
+// to the broker link; never emitted by codex itself.
+export const BROKER_APP_SERVER_EXIT_METHOD = "broker/appServerExited";
+
 export const BROKER_BUSY_RPC_CODE = -32001;
 // The handshake should be near-instant; bound it so a wedged app-server that
 // never emits the initialize response fails fast instead of hanging forever.
@@ -115,6 +120,23 @@ const DEFAULT_CAPABILITIES = {
     "item/reasoning/textDelta"
   ]
 };
+
+// Render a structured exit reason into text. The inputs are validated to a tiny
+// alphabet on the receiving side, so this can never become a channel for child bytes.
+const PROTOCOL_EXIT_REASONS = new Set(["malformed-output"]);
+
+function describeExit(reason) {
+  if (reason?.protocol && PROTOCOL_EXIT_REASONS.has(reason.protocol)) {
+    return `protocol error: ${reason.protocol}`;
+  }
+  if (reason?.signal) {
+    return `signal ${reason.signal}`;
+  }
+  if (Number.isInteger(reason?.code)) {
+    return `exit ${reason.code}`;
+  }
+  return "reason unknown";
+}
 
 function buildJsonRpcError(code, message, data) {
   return data === undefined ? { code, message } : { code, message, data };
@@ -229,6 +251,11 @@ class AppServerClientBase {
     try {
       message = JSON.parse(line);
     } catch (error) {
+      // A protocol death resolves exitPromise right here, BEFORE the child's 'exit'
+      // event fires, so the reason must be recorded now or the broker's handler finds
+      // none and the cause is lost. It is an enum, not text: the parse Error quotes the
+      // offending child bytes, so that message must never be what travels.
+      this.exitReason = { protocol: "malformed-output" };
       this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
       return;
     }
@@ -252,6 +279,41 @@ class AppServerClientBase {
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
       } else {
         pending.resolve(message.result ?? {});
+      }
+      return;
+    }
+
+    // Broker-internal: the backing app-server died. Record it as this connection's
+    // exit cause BEFORE the socket closes, so a streaming turn — which has no pending
+    // request left to reject — still surfaces the real reason instead of the generic
+    // "connection closed". Not forwarded to the notification handler: it is a
+    // transport event, not an app-server notification.
+    if (message.method === BROKER_APP_SERVER_EXIT_METHOD) {
+      if (!this.exitResolved && !this.exitError) {
+        // Only a validated code/signal is accepted, and the text is built from a local
+        // template. Any free-text field on this notification is IGNORED: the broker's
+        // own exitError can embed child stdout (a JSON parse failure quotes the
+        // offending bytes), so relaying its message would reopen the channel this
+        // design exists to close.
+        const { code, signal } = message.params ?? {};
+        const reason = {};
+        const { protocol } = message.params ?? {};
+        if (typeof protocol === "string" && PROTOCOL_EXIT_REASONS.has(protocol)) {
+          reason.protocol = protocol;
+          // Bounded on purpose. The alphabet alone is not a bound: an unbounded
+          // `[A-Z0-9]*` accepts a 200 KB string and embeds it verbatim in the message
+          // below, which is the byte channel this notification exists to avoid. Every
+          // real signal name fits well inside 15 (SIGVTALRM is the longest at 9).
+        } else if (typeof signal === "string" && /^[A-Z][A-Z0-9]{0,14}$/.test(signal)) {
+          reason.signal = signal;
+        } else if (Number.isInteger(code) && code !== 0) {
+          // Symmetric with the sender: code 0 is not a crash, so it must not become
+          // "exited unexpectedly (exit 0)" if it arrives anyway.
+          reason.code = code;
+        }
+        this.exitError = createProtocolError(
+          `codex app-server exited unexpectedly (${describeExit(reason)}).`
+        );
       }
       return;
     }
@@ -320,11 +382,14 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     });
 
     this.proc.on("exit", (code, signal) => {
-      const detail =
-        code === 0
-          ? null
-          : createProtocolError(`codex app-server exited unexpectedly (${signal ? `signal ${signal}` : `exit ${code}`}).`);
-      this.handleExit(detail);
+      // Record the exit reason as STRUCTURED data. It is deliberately not built from
+      // child output: quoting the child's stderr here was tried and withdrawn, because
+      // its content is unbounded and un-authored by this plugin, so no redaction pass
+      // can bound what it might contain. Only the exit code / signal name travels.
+      this.exitReason = signal ? { signal } : { code };
+      this.handleExit(
+        code === 0 ? null : createProtocolError(`codex app-server exited unexpectedly (${describeExit(this.exitReason)}).`)
+      );
     });
 
     this.readline = readline.createInterface({ input: this.proc.stdout });
@@ -350,6 +415,16 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     if (this.readline) {
       this.readline.close();
     }
+
+    // Release the child's stdio unconditionally. These pipes stay open for as long as
+    // ANY descendant holds the inherited descriptor, and an open pipe pins this
+    // process's event loop: measured on the bare topology, a parent listening on
+    // stderr exits in 60ms normally and never exits once a grandchild inherits it
+    // (killed at the 10s timeout). This predates the crash-diagnostic work — main has
+    // the same accumulator with no release — and it must run on the clean-exit path
+    // too, which an exit-handler-only fix would miss.
+    this.proc?.stdout?.destroy();
+    this.proc?.stderr?.destroy();
 
     if (this.proc && !this.proc.killed) {
       this.proc.stdin.end();

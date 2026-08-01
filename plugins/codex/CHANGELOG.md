@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0-fh.8
+
+- Carry the app-server's exit reason across the broker as structured data. `review/start`/`turn/start` are streaming, so once the request has returned there is no pending call left to reject and the broker previously just closed its sockets — the outer client then reported only "connection closed", with not even the exit code. The reason now travels on a `broker/appServerExited` notification, validated on receipt and rendered from a local template: `{code}`/`{signal}` for an ordinary child exit, and `{protocol: "malformed-output"}` when the stream dies on unparseable JSONL — that one resolves before the child's `exit` fires, so it would otherwise be reported as an exit with no code at all.
+- Deliberately does **not** quote the child's stderr. That was implemented and withdrawn: stderr is unbounded and not authored by this plugin, so no redaction pass can bound what it may contain. Four rounds of pattern-patching still leaked `DATABASE_URL`, `PRIVATE_KEY` and `SESSION_COOKIE`, and the patterns added to catch `_`-delimited names backtracked quadratically — 3.9 s on a 40 KB dump, run synchronously inside the exit handler, stalling the very rejection the feature was meant to deliver. That attempt was abandoned within its own branch rather than landing, which removes the cost entirely (40 KB: 3946 ms → 1 ms); the `sanitize.mjs` shipping since `1.1.0-fh.7` is the rewritten one, not the version those four rounds patched.
+- Release the child's stdio in `close()`. These pipes stay open while any descendant holds the inherited descriptor, and an open pipe pins this process's event loop: measured, a parent listening on stderr exits in 60 ms normally and never exits once a grandchild inherits it. This is a pre-existing hang — the same accumulator with no release exists in the prior version — and the release is unconditional so it covers a clean exit too.
+
 ## 1.1.0-fh.7
 
 Close the paths by which child-process output reached persisted or user-visible

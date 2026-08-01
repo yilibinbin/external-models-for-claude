@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { BROKER_APP_SERVER_EXIT_METHOD, BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -250,6 +250,30 @@ async function main() {
   // endpoint/pid/state and exit non-zero so the next ensureBrokerSession spawns
   // a fresh broker.
   appClient.exitPromise.then(async () => {
+    // Hand the cause to every connected client BEFORE tearing their sockets down.
+    // A streaming turn (turn/start, review/start) has already had its request
+    // resolved, so there is no pending call left to reject — without this the outer
+    // client only sees the socket close and reports the generic
+    // "connection closed", losing the crash reason in the case that matters most.
+    //
+    // Send the STRUCTURED reason, never appClient.exitError.message: that message can
+    // embed child stdout (a JSONL parse failure quotes the offending bytes), so
+    // relaying it would make this socket a child-byte channel. The receiver validates
+    // these fields and builds its own text.
+    // A clean exit is not a crash. shutdown() ends the child's stdin, so an orderly
+    // `broker/shutdown` lands here with {code: 0} -- broadcasting that told every
+    // connected client the server "exited unexpectedly (exit 0)", contradicting
+    // itself and manufacturing an exitError where the spawned client's own rule
+    // (code === 0 -> no error) produces none. Mirror that rule here.
+    const reason = appClient.exitReason;
+    const crashed = Boolean(
+      reason && (reason.protocol || reason.signal || (Number.isInteger(reason.code) && reason.code !== 0))
+    );
+    if (crashed) {
+      for (const socket of sockets) {
+        send(socket, { method: BROKER_APP_SERVER_EXIT_METHOD, params: reason });
+      }
+    }
     // Hard deadline: server.close() only settles once every client socket has
     // closed, so a hung companion that ignores socket.end() would keep
     // shutdown() pending forever and process.exit(1) would never run — leaving

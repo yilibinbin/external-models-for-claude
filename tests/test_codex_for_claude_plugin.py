@@ -4,6 +4,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import time
 import tempfile
 
 import pytest
@@ -428,7 +429,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.7" in notices
+    assert "Local extended version: 1.1.0-fh.8" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -11394,3 +11395,298 @@ def test_codex_structured_review_early_return_sanitizes_a_failed_job():
     assert "HUNTER2_SUPER_SECRET" not in payload["failed"]
     # A successful deliverable stays byte-identical -- that exemption is the point.
     assert "HUNTER2_SUPER_SECRET" in payload["completed"]
+# ===== app-server crash diagnostics: surface the cause, redacted and bounded =====
+
+
+def test_codex_broker_propagates_structured_exit_reason_to_clients(tmp_path):
+    """The broker must carry the exit REASON across, and only the reason.
+
+    `review/start`/`turn/start` are streaming, so once the request has returned there is
+    no pending call left to reject; without this the outer client saw only a socket
+    close and reported the generic "connection closed". The payload is deliberately
+    `{code}`/`{signal}` rather than the broker's own `exitError.message`, because that
+    message can embed child stdout — `app-server.mjs` builds one from a JSONL parse
+    failure that quotes the offending bytes.
+    """
+    marker = "SHOULD_NEVER_APPEAR_IN_A_MESSAGE"
+    server_js = (
+        "import readline from 'node:readline';\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "const send = (m) => console.log(JSON.stringify(m));\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const m = JSON.parse(line);\n"
+        "  send({ id: m.id, result: {} });\n"
+        "  if (m.method === 'thread/start') {\n"
+        f"    process.stderr.write('{marker}\\n');\n"
+        "    setTimeout(() => process.exit(9), 100);\n"
+        "  }\n"
+        "});\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    session_dir = pathlib.Path(tempfile.mkdtemp(prefix="cxc-brkdiag-"))
+    try:
+        endpoint = f"unix:{session_dir / 'broker.sock'}"
+        log_file = session_dir / "broker.log"
+        with open(log_file, "w", encoding="utf8") as log_fd:
+            proc = subprocess.Popen(
+                [NODE, str(PLUGIN / "scripts" / "app-server-broker.mjs"), "serve",
+                 "--endpoint", endpoint, "--cwd", str(bin_dir)],
+                cwd=str(bin_dir),
+                env={**os.environ, **app_server_env(tmp_path, bin_dir)},
+                stdout=log_fd, stderr=log_fd,
+            )
+        try:
+            socket_path = session_dir / "broker.sock"
+            deadline = time.time() + 15
+            while not socket_path.exists() and time.time() < deadline:
+                assert proc.poll() is None, log_file.read_text(encoding="utf8")
+                time.sleep(0.05)
+            assert socket_path.exists(), f"broker never listened; log:\n{log_file.read_text(encoding='utf8')}"
+
+            script = (
+                "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+                "const client = await CodexAppServerClient.connect(process.argv[1], "
+                "{ brokerEndpoint: process.argv[2] });\n"
+                "await client.request('thread/start', {}).catch(() => {});\n"
+                "await Promise.race([client.exitPromise, new Promise((r) => setTimeout(r, 8000))]);\n"
+                "process.stdout.write(JSON.stringify({ exitError: client.exitError?.message ?? null }));\n"
+                "process.exit(0);\n"
+            )
+            result = run_node_inline(script, app_server_env(tmp_path, bin_dir),
+                                     args=[str(bin_dir), endpoint], timeout=45)
+            assert result.returncode == 0, result.stderr
+            message = json.loads(result.stdout)["exitError"]
+            assert message, f"no exitError propagated; broker log:\n{log_file.read_text(encoding='utf8')}"
+            # The reason arrives...
+            assert "exit 9" in message, message
+            # ...and nothing the child wrote does.
+            assert marker not in message, message
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+    finally:
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def test_codex_app_server_releases_held_stdio_on_close(tmp_path):
+    """A held descriptor must not keep OUR process alive.
+
+    The child's stderr pipe stays open while any descendant holds it, and an open pipe
+    keeps the parent's event loop alive. Measured on the bare topology: a parent that
+    merely listens on that pipe exits in 60 ms normally, but never exits at all when a
+    grandchild inherits stderr — killed at the timeout.
+
+    This predates the crash-diagnostic work: `main` has the same stderr accumulator and
+    never releases it either. The release therefore lives in `close()`, unconditionally,
+    so it also covers a CLEAN exit — an exit-handler-only fix would miss `code === 0`.
+    """
+    server_js = (
+        "import { spawn } from 'node:child_process';\n"
+        "import fs from 'node:fs';\n"
+        "import os from 'node:os';\n"
+        "import path from 'node:path';\n"
+        "const gc = path.join(os.tmpdir(), 'holder-' + process.pid + '.mjs');\n"
+        "fs.writeFileSync(gc, 'setTimeout(() => {}, 30000);');\n"
+        "spawn(process.execPath, [gc], { stdio: ['ignore', 'ignore', 'inherit'], detached: true }).unref();\n"
+        "process.exitCode = 9;\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    # No process.exit() here on purpose: the script must be able to end on its own.
+    script = (
+        "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+        "try {\n"
+        "  await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });\n"
+        "} catch (error) {\n"
+        "  process.stdout.write(JSON.stringify({ outcome: 'rejected' }));\n"
+        "}\n"
+    )
+    started = time.time()
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=25)
+    elapsed = time.time() - started
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["outcome"] == "rejected"
+    # The grandchild holds the descriptor for 30s; exiting well inside that proves the
+    # handles were released rather than waited on.
+    assert elapsed < 15, f"process lingered {elapsed:.1f}s — stdio was not released"
+
+
+def test_codex_app_server_exit_message_never_quotes_child_output(tmp_path):
+    """The exit message is a fixed template — no child byte may reach it.
+
+    Quoting the child's stderr was tried and withdrawn: its content is unbounded and not
+    authored by this plugin, so no redaction pass can bound what it might contain. Four
+    review rounds of pattern-patching still leaked `DATABASE_URL`, `PRIVATE_KEY` and
+    `SESSION_COOKIE`, and the patterns added to catch them backtracked quadratically
+    (3.9 s on a 40 KB dump) inside the synchronous exit handler.
+
+    This test fails the moment anyone reintroduces interpolation.
+    """
+    secrets = ["AWS_SECRET_ACCESS_KEY=wJalrLEAKME", "DATABASE_URL=postgres://a:s3cr3t@h/db"]
+    server_js = "".join(f"process.stderr.write({json.dumps(s)} + '\\n');\n" for s in secrets) + "process.exit(7);\n"
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    script = (
+        "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+        "let out = { outcome: 'connected' };\n"
+        "try {\n"
+        "  await CodexAppServerClient.connect(process.argv[1], { disableBroker: true });\n"
+        "} catch (error) {\n"
+        "  out = { outcome: 'rejected', message: String(error.message || error) };\n"
+        "}\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+        "process.exit(0);\n"
+    )
+    result = run_node_inline(script, app_server_env(tmp_path, bin_dir), args=[str(bin_dir)], timeout=45)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "rejected", payload
+    # The reason survives...
+    assert payload["message"] == "codex app-server exited unexpectedly (exit 7).", payload["message"]
+    # ...and nothing the child wrote does.
+    for secret in secrets:
+        assert secret.split("=", 1)[1] not in payload["message"], payload["message"]
+
+
+def broker_exit_receiver_block(source):
+    """The broker/appServerExited handler, sliced to its closing brace.
+
+    A fixed character window silently drops assertions off the end as soon as the block
+    grows -- a comment added above `describeExit` was enough to make the check vacuous
+    rather than failing. Bind to the block instead.
+    """
+    start = source.index("BROKER_APP_SERVER_EXIT_METHOD) {")
+    block = source[start:]
+    return block[: block.index("\n    }\n")]
+
+
+def test_codex_broker_exit_notification_ignores_free_text():
+    """A free-text field on the broker notification must be inert.
+
+    The receiver builds its own message from a validated code/signal. If it ever honoured
+    an arbitrary string off the socket, the broker's `exitError.message` — which embeds
+    child stdout when a JSONL parse fails — would become a child-byte channel again.
+    """
+    source = read_text(PLUGIN / "scripts" / "lib" / "app-server.mjs")
+
+    # The receiver must not read a message/text field from the notification params.
+    receiver = broker_exit_receiver_block(source)
+    assert "params?.message" not in receiver, receiver[:400]
+    assert "describeExit" in receiver, receiver[:400]
+    # And the broker must not send one.
+    broker = read_text(PLUGIN / "scripts" / "app-server-broker.mjs")
+    assert "exitError?.message" not in broker
+    assert "params: reason" in broker
+
+
+def test_codex_broker_propagates_protocol_death_reason(tmp_path):
+    """A protocol death must also carry a reason across the broker.
+
+    Malformed JSONL calls handleExit() directly (app-server.mjs:176), which resolves
+    exitPromise BEFORE the child's 'exit' event fires — and 'exit' is the only place the
+    structured reason was assigned. The broker's exitPromise handler therefore saw no
+    reason, sent no notification, and tore the sockets down, leaving a streaming turn
+    with the generic "connection closed" again.
+
+    The reason must also stay structured: the parse-failure Error embeds the offending
+    child bytes, so it must never be what travels.
+    """
+    marker = "PROTOCOL_DEATH_CHILD_BYTES"
+    server_js = (
+        "import readline from 'node:readline';\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "const send = (m) => console.log(JSON.stringify(m));\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const m = JSON.parse(line);\n"
+        "  if (m.method === 'initialize') { send({ id: m.id, result: {} }); return; }\n"
+        "  send({ id: m.id, result: {} });\n"
+        f"  if (m.method === 'thread/start') {{ console.log('{marker} not-json at all'); }}\n"
+        "});\n"
+    )
+    bin_dir = write_fake_app_server(tmp_path, server_js)
+    session_dir = pathlib.Path(tempfile.mkdtemp(prefix="cxc-proto-"))
+    try:
+        endpoint = f"unix:{session_dir / 'broker.sock'}"
+        log_file = session_dir / "broker.log"
+        with open(log_file, "w", encoding="utf8") as log_fd:
+            proc = subprocess.Popen(
+                [NODE, str(PLUGIN / "scripts" / "app-server-broker.mjs"), "serve",
+                 "--endpoint", endpoint, "--cwd", str(bin_dir)],
+                cwd=str(bin_dir),
+                env={**os.environ, **app_server_env(tmp_path, bin_dir)},
+                stdout=log_fd, stderr=log_fd,
+            )
+        try:
+            socket_path = session_dir / "broker.sock"
+            deadline = time.time() + 15
+            while not socket_path.exists() and time.time() < deadline:
+                assert proc.poll() is None, log_file.read_text(encoding="utf8")
+                time.sleep(0.05)
+            assert socket_path.exists(), log_file.read_text(encoding="utf8")
+
+            script = (
+                "import { CodexAppServerClient } from './plugins/codex/scripts/lib/app-server.mjs';\n"
+                "const client = await CodexAppServerClient.connect(process.argv[1], "
+                "{ brokerEndpoint: process.argv[2] });\n"
+                "await client.request('thread/start', {}).catch(() => {});\n"
+                "await Promise.race([client.exitPromise, new Promise((r) => setTimeout(r, 8000))]);\n"
+                "process.stdout.write(JSON.stringify({ exitError: client.exitError?.message ?? null }));\n"
+                "process.exit(0);\n"
+            )
+            result = run_node_inline(script, app_server_env(tmp_path, bin_dir),
+                                     args=[str(bin_dir), endpoint], timeout=45)
+            assert result.returncode == 0, result.stderr
+            message = json.loads(result.stdout)["exitError"]
+            assert message, f"no reason propagated; broker log:\n{log_file.read_text(encoding='utf8')}"
+            # A cause arrives rather than the generic close...
+            assert "connection closed" not in message, message
+            # ...and it carries none of the child's bytes.
+            assert marker not in message, message
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+    finally:
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def test_codex_broker_does_not_announce_a_clean_exit_as_a_crash():
+    """An orderly shutdown must not be broadcast as a crash.
+
+    `broker/shutdown` calls `appClient.close()`, which ends the child's stdin; the child
+    then exits 0 and `exitPromise` resolves down the same path a crash takes. Guarding
+    the broadcast on `Number.isInteger(code)` alone therefore fired on every clean
+    shutdown, and each connected client synthesised
+
+        codex app-server exited unexpectedly (exit 0).
+
+    which contradicts itself and manufactures an `exitError` where the spawned client's
+    own rule (`code === 0` -> no error) produces none. That error is what rejects pending
+    requests, so a normal shutdown surfaced as a crash. Both sides now exclude 0.
+    """
+    broker = read_text(PLUGIN / "scripts" / "app-server-broker.mjs")
+    guard = broker[broker.index("const reason = appClient.exitReason;") :][:600]
+    assert "reason.code !== 0" in guard, guard[:400]
+
+    source = read_text(PLUGIN / "scripts" / "lib" / "app-server.mjs")
+    receiver = broker_exit_receiver_block(source)
+    assert "code !== 0" in receiver, receiver[:400]
+
+
+def test_codex_broker_exit_signal_name_is_length_bounded():
+    """The signal alphabet is not a bound on its own.
+
+    The receiver interpolates the accepted signal into the error message verbatim. An
+    unbounded `[A-Z0-9]*` accepts a 200 KB string of that alphabet and carries every byte
+    into the message — reopening, at up to arbitrary length, the child-byte channel this
+    notification was designed to close. Real signal names fit far inside the cap
+    (SIGVTALRM, the longest, is 9 characters).
+    """
+    source = read_text(PLUGIN / "scripts" / "lib" / "app-server.mjs")
+    receiver = broker_exit_receiver_block(source)
+
+    assert "/^[A-Z][A-Z0-9]*$/" not in receiver, "the signal validator is unbounded"
+    match = re.search(r"/\^\[A-Z\]\[A-Z0-9\]\{0,(\d+)\}\$/", receiver)
+    assert match, receiver[:600]
+    assert int(match.group(1)) <= 30, f"cap of {match.group(1)} is not a bound worth having"
