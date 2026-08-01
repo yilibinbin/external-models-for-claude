@@ -9406,10 +9406,14 @@ def test_codex_failed_turn_does_not_promote_intermediate_chatter_unredacted():
     # unconditionally. On a failed or interrupted turn that value is intermediate
     # commentary, not the deliverable, so it loses the byte-identical exemption.
     source = (ROOT / "plugins" / "codex" / "scripts" / "lib" / "codex.mjs").read_text()
+    # Tightened in a later round: status 0 alone is not enough, because
+    # `turn/completed` can land without a non-empty final_answer ever being
+    # captured while lastAgentMessage still holds commentary.
     assert re.search(
-        r"turnStatus === 0\s*\?\s*turnState\.lastAgentMessage\s*:\s*sanitizeModelText\(turnState\.lastAgentMessage\)",
+        r"turnStatus === 0 && turnState\.finalAnswerSeen\s*\?\s*turnState\.lastAgentMessage\s*"
+        r":\s*sanitizeModelText\(turnState\.lastAgentMessage\)",
         source,
-    ), "a failed turn must not return the last agent message unredacted"
+    ), "a failed or final-answer-less turn must not return the last agent message unredacted"
 
 
 def test_codex_reasoning_summary_is_redacted_where_it_is_stored():
@@ -10887,3 +10891,81 @@ def test_codex_quoted_value_with_attached_suffix_is_taken_whole():
     )
     assert "LEAK" not in payload["attached"]
     assert payload["separated"] == 'API_KEY="[secret]" and notes'
+
+
+def test_codex_sanitizer_handles_yaml_blocks_uris_and_truncated_pem():
+    # Three shapes ordinary tooling produces:
+    #   `KEY: |` puts the value on the FOLLOWING indented lines, so stopping at
+    #   the newline redacted the indicator and left the secret under a marker.
+    #   A URI with inline credentials is a secret whatever the variable is
+    #   called -- keying on the NAME could not keep up with SQLALCHEMY_DATABASE_URI
+    #   or CELERY_BROKER_URL, and casting the net wider by name also caught
+    #   BASE_URL, an ordinary endpoint.
+    #   A crashed writer emits a PEM header with no END marker.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          yamlBlock: sanitizeModelText('API_KEY: |\\n  TOPSECRET\\nnext: ok'),
+          sqlalchemy: sanitizeModelText('SQLALCHEMY_DATABASE_URI=postgresql://admin:p4ss@db/prod'),
+          celery: sanitizeModelText('CELERY_BROKER_URL=amqp://u:p4ss@h'),
+          inProse: sanitizeModelText('connect to mongodb://root:p4ss@h/db now'),
+          truncatedPem: sanitizeModelText('-----BEGIN PRIVATE KEY-----\\nTUlJRXZRSUJBREFO\\n'),
+          plainEndpoint: sanitizeModelText('BASE_URL=https://api.example.com'),
+          docsLink: sanitizeModelText('see https://example.com/docs'),
+        }));
+        """
+    )
+    assert "TOPSECRET" not in payload["yamlBlock"]
+    # The key that follows the block must survive.
+    assert "next: ok" in payload["yamlBlock"]
+    for name in ("sqlalchemy", "celery", "inProse"):
+        assert "p4ss" not in payload[name], f"{name} leaked"
+    assert "TUlJRXZRSUJBREFO" not in payload["truncatedPem"]
+    # An endpoint with no credentials is not a secret.
+    assert payload["plainEndpoint"] == "BASE_URL=https://api.example.com"
+    assert payload["docsLink"] == "see https://example.com/docs"
+
+
+def test_codex_sanitizer_is_linear_on_unmatched_pem_headers():
+    # The FOURTH distinct quadratic in this file: a lazy wildcard between BEGIN
+    # and END rescans every suffix when END never arrives. Measured 213 ms at
+    # 328 KB and 1081 ms at 656 KB before the line scanner replaced it -- and the
+    # stop gate sanitizes before it bounds, so this stalls the fail-closed path.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const block = '-----BEGIN PRIVATE KEY-----\\n'.repeat(12000);
+        const timeFor = (n) => {
+          const text = block.repeat(n);
+          const started = process.hrtime.bigint();
+          sanitizeModelText(text);
+          return Number(process.hrtime.bigint() - started) / 1e6;
+        };
+        console.log(JSON.stringify({ small: timeFor(1), large: timeFor(4) }));
+        """
+    )
+    assert payload["large"] < 200, f"1.3MB of unmatched headers took {payload['large']}ms"
+
+
+def test_codex_failed_job_replay_keeps_its_failure_framing():
+    # /codex:result preferred the stored rawOutput over the stored rendering, so
+    # a failed job replayed as its mid-flight commentary alone -- dropping both
+    # the "did not complete" notice and the diagnostics needed to act on it.
+    payload = run_node_script(
+        """
+        import { renderStoredJobResult } from './plugins/codex/scripts/lib/render.mjs';
+        const stored = {
+          result: { rawOutput: 'Still investigating.' },
+          rendered: 'Codex did not complete the turn.\\n\\ndiagnostics:\\n\\ntransport failed\\n',
+        };
+        console.log(JSON.stringify({
+          failed: renderStoredJobResult({ id: 'j1', status: 'failed', title: 't' }, stored),
+          completed: renderStoredJobResult({ id: 'j2', status: 'completed', title: 't' }, stored),
+        }));
+        """
+    )
+    assert "did not complete" in payload["failed"]
+    assert "transport failed" in payload["failed"]
+    # A completed job still replays its raw answer.
+    assert payload["completed"].strip() == "Still investigating."

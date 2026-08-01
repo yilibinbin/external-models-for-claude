@@ -459,7 +459,11 @@ export function renderStoredJobResult(job, storedJob) {
     (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
     (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
     "";
-  if (rawOutput) {
+  // A FAILED job must replay its stored framing, not its raw output. Preferring
+  // rawOutput here undid the failure labelling at retrieval time: /codex:result
+  // returned the mid-flight commentary alone and dropped both the "did not
+  // complete" notice and the diagnostics needed to act on it.
+  if (rawOutput && job.status !== "failed") {
     const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
     if (!threadId) {
       return output;

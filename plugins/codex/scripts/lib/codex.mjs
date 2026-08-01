@@ -1139,8 +1139,15 @@ export async function runAppServerTurn(cwd, options = {}) {
       status: turnStatus,
       threadId,
       turnId: turnState.turnId,
+      // Success is not enough on its own: `turn/completed` can land with status 0
+      // while no non-empty final_answer was ever captured, and lastAgentMessage
+      // is overwritten by EVERY main-thread message. Without finalAnswerSeen the
+      // value is commentary, so it loses the deliverable's byte-identical
+      // exemption just as a failed turn's does.
       finalMessage:
-        turnStatus === 0 ? turnState.lastAgentMessage : sanitizeModelText(turnState.lastAgentMessage),
+        turnStatus === 0 && turnState.finalAnswerSeen
+          ? turnState.lastAgentMessage
+          : sanitizeModelText(turnState.lastAgentMessage),
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,

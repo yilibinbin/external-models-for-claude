@@ -28,6 +28,11 @@ import { redactMachinePaths } from "./path-hygiene.mjs";
 // Secret shapes worth redacting from Codex-derived text before it is persisted
 // to job state and re-displayed (e.g. in /codex:status and /codex:result).
 const SECRET_PATTERNS = [
+  // A URI with inline credentials is a secret whatever the variable is called.
+  // Keying on the NAME could not keep up -- SQLALCHEMY_DATABASE_URI,
+  // DATABASE_REPLICA_URL, CELERY_BROKER_URL -- and naming more engines would
+  // also have caught BASE_URL, an ordinary endpoint. The value says it plainly.
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@[^\s"'`,}]*/gi,
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z_]{20,}\b/g,
@@ -309,7 +314,39 @@ export function stripTerminalControls(text) {
   return String(text ?? "").replace(ANSI_PATTERN, "").replace(CONTROL_PATTERN, "");
 }
 
-const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]*-----[\s\S]*?-----END [A-Z0-9 ]*-----/g;
+const PEM_BEGIN_LINE = /^-----BEGIN [A-Z0-9 ]*-----/;
+const PEM_END_LINE = /^-----END [A-Z0-9 ]*-----/;
+
+// Line-scanned rather than matched with a lazy wildcard. A `[\s\S]*?` between
+// BEGIN and END rescans every suffix when END never arrives: measured 213 ms at
+// 328 KB and 1081 ms at 656 KB of repeated unmatched BEGIN headers -- the FOURTH
+// distinct quadratic in this file, and the stop gate sanitizes before it bounds.
+//
+// Scanning lines also closes a truncated block, which the old pattern returned
+// byte-for-byte because it required an END marker that a crashed writer never
+// emitted.
+function redactPemBlocks(text) {
+  if (!text.includes("-----BEGIN ")) {
+    return text;
+  }
+  const out = [];
+  let inBlock = false;
+  for (const line of text.split("\n")) {
+    if (!inBlock && PEM_BEGIN_LINE.test(line.trim())) {
+      inBlock = true;
+      out.push(REDACTED);
+      continue;
+    }
+    if (inBlock) {
+      if (PEM_END_LINE.test(line.trim())) {
+        inBlock = false;
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
 
 export function redactSecrets(text) {
   let output = String(text ?? "");
@@ -319,7 +356,7 @@ export function redactSecrets(text) {
   // A whole PEM block is a credential on its own. Everything else here keys off
   // an assignment, so a bare block -- which is exactly how a key is pasted into
   // a review or dumped by a tool -- passed through untouched.
-  output = output.replace(PEM_BLOCK, REDACTED);
+  output = redactPemBlocks(output);
   return redactOrphanedKeyBody(redactAssignedValues(output));
 }
 
@@ -547,7 +584,25 @@ function readValueAt(text, index, key) {
   // a prose sentence is the cheaper error here; this is the diagnostic and
   // index channel, never the deliverable.
   const lineEnd = text.indexOf("\n", index);
-  const end = lineEnd === -1 ? text.length : lineEnd;
+  let end = lineEnd === -1 ? text.length : lineEnd;
+  // YAML block scalar: `KEY: |` puts the value on the FOLLOWING indented lines,
+  // so stopping at the newline redacted the indicator and left the secret. Take
+  // the indented block too.
+  if (/^[|>][-+0-9]*\s*$/.test(text.slice(index, end))) {
+    let cursor = end;
+    while (cursor < text.length) {
+      const nextEnd = text.indexOf("\n", cursor + 1);
+      const line = text.slice(cursor + 1, nextEnd === -1 ? text.length : nextEnd);
+      if (line.trim() && !/^\s/.test(line)) {
+        break;
+      }
+      cursor = nextEnd === -1 ? text.length : nextEnd;
+      if (nextEnd === -1) {
+        break;
+      }
+    }
+    end = cursor;
+  }
   return end > index ? spanTo(text, index, end) : null;
 }
 
