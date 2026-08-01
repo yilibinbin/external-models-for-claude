@@ -10739,3 +10739,62 @@ def test_codex_progress_preview_redacts_before_it_shortens():
     assert "sanitizeModelText(String(text ?? \"\").trim().replace(/\\s+/g, \" \"))" in source, (
         "shorten() must redact before truncating"
     )
+
+
+def test_codex_sanitizer_two_sided_invariant():
+    # The single most-regressed property in this change: five of the panel's
+    # findings were fixes in one direction breaking the other. Both sets are
+    # asserted together so neither can be traded away silently.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const out = {};
+        for (const s of [
+          'SESSION_ID=abc123LEAK', 'BEARER=eyJLEAK', 'Authorization: Bearer eyJLEAK',
+          'Cookie: a=1; s=cLEAK', 'SESSION_COOKIE=cLEAK', 'GITHUB_TOKEN=ghLEAK',
+          'AWS_SECRET_ACCESS_KEY=wLEAK', 'SSH_KEY=aLEAK', 'DB_PASS=hLEAK',
+          'DOCKER_AUTH_CONFIG=eLEAK', 'NPM_CONFIG__AUTH=nLEAK',
+          'REDIS_URL=redis://u:pLEAK@h', 'DATABASE_URL=postgres://u:pLEAK@h/db',
+          'tokenizer_model=gpt-4 and notes', 'cookie_domain=example.com here',
+          'token_name=primary', 'token_count=42', 'passwordless=true',
+          'signature_status=valid', 'SSH_AUTH_SOCK=/tmp/a.sock',
+          'REQUEST_ID=r-123', 'JOB_ID=j-9', 'PRIMARY_KEY=id', 'FOREIGN_KEY=u and more',
+          'PASS_RATE=0.98', 'DICT_KEYS=abc', 'let keyboard = 1', 'AUTHOR=alice',
+          'TESTS_PASSED=3', 'version=1.2.3', 'status: ok',
+        ]) out[s] = sanitizeModelText(s);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for original, value in payload.items():
+        if "LEAK" in original:
+            assert "LEAK" not in value, f"must redact but leaked: {original!r}"
+            assert "[secret]" in value
+        else:
+            assert value == original, f"must survive byte-identical: {original!r} -> {value!r}"
+
+
+def test_codex_orphaned_key_body_walk_stops_at_ordinary_prose():
+    # `diag` matches the base64 charset by accident, so accepting any short
+    # alphanumeric run as key body deleted the diagnostic line above the key. A
+    # short line is body ONLY immediately before the END marker -- which is
+    # exactly where a real PEM's remainder line sits.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        console.log(JSON.stringify({
+          shortTail: sanitizeModelText(
+            'diag\\nQUJDREVGR0hJSktMTU5PUFFS\\nQUJD\\n-----END RSA PRIVATE KEY-----\\ntail'
+          ),
+          noBody: sanitizeModelText(
+            'important diagnostic\\nanother line\\n-----END RSA PRIVATE KEY-----\\ntail'
+          ),
+        }));
+        """
+    )
+    # The short remainder line and the full-width line both go; `diag` stays.
+    assert "diag" in payload["shortTail"]
+    assert "QUJDREVGR0hJSktMTU5PUFFS" not in payload["shortTail"]
+    assert "QUJD\n" not in payload["shortTail"]
+    # Nothing key-shaped precedes the marker: leave the text entirely alone.
+    assert "important diagnostic" in payload["noBody"]
+    assert "another line" in payload["noBody"]

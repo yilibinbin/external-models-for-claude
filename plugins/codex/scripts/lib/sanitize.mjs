@@ -46,24 +46,18 @@ const SECRET_PATTERNS = [
 // bypass at 64 and beyond -- squarely where deeply-namespaced enterprise names
 // like ACME_PLATFORM_INTERNAL_SERVICE_API_KEY live. Raising the bound only
 // moves the cliff. A substring test has no cliff at any length.
+// COMPOUND names only. Single words moved to STRONG_KEY_SEGMENTS below, because
+// a substring test on them flags ordinary identifiers: `token` matches
+// `tokenizer_model`, `cookie` matches `cookie_domain`. With unquoted values
+// running to end-of-line, each false positive erases the rest of its line.
 const SENSITIVE_KEY_FRAGMENTS = [
   "apikey",
-  "token",
-  "secret",
-  "password",
-  "passwd",
-  "passphrase",
-  "pwd",
-  "credential",
   "privatekey",
   "accesskey",
-  "cookie",
   "databaseurl",
   "dburl",
   "connectionstring",
-  // Connection strings carry `user:password@host` inline, so the URL itself is
-  // the credential. Named per-engine because none of them contains a word from
-  // the segment list.
+  "connectionuri",
   "redisurl",
   "postgresurl",
   "postgresqlurl",
@@ -71,17 +65,12 @@ const SENSITIVE_KEY_FRAGMENTS = [
   "mongodburi",
   "mongourl",
   "amqpurl",
-  "connectionuri",
-  // Registry credentials. `DOCKER_AUTH_CONFIG` holds a base64 auth blob and
-  // `NPM_CONFIG__AUTH` a base64 user:token; neither matches the qualifier+weak
-  // pairing, because `auth` is not preceded by a qualifier segment in either.
   "dockerauth",
   "npmconfigauth",
   "registryauth",
-  "authconfig",
-  "authorization",
-  "signature"
+  "authconfig"
 ];
+
 
 // Assignments are found by scanning for the SEPARATOR and looking back for the
 // key, rather than by matching key-separator-value as one unit.
@@ -106,12 +95,6 @@ const QUOTED_VALUE = /(["'`])((?:\\.|(?!\1)[^\\])*)\1/y;
 const BARE_VALUE = /[^\s"'`,}]+/y;
 const QUOTE_CHARS = new Set(['"', "'", "`"]);
 const KEY_CHAR = /[\w.-]/;
-// Keys whose value runs to the end of the line rather than to the next space.
-// Redacting only the first token yielded `Authorization: [secret] eyJhbGci...`
-// -- worse than doing nothing, because it reads as already handled. Keyed on the
-// header NAME rather than on a list of schemes: enumerating schemes missed
-// Negotiate and NTLM, and a cookie header holds several pairs.
-const LINE_VALUED_KEYS = ["authorization", "cookie", "setcookie"];
 // PEM bodies are newline-delimited, so the line rule above would keep all but
 // the first line. Consume through the matching end marker instead.
 const PEM_END = /-----END [A-Z ]*-----/;
@@ -122,14 +105,6 @@ const ORPHAN_PEM_END = /-----END [A-Z ]*-----/;
 
 const REDACTED = "[secret]";
 
-// `includes`, not `endsWith`: AUTHORIZATION_HEADER and COOKIE_HEADER are
-// sensitive by the same substring rule, but an endsWith test excluded them from
-// whole-line handling, so only the scheme word was taken and the credential
-// suffix survived behind a `[secret]` that read as complete.
-function isLineValuedKey(key) {
-  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
-  return LINE_VALUED_KEYS.some((name) => normalized.includes(name));
-}
 
 // Single-word segments that make a key sensitive. Matched per SEGMENT, not as a
 // substring of the whole key, because the short ones are substrings of ordinary
@@ -145,6 +120,7 @@ function isLineValuedKey(key) {
 // leaving the identifiers above alone.
 const STRONG_KEY_SEGMENTS = new Set([
   "token",
+  "authorization",
   "secret",
   "secrets",
   "password",
@@ -153,9 +129,13 @@ const STRONG_KEY_SEGMENTS = new Set([
   "pwd",
   "credential",
   "credentials",
+  "cookie",
+  "bearer",
+  "signature",
   "apikey",
   "privatekey"
 ]);
+
 
 const KEY_QUALIFIERS = new Set([
   "ssh",
@@ -184,6 +164,9 @@ const KEY_QUALIFIERS = new Set([
 
 const WEAK_KEY_SEGMENTS = new Set([
   "key",
+  // SESSION_ID / REFRESH_ID are credentials; REQUEST_ID / JOB_ID are not, and
+  // their first segment is not a qualifier, so pairing keeps them apart.
+  "id",
   "keys",
   "pass",
   "cert",
@@ -224,14 +207,21 @@ const NON_SECRET_SEGMENTS = new Set([
   "path",
   "file",
   "dir",
-  "id",
   "type",
   "kind",
   "version",
   "expiry",
   "expires",
-  "ttl"
+  "ttl",
+  "domain",
+  "name",
+  "model",
+  "prefix",
+  "suffix",
+  "format",
+  "encoding"
 ]);
+
 
 function isSensitiveKey(key) {
   const segments = keySegments(key);
@@ -312,12 +302,32 @@ function redactOrphanedKeyBody(text) {
   // buffer of legitimate diagnostics, because a truncated key body is normally
   // preceded by ordinary output.
   const lines = before.split("\n");
+  // Collect the trailing run of blank / marker / base64 lines, then require the
+  // run to contain at least one FULL-WIDTH body line before deleting it.
+  //
+  // A uniform length floor was wrong in both directions: the last body line of a
+  // PEM is a remainder and can be four characters, so the floor aborted the walk
+  // at once and left the whole key; accepting any short base64 line instead
+  // would delete ordinary short output.
   let firstBodyLine = lines.length;
-  while (firstBodyLine > 0 && looksLikeKeyBody(lines[firstBodyLine - 1])) {
+  let seenNonEmpty = 0;
+  while (firstBodyLine > 0) {
+    const candidate = lines[firstBodyLine - 1];
+    // A SHORT base64 line is only body when it sits immediately before the END
+    // marker -- that is the remainder line of a real PEM. Anywhere else a short
+    // alphanumeric run is ordinary prose: `diag` matches the base64 charset by
+    // accident, and accepting it deleted the diagnostic line above the key.
+    if (!looksLikeKeyBody(candidate, seenNonEmpty === 0)) {
+      break;
+    }
+    if (candidate.trim()) {
+      seenNonEmpty += 1;
+    }
     firstBodyLine -= 1;
   }
-  if (firstBodyLine === lines.length) {
-    // The marker is not preceded by key material at all; leave the text alone.
+  const collected = lines.slice(firstBodyLine);
+  if (!collected.some((line) => line.trim().length >= 16 && /^[A-Za-z0-9+/=]+$/.test(line.trim()))) {
+    // Nothing that looks like real key material precedes the marker.
     return text;
   }
   const head = lines.slice(0, firstBodyLine).join("\n");
@@ -327,15 +337,18 @@ function redactOrphanedKeyBody(text) {
 
 // PEM body lines are unbroken base64 runs. A redaction marker counts too, so a
 // body already collapsed by an earlier pass does not stop the walk.
-function looksLikeKeyBody(line) {
+// Blank lines, existing markers and base64 runs of ANY length. The "is this
+// really key material" judgement is made on the collected run as a whole, not
+// line by line -- see redactOrphanedKeyBody.
+function looksLikeKeyBody(line, allowShort) {
   const trimmed = line.trim();
-  if (!trimmed) {
+  if (!trimmed || trimmed === REDACTED || trimmed.endsWith(REDACTED)) {
     return true;
   }
-  if (trimmed === REDACTED || trimmed.endsWith(REDACTED)) {
-    return true;
+  if (!/^[A-Za-z0-9+/=]+$/.test(trimmed)) {
+    return false;
   }
-  return trimmed.length >= 16 && /^[A-Za-z0-9+/=]+$/.test(trimmed);
+  return trimmed.length >= 16 || allowShort;
 }
 
 // Reads the key ending at `end`, walking backwards over key characters and, if
