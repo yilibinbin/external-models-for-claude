@@ -301,10 +301,17 @@ function recordPendingBlock(workspaceRoot, input, reason, retries = 0) {
   }
 }
 
-function clearPendingBlock(workspaceRoot) {
+function clearPendingBlock(workspaceRoot, input) {
   try {
     updateState(workspaceRoot, (state) => {
-      delete state.pendingStopBlock;
+      // Scoped like readPendingBlock. Clearing unconditionally let one session's
+      // ordinary Stop erase another session's outstanding block -- after which the
+      // owning session's retry found nothing outstanding and was allowed through,
+      // which is the same bypass this whole record exists to close.
+      const pending = state.pendingStopBlock;
+      if (!pending || (pending.sessionId ?? null) === stopGateSessionId(input ?? {})) {
+        delete state.pendingStopBlock;
+      }
     });
   } catch {
     // Same: a stale record only causes one extra replayed block, which the retry
@@ -353,7 +360,7 @@ function main() {
       return;
     }
     if (pending.retries >= MAX_STOP_GATE_RETRIES) {
-      clearPendingBlock(workspaceRoot);
+      clearPendingBlock(workspaceRoot, input);
       logNote(
         `[codex review-gate] Releasing Stop after ${MAX_STOP_GATE_RETRIES} blocked attempts. ` +
           `The last block still stands and was NOT resolved: ${pending.reason}`
@@ -365,7 +372,7 @@ function main() {
     emitHookDecision({ decision: "block", reason: pending.reason });
     return;
   }
-  clearPendingBlock(workspaceRoot);
+  clearPendingBlock(workspaceRoot, input);
 
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
@@ -417,10 +424,14 @@ function handleHookException(error) {
       // activeWorkspaceRoot was never set): match main()'s resolution order
       // — CLAUDE_PROJECT_DIR before process.cwd() — so a malformed Stop payload
       // still fails closed against the CORRECT workspace's gate config.
-      config = getConfig(
-        activeWorkspaceRoot
-          ?? resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd())
-      );
+      // Adopt the resolved root as the active one. emitHookDecision persists a
+      // block against activeWorkspaceRoot, and a crash in readHookInput happens
+      // BEFORE main() sets it -- so the crash block went unrecorded, and the next
+      // Stop read "nothing outstanding" and was allowed. A malformed Stop payload
+      // is exactly the input an attacker or a broken client controls.
+      activeWorkspaceRoot =
+        activeWorkspaceRoot ?? resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+      config = getConfig(activeWorkspaceRoot);
     } catch (configError) {
       const configMessage = configError instanceof Error ? configError.message : String(configError);
       process.stderr.write(`${boundReason(sanitizeModelText(`[codex review-gate] could not determine gate config; allowing Stop: ${configMessage}`))}\n`);

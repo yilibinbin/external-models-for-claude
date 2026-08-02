@@ -49,7 +49,7 @@ fh.8 re-validation (2026-08-01): `claude plugin validate --strict .claude-plugin
 
 fh.9 re-validation (2026-08-01): `claude plugin validate --strict .claude-plugin/marketplace.json`, `claude plugin validate --strict plugins/codex` and `claude plugin validate --strict plugins/review-chain` were re-run against the bumped `1.1.0-fh.9` manifests and all three exited 0 ("Validation passed"). This bump carries no code change: it exists because fh.7 and fh.8 each landed as multi-commit merges whose intermediate commits published differing trees under one version key. The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold.
 
-fh.10 re-validation (2026-08-02): `claude plugin validate --strict .claude-plugin/marketplace.json`, `claude plugin validate --strict plugins/codex` and `claude plugin validate --strict plugins/review-chain` were re-run against the bumped `1.1.0-fh.10` manifests and all three exited 0 ("Validation passed"). The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold.
+fh.10 re-validation (2026-08-02): `claude plugin validate --strict .claude-plugin/marketplace.json`, `claude plugin validate --strict plugins/codex` and `claude plugin validate --strict plugins/review-chain` were re-run against the bumped `1.1.0-fh.10` manifests and all three exited 0 ("Validation passed"). That is SCHEMA validity only -- the validator does not assert the marketplace metadata version, which stays `0.5.0` and is pinned by `tests/plugin_versions.py`. The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold.
 
 ## Current version axis
 

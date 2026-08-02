@@ -11789,3 +11789,27 @@ def test_codex_inline_pem_block_does_not_swallow_the_rest_of_the_output():
     assert "finding: still here" in payload["endWithTrailingSyntax"]["text"]
     # And a closing delimiter must not leave a blank line behind it.
     assert payload["normalMultiline"]["text"] == "before\n[secret]\nafter: src/a.ts:12"
+
+
+def test_codex_stop_gate_block_record_survives_the_two_ways_it_was_lost():
+    """Both leaks re-opened the same bypass the record exists to close.
+
+    A block that is not recorded, or is erased by someone else, reads as "nothing
+    outstanding" on the retry -- and the retry path then allows the Stop.
+
+    1. clearPendingBlock deleted unconditionally while readPendingBlock was
+       session-scoped, so one session's ordinary Stop erased another session's
+       outstanding block.
+    2. emitHookDecision persists against activeWorkspaceRoot, but a crash inside
+       readHookInput happens BEFORE main() assigns it -- so the crash handler's
+       own block went unrecorded. A malformed Stop payload is exactly the input a
+       broken client controls.
+    """
+    source = read_text(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")
+
+    clear = source[source.index("function clearPendingBlock(") :][:900]
+    assert "stopGateSessionId" in clear, clear[:400]
+    assert "pending.sessionId" in clear, clear[:400]
+
+    crash = source[source.index("function handleHookException(") :][:1400]
+    assert "activeWorkspaceRoot =" in crash, crash[:600]
