@@ -429,7 +429,7 @@ def test_codex_docs_have_install_and_fork_notice_without_machine_paths():
     assert "OpenAI" in notices
     assert "Apache" in notices
     assert "Version included: 1.0.4" in notices
-    assert "Local extended version: 1.1.0-fh.9" in notices
+    assert "Local extended version: 1.1.0-fh.10" in notices
     root_license = read_text(ROOT / "LICENSE")
     assert root_license.splitlines()[0] == "MIT License"
 
@@ -11690,3 +11690,102 @@ def test_codex_broker_exit_signal_name_is_length_bounded():
     match = re.search(r"/\^\[A-Z\]\[A-Z0-9\]\{0,(\d+)\}\$/", receiver)
     assert match, receiver[:600]
     assert int(match.group(1)) <= 30, f"cap of {match.group(1)} is not a bound worth having"
+
+
+def test_codex_stop_gate_replays_a_block_instead_of_allowing_on_retry():
+    """stop_hook_active must not be a free pass.
+
+    The host sets stop_hook_active when Stop fires because a hook already blocked.
+    Returning early answered the cost problem -- a second eight-minute Codex turn
+    per iteration -- but a bare return IS an allow, so a second Stop after any
+    block (a real BLOCK verdict, a timeout, an auth failure) walked straight
+    through. The gate blocked once and then yielded to whoever pressed Stop again.
+
+    The block is now replayed from persisted state: no model call, so the cost
+    problem stays solved, and the loop is bounded by a retry count rather than by
+    surrendering on the first retry.
+    """
+    source = read_text(PLUGIN / "scripts" / "stop-review-gate-hook.mjs")
+
+    branch = source[source.index("if (input.stop_hook_active) {") :][:1400]
+    assert "readPendingBlock" in branch, branch[:500]
+    assert 'emitHookDecision({ decision: "block"' in branch, branch[:500]
+    assert "MAX_STOP_GATE_RETRIES" in branch, branch[:500]
+
+    # Every block persists, and from ONE place: recording per call site would leave
+    # whichever site is added next unrecorded, and an unrecorded block reads as
+    # "nothing outstanding" -- the exact allow this fix closes.
+    emitter = source[source.index("function emitHookDecision(") :][:1200]
+    assert "recordPendingBlock" in emitter, emitter[:500]
+    # The persisted text is the bounded, sanitized reason, so a replay cannot widen
+    # what the original block emitted.
+    assert "safePayload.reason" in emitter, emitter[:500]
+
+    # The cap must release rather than trap the session, and say so loudly.
+    release = source[source.index("MAX_STOP_GATE_RETRIES") :][:2000]
+    assert "clearPendingBlock" in release
+
+
+def test_codex_phaseless_final_answer_schedules_inferred_completion():
+    """A phase-less final answer must arm the completion timer too.
+
+    The accepting branch treats `phase == null` as a final answer -- providers are
+    not required to emit MessagePhase -- but the inference timer stayed keyed to
+    the explicit phase. So the one case the timer exists for went unscheduled: a
+    non-terminal turn/start response plus no turn/completed notification. Measured
+    against a fake app-server in exactly that shape, the turn never settled (killed
+    at a 20s timeout); with the timer armed it completes in ~0.4s.
+    """
+    source = read_text(PLUGIN / "scripts" / "lib" / "codex.mjs")
+    branch = source[source.index('if (lifecycle === "completed" && (item.phase == null') :][:1600]
+    assert "scheduleInferredCompletion(state);" in branch, branch[:600]
+    assert 'if (item.phase === "final_answer") {\n            scheduleInferredCompletion' not in branch, (
+        "the timer is still gated on the explicit phase"
+    )
+    # The explicit-precedence rule must survive: a phase-less message after an
+    # explicit final answer still returns before reaching the scheduler.
+    assert "state.explicitFinalAnswerSeen && item.phase == null" in branch, branch[:600]
+
+
+def test_codex_inline_pem_block_does_not_swallow_the_rest_of_the_output():
+    """A BEGIN and its END can share one line; the block must close there.
+
+    Deciding per line instead of scanning within it left `inBlock` set for good
+    once a single-line PEM appeared -- a key inlined into JSON, or a concatenated
+    string -- and every following line was silently dropped. Nothing leaked; what
+    was lost was the diagnostic content a finding needs. Text after an END on the
+    same line is ordinary output and has to survive.
+    """
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const B = '-----BEGIN PRIVATE KEY-----', E = '-----END PRIVATE KEY-----';
+        const cases = {
+          inlineThenMore: `${B}MIIBVgIBADAN${E}\\nfinding: src/a.ts:12\\nsecond\\nthird`,
+          insideJson: `{"key":"${B}AAA${E}","file":"src/a.ts"}\\n{"next":"finding 2"}`,
+          endWithTrailingSyntax: `${B}\\nMIIBVg\\n${E}";\\nfinding: still here`,
+          normalMultiline: `before\\n${B}\\nMIIBVg\\n${E}\\nafter: src/a.ts:12`,
+          unterminated: `${B}\\nMIIBVg\\nno end marker`,
+          twoInlineBlocks: `a ${B}AAA${E} b ${B}BBB${E} c\\nnext`,
+        };
+        const out = {};
+        for (const [k, v] of Object.entries(cases)) {
+          const once = sanitizeModelText(v);
+          out[k] = { text: once, idempotent: sanitizeModelText(once) === once };
+        }
+        console.log(JSON.stringify(out));
+        """
+    )
+    for name, result in payload.items():
+        assert "MIIBVg" not in result["text"], f"{name} leaked the key body"
+        assert "AAA" not in result["text"] and "BBB" not in result["text"], f"{name} leaked"
+        assert result["idempotent"], f"{name} is not idempotent"
+
+    # The content after an inline block survives -- that is the whole point.
+    assert "finding: src/a.ts:12" in payload["inlineThenMore"]["text"]
+    assert "third" in payload["inlineThenMore"]["text"]
+    assert '"file":"src/a.ts"' in payload["insideJson"]["text"]
+    assert "finding 2" in payload["insideJson"]["text"]
+    assert "finding: still here" in payload["endWithTrailingSyntax"]["text"]
+    # And a closing delimiter must not leave a blank line behind it.
+    assert payload["normalMultiline"]["text"] == "before\n[secret]\nafter: src/a.ts:12"

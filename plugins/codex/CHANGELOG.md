@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.1.0-fh.10
+
+Three defects found by the three-model serial panel (Claude / Gemini via
+Antigravity / Codex) run retroactively over `ec29ab4..4b00b0c` -- the 16 commits
+that reached `main` without one. All three were confirmed by every reviewer with
+independent evidence, and all three are on code that CodeRabbit had already
+passed clean.
+
+- **The fail-closed stop gate yielded on retry.** The host sets
+  `stop_hook_active` when Stop fires because a hook already blocked, and the gate
+  returned early to avoid a second eight-minute Codex turn per iteration. But a
+  bare return IS an allow, so a second Stop after any block -- a real `BLOCK`
+  verdict, a timeout, an auth failure -- walked straight through. The gate now
+  replays the persisted block instead of re-deriving it: no model call, so the
+  cost problem stays solved, and the loop is bounded by a retry count rather than
+  by surrendering on the first retry. Blocks are recorded from the single point
+  they all pass through, because a block recorded nowhere reads as "nothing
+  outstanding" -- which is the allow this closes.
+
+- **A phase-less final answer never armed the completion timer.** The accepting
+  branch treats an absent `phase` as a final answer, since providers are not
+  required to emit MessagePhase, but `scheduleInferredCompletion` stayed keyed to
+  the explicit phase. The one case the timer exists for therefore went
+  unscheduled. Measured against a fake app-server answering `turn/start`
+  non-terminally and never sending `turn/completed`: the turn never settled and
+  was killed at a 20s timeout; with the timer armed it completes in 389ms.
+
+- **An inline PEM block swallowed everything after it.** `redactPemBlocks`
+  decided per line, so a `BEGIN` and its `END` sharing one line -- a key inlined
+  into JSON, or a concatenated string -- left `inBlock` set for good and every
+  following line was silently dropped. A single-line key followed by three lines
+  of findings returned just `[secret]`. Nothing leaked; what was lost was the
+  diagnostic content a finding needs. The scan now runs within the line, and text
+  after an `END` survives.
+
 ## 1.1.0-fh.9
 
 No code change. `1.1.0-fh.8` and its predecessor shipped as multi-commit branches that

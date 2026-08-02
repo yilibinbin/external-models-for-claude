@@ -476,9 +476,13 @@ function recordItem(state, item, lifecycle, threadId = null) {
           // standing in as the final answer -- and the Stop classifier would
           // accept an ALLOW parsed from it.
           state.finalAnswerText = item.text;
-          if (item.phase === "final_answer") {
-            scheduleInferredCompletion(state);
-          }
+          // Schedule for a phase-less final answer too. The branch above accepts
+          // `phase == null` as final -- providers are not required to emit
+          // MessagePhase -- but the inference timer was left keyed to the explicit
+          // phase, so exactly the degraded case this timer exists for went
+          // unscheduled: no `turn/completed`, no explicit phase, and the capture
+          // promise never settles. The turn then hangs until the transport dies.
+          scheduleInferredCompletion(state);
         }
       }
       if (lifecycle === "completed") {

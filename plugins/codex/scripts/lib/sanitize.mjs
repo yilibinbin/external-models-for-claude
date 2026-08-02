@@ -343,13 +343,23 @@ export function stripTerminalControls(text) {
 // Finds a PEM delimiter anywhere in the line, tolerating a unified-diff marker
 // in front of it. Anchoring at the line start missed both an inline delimiter
 // and a diff-prefixed one.
-function findPemDelimiter(line, kind) {
+function findPemDelimiter(line, kind, from = 0) {
   const marker = `-----${kind} `;
-  const at = line.indexOf(marker);
+  const at = line.indexOf(marker, from);
   if (at === -1) {
     return -1;
   }
-  return line.slice(at).includes("-----", marker.length) ? at : -1;
+  const closeAt = line.indexOf("-----", at + marker.length);
+  return closeAt === -1 ? -1 : at;
+}
+
+// Where the delimiter's own trailing `-----` ends, so a caller can keep scanning
+// the same line. Without this an END sharing a line with its BEGIN was never
+// looked for, and `inBlock` stayed true for the rest of the text.
+function pemDelimiterEnd(line, kind, at) {
+  const marker = `-----${kind} `;
+  const closeAt = line.indexOf("-----", at + marker.length);
+  return closeAt === -1 ? line.length : closeAt + 5;
 }
 
 function redactPemBlocks(text) {
@@ -359,24 +369,49 @@ function redactPemBlocks(text) {
   const out = [];
   let inBlock = false;
   for (const line of text.split("\n")) {
-    if (!inBlock) {
-      const beginAt = findPemDelimiter(line, "BEGIN");
-      if (beginAt !== -1) {
-        inBlock = true;
-        // A delimiter can start mid-line: `Evidence follows: -----BEGIN ...`.
-        // Keep what came before it; the key itself starts at the marker.
-        const head = line.slice(0, beginAt).trimEnd();
-        out.push(head ? `${head} ${REDACTED}` : REDACTED);
+    // Scan WITHIN the line rather than deciding per line. A BEGIN and its END can
+    // share one line -- a key inlined into JSON, or a concatenated string -- and
+    // treating the whole line as "inside the block" then left inBlock set for
+    // good, silently swallowing every following line. Text after an END on the
+    // same line is ordinary content (`", "file": "src/a.ts"}`) and has to
+    // survive: this is the diagnostic channel, and dropping it destroys exactly
+    // the context a finding needs.
+    // Whether this line BEGAN inside a block decides if it may vanish. A line
+    // wholly consumed by the block (its interior, or a bare END) leaves nothing
+    // and must not emit an empty string -- doing so inserted a blank line where
+    // every closing delimiter had been.
+    const startedInBlock = inBlock;
+    let rest = line;
+    let kept = "";
+    for (;;) {
+      if (inBlock) {
+        const endAt = findPemDelimiter(rest, "END");
+        if (endAt === -1) {
+          rest = "";
+          break;
+        }
+        inBlock = false;
+        rest = rest.slice(pemDelimiterEnd(rest, "END", endAt));
         continue;
       }
-    }
-    if (inBlock) {
-      if (findPemDelimiter(line, "END") !== -1) {
-        inBlock = false;
+      const beginAt = findPemDelimiter(rest, "BEGIN");
+      if (beginAt === -1) {
+        kept += rest;
+        rest = "";
+        break;
       }
-      continue;
+      // A delimiter can start mid-line: `Evidence follows: -----BEGIN ...`.
+      // Keep what came before it; the key itself starts at the marker.
+      const head = (kept + rest.slice(0, beginAt)).trimEnd();
+      kept = head ? `${head} ${REDACTED}` : REDACTED;
+      inBlock = true;
+      rest = rest.slice(beginAt);
+      // Consume the BEGIN delimiter so the END search below cannot re-match it.
+      rest = rest.slice(pemDelimiterEnd(rest, "BEGIN", 0));
     }
-    out.push(line);
+    if (!startedInBlock || kept) {
+      out.push(kept);
+    }
   }
   return out.join("\n");
 }
