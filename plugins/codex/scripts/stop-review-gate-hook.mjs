@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { acquireResourceLease, capacityBlockedMessage } from "./lib/resource-governor.mjs";
-import { getConfig, listJobs } from "./lib/state.mjs";
+import { getConfig, listJobs, loadState, updateState } from "./lib/state.mjs";
 import { classifyStopGateResult } from "./lib/stop-gate-result.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
@@ -23,6 +23,10 @@ const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 let activeWorkspaceRoot = null;
 let activeGateConfig = null;
+let activeHookInput = null;
+// Set once the replay path has already written the record, so the emit below does
+// not reset the retry count it just incremented.
+let pendingBlockRecorded = false;
 let decisionEmitted = false;
 
 function readHookInput() {
@@ -73,6 +77,16 @@ function emitHookDecision(payload) {
     typeof payload?.reason === "string"
       ? { ...payload, reason: boundReason(sanitizeModelText(payload.reason)) }
       : payload;
+  // Persist EVERY block from the one place they all pass through. Recording at
+  // each call site instead would leave whichever site was added next silently
+  // unrecorded, and an unrecorded block is one the retry path cannot replay --
+  // it would read as "nothing outstanding" and allow the Stop, which is the
+  // failure this fix exists to close. The persisted text is the bounded,
+  // sanitized reason, so a replay cannot widen what the original block emitted.
+  if (safePayload?.decision === "block" && activeWorkspaceRoot && !pendingBlockRecorded) {
+    pendingBlockRecorded = true;
+    recordPendingBlock(activeWorkspaceRoot, activeHookInput ?? {}, safePayload.reason, 0);
+  }
   process.stdout.write(`${JSON.stringify(safePayload)}\n`);
 }
 
@@ -246,6 +260,65 @@ function withStopGateLease(cwd, callback) {
   }
 }
 
+// A blocked Stop is replayed, not re-derived, when the host retries. Bounded so a
+// gate that can never reach a verdict cannot trap the session forever; the release
+// is loud and says the block was never resolved.
+const MAX_STOP_GATE_RETRIES = 3;
+
+function stopGateSessionId(input) {
+  return input.session_id || process.env[SESSION_ID_ENV] || null;
+}
+
+function readPendingBlock(workspaceRoot, input) {
+  try {
+    const pending = loadState(workspaceRoot)?.pendingStopBlock;
+    if (!pending || typeof pending.reason !== "string" || !pending.reason) {
+      return null;
+    }
+    // Scoped to the session that earned it: a block from another session must not
+    // gate this one, and must not be silently consumed by it either.
+    const sessionId = stopGateSessionId(input);
+    if ((pending.sessionId ?? null) !== sessionId) {
+      return null;
+    }
+    return { reason: pending.reason, retries: Number.isInteger(pending.retries) ? pending.retries : 0 };
+  } catch {
+    // State is advisory here. An unreadable record must not crash the hook, but it
+    // also must not read as "no block" for a gate that already blocked -- the caller
+    // treats null as "not ours to enforce", which is the same outcome a fresh run
+    // would reach.
+    return null;
+  }
+}
+
+function recordPendingBlock(workspaceRoot, input, reason, retries = 0) {
+  try {
+    updateState(workspaceRoot, (state) => {
+      state.pendingStopBlock = { reason, retries, sessionId: stopGateSessionId(input) };
+    });
+  } catch {
+    // Best-effort: failing to persist costs a replay, not correctness.
+  }
+}
+
+function clearPendingBlock(workspaceRoot, input) {
+  try {
+    updateState(workspaceRoot, (state) => {
+      // Scoped like readPendingBlock. Clearing unconditionally let one session's
+      // ordinary Stop erase another session's outstanding block -- after which the
+      // owning session's retry found nothing outstanding and was allowed through,
+      // which is the same bypass this whole record exists to close.
+      const pending = state.pendingStopBlock;
+      if (!pending || (pending.sessionId ?? null) === stopGateSessionId(input ?? {})) {
+        delete state.pendingStopBlock;
+      }
+    });
+  } catch {
+    // Same: a stale record only causes one extra replayed block, which the retry
+    // cap already bounds.
+  }
+}
+
 function main() {
   if (String(process.env.CODEX_FOR_CLAUDE_REVIEW_GATE || "").toLowerCase() === "off") {
     return;
@@ -254,17 +327,52 @@ function main() {
     throw new Error("test hook crash");
   }
   const input = readHookInput();
-  // The host sets stop_hook_active when Stop fires because a hook already
-  // blocked. Running another full review then costs a second eight-minute
-  // Codex turn per iteration -- and the new fail-closed path for a turn with no
-  // final answer makes that loop reachable, since it blocks without ever
-  // reaching a verdict. Allow the Stop through; the gate already had its say.
-  if (input.stop_hook_active) {
-    return;
-  }
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
+  // Set before any block can be emitted, including the crash handler's, so every
+  // path that blocks is recorded and therefore replayable.
+  activeWorkspaceRoot = workspaceRoot;
+  activeHookInput = input;
+
+  // The host sets stop_hook_active when Stop fires because a hook already
+  // blocked. Re-running a full review costs another eight-minute Codex turn per
+  // iteration, and the fail-closed path for a turn with no final answer makes
+  // that loop reachable -- it blocks without ever reaching a verdict.
+  //
+  // Returning here answered the cost but broke the gate: a bare `return` is an
+  // ALLOW, so a second Stop after ANY block -- a real BLOCK verdict, a timeout,
+  // an auth failure -- walked straight through. The gate blocked once and then
+  // yielded to whoever pressed Stop again.
+  //
+  // Replay the decision instead of re-deriving it. The block is re-emitted from
+  // persisted state (no model call, so the cost problem stays solved) and the
+  // loop is bounded by a retry count rather than by surrendering on the first
+  // retry.
+  if (input.stop_hook_active) {
+    if (!config.stopReviewGate) {
+      return;
+    }
+    const pending = readPendingBlock(workspaceRoot, input);
+    if (!pending) {
+      // Nothing of ours is outstanding -- another hook blocked, or the record
+      // was lost. Not our gate to enforce.
+      return;
+    }
+    if (pending.retries >= MAX_STOP_GATE_RETRIES) {
+      clearPendingBlock(workspaceRoot, input);
+      logNote(
+        `[codex review-gate] Releasing Stop after ${MAX_STOP_GATE_RETRIES} blocked attempts. ` +
+          `The last block still stands and was NOT resolved: ${pending.reason}`
+      );
+      return;
+    }
+    recordPendingBlock(workspaceRoot, input, pending.reason, pending.retries + 1);
+    pendingBlockRecorded = true;
+    emitHookDecision({ decision: "block", reason: pending.reason });
+    return;
+  }
+  clearPendingBlock(workspaceRoot, input);
 
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
@@ -277,7 +385,6 @@ function main() {
     return;
   }
 
-  activeWorkspaceRoot = workspaceRoot;
   activeGateConfig = config;
   const setupNote = buildSetupNote(cwd);
   if (setupNote) {
@@ -317,10 +424,14 @@ function handleHookException(error) {
       // activeWorkspaceRoot was never set): match main()'s resolution order
       // — CLAUDE_PROJECT_DIR before process.cwd() — so a malformed Stop payload
       // still fails closed against the CORRECT workspace's gate config.
-      config = getConfig(
-        activeWorkspaceRoot
-          ?? resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd())
-      );
+      // Adopt the resolved root as the active one. emitHookDecision persists a
+      // block against activeWorkspaceRoot, and a crash in readHookInput happens
+      // BEFORE main() sets it -- so the crash block went unrecorded, and the next
+      // Stop read "nothing outstanding" and was allowed. A malformed Stop payload
+      // is exactly the input an attacker or a broken client controls.
+      activeWorkspaceRoot =
+        activeWorkspaceRoot ?? resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+      config = getConfig(activeWorkspaceRoot);
     } catch (configError) {
       const configMessage = configError instanceof Error ? configError.message : String(configError);
       process.stderr.write(`${boundReason(sanitizeModelText(`[codex review-gate] could not determine gate config; allowing Stop: ${configMessage}`))}\n`);
