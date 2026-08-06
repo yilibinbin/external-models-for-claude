@@ -258,6 +258,14 @@ function isSensitiveKey(key) {
   if (segments.length > 1 && NON_SECRET_SEGMENTS.has(segments[segments.length - 1])) {
     return false;
   }
+  // OAUTH_CLIENT_ID / *_CLIENT_ID: an OAuth client identifier is a public
+  // identifier by definition (RFC 6749 section 2.2, "the client identifier is
+  // not a secret"), not a credential. Demoted by trailing shape like the check
+  // above, so it wins over the "client"+"id" qualifier pairing below without
+  // weakening that pairing for anything else (CLIENT_KEY, CLIENT_CERT, ...).
+  if (segments.length > 1 && segments[segments.length - 2] === "client" && segments[segments.length - 1] === "id") {
+    return false;
+  }
   // `passwordless` is one segment and must not match `password` as a substring.
   if (segments.length === 1 && /less$/.test(segments[0])) {
     return false;
@@ -271,8 +279,13 @@ function isSensitiveKey(key) {
   }
   // A segment ENDING in a credential word: PGPASSWORD, REDISCLI_AUTH. Suffix
   // rather than substring, so `tokenizer` (token + more) and `author` stay out.
+  // `oauth` is excluded on the same basis: it ends in "auth" by coincidence of
+  // spelling, not because it names a credential -- OAUTH_SCOPE, OAUTH_ISSUER
+  // and OAUTH_REDIRECT_URI are ordinary configuration, and this suffix rule
+  // was wiping every one of them.
   if (
     segments.some((segment) =>
+      segment !== "oauth" &&
       [...STRONG_KEY_SEGMENTS, "auth"].some((word) => segment !== word && segment.endsWith(word))
     )
   ) {

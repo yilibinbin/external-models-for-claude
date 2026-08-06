@@ -4,6 +4,9 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
+
+import pytest
 
 from plugin_versions import ANTIGRAVITY_FOR_CLAUDE_VERSION, MARKETPLACE_VERSION
 
@@ -633,6 +636,93 @@ def test_antigravity_review_gate_blocks_only_on_literal_block_prefix():
     assert 'ANTIGRAVITY_FOR_CLAUDE_STOP_HOOK_ACTIVE === "1"' in source, (
         "review gate loop guard (stop_hook_active short-circuit) was removed"
     )
+
+
+def test_antigravity_review_gate_fails_closed_by_default_on_a_real_failure(tmp_path):
+    """Serial-panel round 2 (high): runReviewGate used to let Claude Code's
+    Stop proceed silently on EVERY non-block outcome (untrusted git context,
+    preflight/runtime unavailable, timeout, non-zero model exit, invalid
+    output) with no way to opt into a stricter posture -- unlike the codex
+    sibling plugin, which was hardened so the same failure class fails closed
+    by default (stopReviewGateFailOpen, default false).
+
+    This drives a REAL failure through the actual git-context check (PATH
+    stripped, so `git` itself cannot be spawned and rootResult.ok is false
+    with a genuine error rather than the benign "not a git repository"
+    message reviewGateGitContext treats as merely nothing-to-review), proving
+    the fail-closed default end-to-end rather than only asserting it exists in
+    the source. Note the FAIL_OPEN env restores the exact old always-allow
+    behavior for anyone who wants it back.
+    """
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+
+    def run_gate(extra_env):
+        merged_env = {
+            **os.environ,
+            "ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE": "on",
+            "PATH": "",
+            **extra_env,
+        }
+        return subprocess.run(
+            [NODE, str(ROOT / REVIEW_GATE_COMPANION), "review-gate"],
+            cwd=workdir,
+            env=merged_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+
+    default_result = run_gate({})
+    assert default_result.returncode == 0, (default_result.returncode, default_result.stderr)
+    default_payload = json.loads(default_result.stdout)
+    assert default_payload["decision"] == "block", default_result.stdout
+    assert default_payload["reason"], default_result.stdout
+
+    fail_open_result = run_gate({"ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE_FAIL_OPEN": "on"})
+    assert fail_open_result.returncode == 0, (fail_open_result.returncode, fail_open_result.stderr)
+    assert fail_open_result.stdout.strip() == "", fail_open_result.stdout
+    assert '"decision"' not in fail_open_result.stdout, fail_open_result.stdout
+
+
+def test_antigravity_review_gate_every_failure_branch_routes_through_fail_closed_helper():
+    """Structural companion to the end-to-end test above (matching this
+    file's own idiom for pinning the gate's control-flow contract -- see
+    test_antigravity_review_gate_blocks_only_on_literal_block_prefix): proves
+    EVERY non-block, non-allow outcome of runReviewGate -- not just the one
+    exercised live -- now routes through the same fail-closed-by-default
+    helper, so a future edit cannot quietly reintroduce a bare
+    warnReviewGate(...); return; that bypasses it. context.reviewable === false
+    ("nothing to review", not a failure) and the stop_hook_active loop guard
+    are deliberately excluded: those are correct to stay silent regardless of
+    the fail-open setting.
+    """
+    companion = read_text(ROOT / REVIEW_GATE_COMPANION)
+    gate_start = companion.index("function runReviewGate(rawArgs)")
+    gate_body = companion[gate_start: companion.index("\nasync function runMultiReview")]
+
+    assert "function reviewGateFailOpen()" in companion
+    assert 'process.env[REVIEW_GATE_FAIL_OPEN_ENV]' in companion
+
+    # Every one of the eight real failure sites now calls reviewGateFailure
+    # (all are call sites within runReviewGate's own body -- the function's
+    # one definition lives outside this slice, above runReviewGate, so it is
+    # not counted here): !context.trusted, preflightBudget<=0, the post-
+    # preflight and pre-model-call timeout checks, !preflight.ok, the
+    # runtime-error catch block, result.status!==0, and the invalid-output
+    # fallthrough. None of them still calls the old bare
+    # warnReviewGate(...); return; shape (the loop guard and the
+    # reviewable===false skip are exempt, and neither ever called
+    # warnReviewGate to begin with).
+    assert gate_body.count("reviewGateFailure(") == 8, gate_body
+    assert "warnReviewGate(" not in gate_body, (
+        "a review-gate failure path calls warnReviewGate directly instead of "
+        "reviewGateFailure, so it would silently allow-through regardless of "
+        "the fail-open setting"
+    )
+    assert "if (!context.reviewable) {\n      return;\n    }" in gate_body, gate_body
 
 
 # ---------------------------------------------------------------------------
@@ -1322,6 +1412,638 @@ def test_antigravity_sanitize_summary_redacts_secret_and_local_path_and_strips_c
     assert "\x1b" not in out, repr(out)
     assert "\x07" not in out, repr(out)
     assert "[31m" not in out, out
+
+
+def test_antigravity_sanitize_covers_compound_keys_and_uri_credentials():
+    """Serial-panel round 2 (high): the old SECRET_PATTERNS regex required its
+    keyword immediately adjacent to `:`/`=`, so any compound identifier
+    (AWS_SECRET_ACCESS_KEY, STRIPE_SECRET_KEY, DB_PASSWORD) or URI-embedded
+    credential (postgres://user:pass@host) matched nothing and passed through
+    every call site that already invokes redactSecrets (validation-evidence
+    summaries sent to an external model, mailbox bodies, the Stop-gate reason).
+    Segment-based key matching plus the ported URI pattern close both gaps.
+    """
+    source = (
+        "const m = await import('./" + SANITIZE_LIB + "');"
+        "const cases = {"
+        "  awsSecret: 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG',"
+        "  stripeSecret: 'STRIPE_SECRET_KEY: sk_live_51H8xEXAMPLEKEY',"
+        "  dbPassword: 'DB_PASSWORD=hunter2',"
+        "  databaseUrl: 'DATABASE_URL=postgres://svc_acct:Sup3rS3cr3t@db.internal.example.com:5432/prod',"
+        "};"
+        "const out = {};"
+        "for (const [k, v] of Object.entries(cases)) out[k] = m.redactSecrets(v);"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+    payload = _import_probe(source)
+    assert "wJalrXUtnFEMIK7MDENG" not in payload["awsSecret"], payload
+    assert "sk_live_51H8xEXAMPLEKEY" not in payload["stripeSecret"], payload
+    assert "hunter2" not in payload["dbPassword"], payload
+    assert "Sup3rS3cr3t" not in payload["databaseUrl"], payload
+    for name, redacted in payload.items():
+        assert "[secret]" in redacted, f"{name} was not redacted: {redacted}"
+
+
+def test_antigravity_sanitize_covers_quoted_assigned_values():
+    """Serial-panel round 2, Codex's re-verification pass: BARE_VALUE
+    (`/[^\\s"'`]+/y`) cannot start a match ON a quote character, so a quoted
+    assignment -- `password: "hunter2"`, `password='hunter2'` -- fell through
+    unredacted even though the bare form (`password=hunter2`) was already
+    caught. This is a common config/log/YAML shape, reachable through every
+    remaining raw-text sanitizeModelText call site (mailbox bodies, the
+    plain-text review branch, the Stop-gate reason, validation-evidence
+    summaries). A ported, escape-aware QUOTED_VALUE pattern (mirroring the
+    codex sanitizer's own) is tried before the bare fallback, and an escaped
+    quote inside the value does not end it early.
+    """
+    source = (
+        "const m = await import('./" + SANITIZE_LIB + "');"
+        "const cases = {"
+        '  doubleQuoted: String.raw`password: "hunter2"`,'
+        "  singleQuoted: \"password: 'hunter2'\","
+        '  bareStillWorks: "password=hunter2",'
+        '  escapedQuoteInside: String.raw`password: "hu\\"nter2" more text`,'
+        "};"
+        "const out = {};"
+        "for (const [k, v] of Object.entries(cases)) out[k] = m.redactSecrets(v);"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+    payload = _import_probe(source)
+    assert "hunter2" not in payload["doubleQuoted"], payload
+    assert "[secret]" in payload["doubleQuoted"], payload
+    assert "hunter2" not in payload["singleQuoted"], payload
+    assert "[secret]" in payload["singleQuoted"], payload
+    assert "hunter2" not in payload["bareStillWorks"], payload
+    assert "[secret]" in payload["bareStillWorks"], payload
+    # NOTE: the raw value is `hu\"nter2` -- the literal substring "hunter2"
+    # never appears in it (the escaped quote splits it), so asserting its
+    # absence would pass trivially even if escape handling were broken and
+    # leaked the "nter2" tail verbatim. Check for that tail specifically.
+    assert "nter2" not in payload["escapedQuoteInside"], payload
+    assert "[secret]" in payload["escapedQuoteInside"], payload
+    assert "more text" in payload["escapedQuoteInside"], (
+        "the escaped quote inside the value was not consumed as part of the "
+        "value, so redaction stopped early and left context after it intact "
+        "when it should have survived, or ate too much"
+    )
+
+
+def test_antigravity_sanitize_fails_closed_on_unterminated_quoted_value():
+    """Serial-panel round 2, Codex's SECOND re-verification pass: the quoted-
+    value fix above only handles a BALANCED pair -- QUOTED_VALUE requires a
+    matching closing quote, and an unterminated one (`password="hunter2`,
+    the exact shape a truncated or malformed model response produces) fails
+    to match, while BARE_VALUE still cannot start on the opening quote
+    either. Neither rule fired, so the credential passed through completely
+    unredacted -- worse than the already-fixed balanced-quote gap, since this
+    is realistic truncated-output shape, not just an unusual quoting style.
+    Mirrors the codex sanitizer's own documented rule for this exact case:
+    an opened-but-never-closed quote fails closed on the remainder, since
+    everything after it is plausibly still the value.
+    """
+    source = (
+        "const m = await import('./" + SANITIZE_LIB + "');"
+        "const cases = {"
+        '  unterminatedDouble: String.raw`password="hunter2`,'
+        "  unterminatedSingle: \"token='abc123\","
+        "};"
+        "const out = {};"
+        "for (const [k, v] of Object.entries(cases)) out[k] = m.redactSecrets(v);"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+    payload = _import_probe(source)
+    assert "hunter2" not in payload["unterminatedDouble"], payload
+    assert "[secret]" in payload["unterminatedDouble"], payload
+    assert "abc123" not in payload["unterminatedSingle"], payload
+    assert "[secret]" in payload["unterminatedSingle"], payload
+
+
+def test_antigravity_sanitize_still_covers_original_keywords_after_port():
+    """Regression guard for the fix above: moving from a single adjacency-only
+    regex to segment-based key matching must not lose any of the FOUR keyword
+    shapes (api_key/token/secret/password) the original pattern already
+    covered, in every separator/casing form it accepted -- and must not
+    over-redact ordinary non-secret compounds the old pattern never touched
+    (token_count, api_version), which segment matching could otherwise catch
+    as new false positives since "count"/"version" no longer block adjacency.
+    """
+    source = (
+        "const m = await import('./" + SANITIZE_LIB + "');"
+        "const cases = {"
+        "  underscoreApiKey: 'API_KEY=xyz123secretvalue',"
+        "  hyphenApiKey: 'api-key: xyz123secretvalue',"
+        "  camelApiKey: 'ApiKey=xyz123secretvalue',"
+        "  noSepApiKey: 'apikey=xyz123secretvalue',"
+        "  token: 'token=xyz123secretvalue',"
+        "  secret: 'secret=xyz123secretvalue',"
+        "  password: 'password=xyz123secretvalue',"
+        "  tokenCount: 'token_count=42',"
+        "  apiVersion: 'api_version=2024-01-01',"
+        "};"
+        "const out = {};"
+        "for (const [k, v] of Object.entries(cases)) out[k] = m.redactSecrets(v);"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+    payload = _import_probe(source)
+    for name in [
+        "underscoreApiKey", "hyphenApiKey", "camelApiKey", "noSepApiKey",
+        "token", "secret", "password",
+    ]:
+        assert "xyz123secretvalue" not in payload[name], f"{name} leaked: {payload[name]}"
+        assert "[secret]" in payload[name], f"{name} was not redacted: {payload[name]}"
+    assert payload["tokenCount"] == "token_count=42", payload["tokenCount"]
+    assert payload["apiVersion"] == "api_version=2024-01-01", payload["apiVersion"]
+
+
+def test_antigravity_save_taskset_rejects_empty_subtasks(tmp_path):
+    """Serial-panel round 2 (medium): normalizeTaskset() had no length check on
+    subtasks, so `plan --taskset` printed ok:true / exit 0 for a degenerate
+    model response with zero subtasks -- indistinguishable from a real
+    successful plan to any caller gating on exit code alone. saveTaskset() now
+    rejects it; readTaskset (the read path, also built on normalizeTaskset)
+    must stay tolerant, so the check lives only on the save side.
+    """
+    env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")}
+
+    def save(taskset_json):
+        source = (
+            "const t = await import('./plugins/antigravity-for-claude/scripts/lib/tasksets.mjs');"
+            f"const input = {taskset_json};"
+            "try {"
+            "  const saved = t.saveTaskset(process.cwd(), input);"
+            "  process.stdout.write(JSON.stringify({ ok: true, subtaskCount: saved.subtasks.length }));"
+            "} catch (error) {"
+            "  process.stdout.write(JSON.stringify({ ok: false, message: error.message }));"
+            "}"
+        )
+        result = subprocess.run(
+            [NODE, "--input-type=module", "-e", source],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    empty_array = save('{ title: "empty plan", subtasks: [] }')
+    assert empty_array["ok"] is False, empty_array
+    assert "no subtasks" in empty_array["message"], empty_array
+
+    missing_field = save('{ title: "no subtasks field at all" }')
+    assert missing_field["ok"] is False, missing_field
+    assert "no subtasks" in missing_field["message"], missing_field
+
+    real_plan = save(
+        '{ title: "real plan", subtasks: [ { title: "do the thing", '
+        'description: "implement it", acceptance_criteria: ["works"] } ] }'
+    )
+    assert real_plan["ok"] is True, real_plan
+    assert real_plan["subtaskCount"] == 1, real_plan
+
+
+def test_antigravity_runtime_spawns_never_use_a_shell_for_prompt_bearing_calls():
+    """Serial-panel round 2 (medium -> then critical, then resolved): the
+    first version of this fix set shell:true on win32 (copying codex's
+    process.mjs default verbatim) for both runCommand()'s spawnSync and
+    antigravityPrintAsync()'s spawn, reasoning that agy.cmd needs a shell to
+    run on Windows. Codex's stage-2 review of that diff flagged it as
+    CRITICAL: both call sites carry the full prompt -- including working-tree
+    diff content -- as a single `--prompt <text>` argument, and Node
+    explicitly does NOT escape command+args when shell:true is set, so shell
+    metacharacters in reviewed repository content would be interpreted by
+    cmd.exe. Codex's own process.mjs is safe with shell:true only because its
+    win32 default is reserved for TRUSTED, fixed-argv invocations -- its own
+    git.mjs explicitly overrides back to shell:false for every call carrying
+    repository-derived arguments, which is exactly this call's situation too.
+
+    The fix was corrected to shell:false, ALWAYS, on every platform -- which
+    does not disable .cmd/.bat execution: Node resolves those via its own
+    internal, escaped argv-to-command-line handling regardless of the shell
+    option (the mechanism CVE-2024-27980 hardened, which does not apply when
+    shell is explicitly true). Codex's RE-verification pass of that fix
+    caught a second problem: `shell: options.shell ?? false` still let a
+    caller override the hardening by passing `{shell: true}` in options --
+    both exported functions accept an arbitrary options object, so this was
+    not just defensive-programming paranoia. Corrected again to a LITERAL
+    `shell: false`, not derived from options at all. This pins the final,
+    non-overridable value at both call sites and guards against a future
+    edit reintroducing either shell:true OR an options-derived shell value.
+    """
+    runtime = read_text(ROOT / RUNTIME_LIB)
+
+    sync_start = runtime.index("export function runCommand(command, args, options = {})")
+    sync_body = runtime[sync_start: runtime.index("\nexport function normalizedModelProvider", sync_start)]
+    assert "shell: false" in sync_body, sync_body
+    assert "shell: true" not in sync_body, sync_body
+    assert "shell: options" not in sync_body, (
+        "the shell option must be a literal false, not derived from caller-"
+        "supplied options -- a caller passing {shell:true} must not be able "
+        "to re-enable shell interpretation of the untrusted prompt argument"
+    )
+
+    async_start = runtime.index("export function antigravityPrintAsync(prompt, options = {}, env = process.env)")
+    async_body = runtime[async_start: async_start + 3000]
+    assert "shell: false" in async_body, async_body
+    assert "shell: true" not in async_body, async_body
+    assert "shell: options" not in async_body, async_body
+    assert "shell: true" not in async_body, async_body
+
+
+def test_antigravity_mailbox_dir_and_thread_file_are_owner_only(tmp_path):
+    """Serial-panel round 2 (medium): mailboxDir()/writeJsonAtomic() created
+    the mailbox directory and thread JSON files with Node's default modes (no
+    explicit `mode`), unlike the sibling state.mjs (0o700 dir / 0o600 file)
+    and reports.mjs/resource-governor.mjs in the same lib directory -- so on a
+    typical host (umask 022) the mailbox tree, which persists free-text
+    message bodies sanitized only by the weaker antigravity regex, ended up
+    group/world-readable (0755 dir / 0644 file). Verifies the actual on-disk
+    mode after a real `mailbox post`, not just that a mode argument appears in
+    the source.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX file-mode bits are not meaningful on Windows")
+
+    plugin_data = tmp_path / "plugin-data"
+    result = run_node(
+        ROOT,
+        REVIEW_GATE_COMPANION,
+        ["mailbox", "post", "--thread", "notes", "--message", "hello"],
+        env={"CLAUDE_PLUGIN_DATA": str(plugin_data)},
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+    mailbox_dirs = list(plugin_data.rglob("mailbox"))
+    assert mailbox_dirs, f"no mailbox dir found under {plugin_data}"
+    mailbox_dir = mailbox_dirs[0]
+    thread_files = list(mailbox_dir.glob("*.json"))
+    assert thread_files, f"no thread file found under {mailbox_dir}"
+
+    dir_mode = mailbox_dir.stat().st_mode & 0o777
+    file_mode = thread_files[0].stat().st_mode & 0o777
+    assert dir_mode == 0o700, f"mailbox dir mode was {oct(dir_mode)}, expected 0o700"
+    assert file_mode == 0o600, f"mailbox thread file mode was {oct(file_mode)}, expected 0o600"
+
+
+def test_antigravity_mailbox_dir_self_heals_wrong_permissions(tmp_path):
+    """CodeRabbit review of the fix above: mailboxDir()'s chmodSync was
+    caught-and-ignored on failure with no verification that the directory
+    actually ended up owner-only afterward, so a pre-existing directory with
+    looser permissions that COULD be chmod'd would still work today (this
+    test), but the caller had no way to know whether that silent chmod
+    actually succeeded -- see the fail-closed test below for the case where
+    it does not. Here: a pre-existing world-readable directory is corrected
+    to 0700 the next time mailboxDir() runs.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX file-mode bits are not meaningful on Windows")
+
+    plugin_data = tmp_path / "plugin-data"
+    env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(plugin_data)}
+
+    # Pre-create the mailbox dir with loose (0755) permissions, simulating a
+    # directory left behind by a pre-fix version of this plugin.
+    probe = subprocess.run(
+        [NODE, "--input-type=module", "-e",
+         "const s = await import('./plugins/antigravity-for-claude/scripts/lib/state.mjs');"
+         "process.stdout.write(s.stateDirForCwd(process.cwd(), process.env));"],
+        cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        check=False, timeout=10,
+    )
+    assert probe.returncode == 0, probe.stderr
+    state_dir = pathlib.Path(probe.stdout.strip())
+    loose_mailbox_dir = state_dir / "mailbox"
+    loose_mailbox_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(loose_mailbox_dir, 0o755)
+    assert (loose_mailbox_dir.stat().st_mode & 0o777) == 0o755
+
+    result = run_node(
+        ROOT, REVIEW_GATE_COMPANION,
+        ["mailbox", "post", "--thread", "notes", "--message", "hello"],
+        env={"CLAUDE_PLUGIN_DATA": str(plugin_data)},
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (loose_mailbox_dir.stat().st_mode & 0o777) == 0o700
+
+
+def test_antigravity_mailbox_dir_fails_closed_when_mode_cannot_be_verified():
+    """CodeRabbit review: mailboxDir() used to return the directory
+    unconditionally even if the best-effort chmodSync silently failed and
+    the directory was NOT actually owner-only -- proceeding to persist
+    unencrypted, only-regex-sanitized message bodies into it regardless.
+
+    A REAL forced-failure reproduction (making chmodSync itself fail without
+    root) was attempted and found not to be portably constructible: POSIX
+    chmod on a path you own only requires ownership of that path, not write
+    access to its parent, so restricting the parent directory's permissions
+    (the obvious lever) does not actually block chmodSync on a child the
+    test process already owns -- confirmed directly: chmod on a child
+    succeeded and reached the target mode even with the parent at 0o555.
+    Absent a way to make chmodSync genuinely fail as the non-root test
+    runner, this instead pins the STRUCTURE of the fail-closed guard
+    directly: the mode is read back with statSync (not assumed from the
+    chmodSync call succeeding), and a mismatch throws naming the expected
+    mode, both unconditional on any platform check other than the win32
+    skip. This guards against a future edit silently deleting the
+    verification and reverting to "trust the chmod call, don't check."
+    """
+    source = read_text(ROOT / "plugins" / "antigravity-for-claude" / "scripts" / "lib" / "mailbox.mjs")
+    fn_start = source.index("function mailboxDir(")
+    fn_body = source[fn_start: source.index("\nfunction cleanText", fn_start)]
+
+    assert "fs.statSync(dir).mode & 0o777" in fn_body, fn_body
+    assert "actualMode !== 0o700" in fn_body, fn_body
+    assert "throw new Error" in fn_body, fn_body
+    assert 'process.platform !== "win32"' in fn_body, fn_body
+    # The throw must be reached AFTER the chmodSync attempt, not instead of
+    # it -- the self-heal path (see the test above) must still get a chance
+    # to correct a fixable directory before the verification runs.
+    chmod_index = fn_body.index("fs.chmodSync(dir, 0o700)")
+    verify_index = fn_body.index("fs.statSync(dir).mode & 0o777")
+    assert chmod_index < verify_index, fn_body
+
+
+def test_antigravity_finish_job_redacts_secrets_before_persisting(tmp_path):
+    """Serial-panel round 2 (critical): finishJob/capText previously only
+    truncated job.stdout/stderr/error by byte length -- no redaction -- so a
+    --background review job persisted a model's raw, unsanitized output
+    (including any secret it happened to quote as evidence) straight to the
+    on-disk job JSON, later served verbatim by /antigravity:result. capText is
+    the single choke point every finishJob caller goes through, so fixing it
+    there covers every background job regardless of which command queued it.
+    """
+    env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")}
+    source = (
+        "const jobs = await import('./plugins/antigravity-for-claude/scripts/lib/jobs.mjs');"
+        "const job = jobs.createJob({ command: 'review', args: [] });"
+        "jobs.finishJob(job.id, { status: 0, "
+        "stdout: 'evidence: token=abc123secretvalue found in config.py', "
+        "stderr: 'warning: password=hunter2 leaked in log', "
+        "error: '' });"
+        "const reloaded = jobs.readJob(job.id);"
+        "process.stdout.write(JSON.stringify({ stdout: reloaded.stdout, stderr: reloaded.stderr }));"
+    )
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", source],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert "abc123secretvalue" not in payload["stdout"], payload
+    assert "hunter2" not in payload["stderr"], payload
+    assert "[secret]" in payload["stdout"], payload
+    assert "[secret]" in payload["stderr"], payload
+
+
+def test_antigravity_finish_job_sanitizes_json_stdout_without_corrupting_it(tmp_path):
+    """Companion to the corruption fix in deepSanitizeStrings: a
+    --background --taskset/--scorecard/--json job's stdout is JSON, served
+    verbatim by `/antigravity:result --json` to a caller that will parse it.
+    capText now detects JSON-shaped stdout, parses it, and sanitizes only the
+    decoded string leaves (via the same deepSanitizeStrings helper) instead of
+    mangling the raw text -- so persisted job.stdout stays valid, parseable
+    JSON even when it contains a secret directly adjacent to an escaped quote,
+    the exact shape that broke JSON.parse before this fix.
+    """
+    env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")}
+    raw_stdout = '{"evidence":"found token=abc\\" quoted","file":"src/config.ts"}'
+    source = (
+        "const jobs = await import('./plugins/antigravity-for-claude/scripts/lib/jobs.mjs');"
+        "const job = jobs.createJob({ command: 'review', args: [] });"
+        "jobs.finishJob(job.id, { status: 0, "
+        f"stdout: {json.dumps(raw_stdout)}, stderr: '', error: '' }});"
+        "const reloaded = jobs.readJob(job.id);"
+        "let parseError = null;"
+        "let parsed = null;"
+        "try { parsed = JSON.parse(reloaded.stdout); } catch (error) { parseError = error.message; }"
+        "process.stdout.write(JSON.stringify({ stdout: reloaded.stdout, parseError, parsed }));"
+    )
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", source],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["parseError"] is None, (
+        f"persisted job.stdout is not valid JSON: {payload}"
+    )
+    assert "abc" not in payload["parsed"]["evidence"], payload
+    assert "[secret]" in payload["parsed"]["evidence"], payload
+    # A field that is NOT secret-shaped (a repo-relative path) survives untouched.
+    assert payload["parsed"]["file"] == "src/config.ts", payload
+
+
+def test_antigravity_structured_output_paths_sanitize_before_writing():
+    """Serial-panel round 2 (critical): every structured-output branch of
+    runReview (taskset, scorecard, --json, --structured) wrote the raw parsed
+    model JSON straight to stdout with ZERO redaction, while the plain-text
+    branch two branches below it called sanitizeModelText -- so a finding that
+    quoted a real hardcoded credential as evidence (the schema requires
+    blocking findings to carry free-text evidence) was printed, and for
+    --background jobs also persisted to disk, completely unredacted.
+
+    Fixed as parse-then-sanitize, not sanitize-then-parse: an earlier version
+    of this fix sanitized the RAW pre-parse text (matching the plain-text
+    branch's own pattern), but Gemini's stage-1 review of that version found
+    it corrupts JSON -- a redacted span can consume the backslash escaping a
+    quote inside a JSON string value, desyncing the string and making the
+    subsequent JSON.parse throw for input that would otherwise have been
+    valid. See test_antigravity_deep_sanitize_does_not_corrupt_json below for
+    the live reproduction. The correct fix parses first and sanitizes only
+    the decoded string leaves via deepSanitizeStrings, which cannot corrupt
+    structure that no longer exists as text.
+
+    WHY this shape of test: parseScorecardResult/the taskset and structured
+    branches are private module functions with no CLI-level fake-agy harness
+    in this suite, so -- matching this codebase's own established idiom for
+    "prove the sanitize call is wired before the write" (see the sibling
+    codex-plugin test asserting sanitizeModelText appears, and appears BEFORE
+    the output line, inside a sliced function body) -- assert directly against
+    the source that every previously-bypassing branch now sanitizes, in the
+    parse-first order.
+    """
+    companion = read_text(PLUGIN / "scripts" / "antigravity-companion.mjs")
+
+    # parseScorecardResult is the single choke point for BOTH the direct
+    # --scorecard branch and runMultiReview's per-role scorecard aggregation.
+    # Parse+validate the RAW stdout first, sanitize the validated object after.
+    parse_start = companion.index("function parseScorecardResult(stdout)")
+    parse_body = companion[parse_start: companion.index("\n}", parse_start)]
+    assert "extractJsonObject(stdout)" in parse_body, parse_body
+    assert "deepSanitizeStrings(normalizeScorecardOutput(extractJsonObject(stdout)), sanitizeModelText)" in parse_body, parse_body
+
+    run_review_start = companion.index("function runReview(kind, rawArgs)")
+    run_review_body = companion[run_review_start: companion.index("\nfunction runReport", run_review_start)]
+
+    # taskset branch: parse raw, sanitize the decoded object, then save.
+    assert "extractJsonObject(result.stdout)" in run_review_body, run_review_body
+    assert "deepSanitizeStrings(extractJsonObject(result.stdout), sanitizeModelText)" in run_review_body, run_review_body
+    taskset_call = run_review_body.index("deepSanitizeStrings(extractJsonObject(result.stdout), sanitizeModelText)")
+    save_call = run_review_body.index("saveTaskset(process.cwd(), sanitizedInput, process.env)")
+    stdout_write_calls = _all_indices(run_review_body, "process.stdout.write(stdout)")
+    assert stdout_write_calls, "no process.stdout.write(stdout) found in runReview"
+    assert taskset_call < save_call < stdout_write_calls[0], run_review_body
+
+    # --json / --structured branch: parse raw, validate, sanitize, THEN write.
+    assert "validateStructuredReview(extractJsonObject(result.stdout))" in run_review_body, run_review_body
+    assert "deepSanitizeStrings(validateStructuredReview(extractJsonObject(result.stdout)), sanitizeModelText)" in run_review_body, run_review_body
+    structured_call = run_review_body.index("deepSanitizeStrings(validateStructuredReview(extractJsonObject(result.stdout)), sanitizeModelText)")
+    json_write = run_review_body.index('process.stdout.write(`${JSON.stringify(parsed)}\\n`)')
+    assert structured_call < json_write, run_review_body
+
+    # scorecardMultiReviewPayload: a failed role's raw stderr/error is plain
+    # CLI error text (never re-parsed as JSON), so sanitizing it before it is
+    # embedded into the payload object is safe -- JSON.stringify re-escapes
+    # the already-sanitized string correctly when the payload is serialized.
+    payload_start = companion.index("function scorecardMultiReviewPayload(results, args")
+    payload_body = companion[payload_start: companion.index("\nfunction", payload_start + 10)]
+    assert 'sanitizeModelText((result.stderr || result.error || "Antigravity role review failed").trim())' in payload_body, payload_body
+
+
+def test_antigravity_deep_sanitize_does_not_corrupt_json():
+    """Serial-panel round 2, Gemini stage-1 finding: sanitizing RAW text
+    before JSON.parse can corrupt the JSON. Concretely, a redacted span can
+    consume the backslash escaping a quote inside a JSON string value (e.g.
+    an `evidence` field containing `token=abc\\" more text` -- realistic
+    output from a model quoting a code snippet that itself contains an
+    escaped quote), turning `\\"` into a bare `"` that prematurely
+    terminates the string. Reproduced directly against the OLD design
+    (sanitizeModelText applied to the raw text) to prove the corruption is
+    real, then against the NEW design (parse first, sanitize the decoded
+    object via deepSanitizeStrings) to prove it is fixed.
+    """
+    source = (
+        "const sanitize = await import('./" + SANITIZE_LIB + "');"
+        "const raw = " + json.dumps('{"evidence":"found token=abc\\" quoted"}') + ";"
+        # OLD (buggy) design: sanitize raw text, then parse.
+        "let oldDesignError = null;"
+        "try { JSON.parse(sanitize.redactSecrets(raw)); } "
+        "catch (error) { oldDesignError = error.message; }"
+        # NEW (fixed) design: parse raw text first, sanitize the decoded object.
+        "let newDesignError = null;"
+        "let newDesignResult = null;"
+        "try {"
+        "  const parsed = JSON.parse(raw);"
+        "  newDesignResult = sanitize.deepSanitizeStrings(parsed, sanitize.redactSecrets);"
+        "} catch (error) { newDesignError = error.message; }"
+        "process.stdout.write(JSON.stringify({ oldDesignError, newDesignError, newDesignResult }));"
+    )
+    payload = _import_probe(source)
+
+    # The old design's corruption is real: sanitizing the raw text before
+    # parsing breaks JSON.parse on input that is otherwise perfectly valid.
+    assert payload["oldDesignError"] is not None, (
+        "expected the pre-parse-sanitize design to corrupt this JSON, but it "
+        "parsed cleanly -- the reproduction no longer demonstrates the bug"
+    )
+
+    # The new design parses and sanitizes cleanly, with no parse error.
+    assert payload["newDesignError"] is None, payload
+    assert payload["newDesignResult"]["evidence"] == 'found token=[secret]" quoted', payload
+
+
+def test_antigravity_deep_sanitize_catches_key_only_sensitive_values():
+    """Serial-panel round 2, Codex stage-2 finding: deepSanitizeStrings walked
+    the object but sanitized each string value with no awareness of the KEY
+    it came from. `{"password": "hunter2"}` passed through completely
+    unchanged -- "hunter2" alone has no key=value text shape and matches no
+    secret pattern, so nothing caught it, even though the surrounding JSON
+    key made its sensitivity obvious. Only a string that happened to embed
+    its OWN "key=value" text (e.g. a prose "evidence" field quoting a
+    hardcoded secret) was ever redacted. deepSanitizeStrings now also checks
+    whether the key itself is sensitive (the same isSensitiveKey used by
+    redactAssignedValues) and replaces the whole value when it is, regardless
+    of the value's own shape -- while a value under a NON-sensitive key
+    (a repo-relative "file" path, a "severity" enum) is left untouched.
+    """
+    source = (
+        "const sanitize = await import('./" + SANITIZE_LIB + "');"
+        "const obj = {"
+        "  password: 'hunter2',"
+        "  token: 'abc123',"
+        "  AWS_SECRET_ACCESS_KEY: 'wJalrXUtnFEMIK7MDENG',"
+        "  evidence: 'config.py:14 sets API_KEY=hunter2',"
+        "  file: 'src/config.ts',"
+        "  severity: 'high',"
+        "  nested: { credential: 'nested-secret-value', note: 'ordinary text' }"
+        "};"
+        "const out = sanitize.deepSanitizeStrings(obj, sanitize.redactSecrets);"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+    payload = _import_probe(source)
+
+    assert payload["password"] == "[secret]", payload
+    assert payload["token"] == "[secret]", payload
+    assert payload["AWS_SECRET_ACCESS_KEY"] == "[secret]", payload
+    assert payload["evidence"] == "config.py:14 sets API_KEY=[secret]", payload
+    assert payload["nested"]["credential"] == "[secret]", payload
+    # Non-sensitive keys and their values survive untouched.
+    assert payload["file"] == "src/config.ts", payload
+    assert payload["severity"] == "high", payload
+    assert payload["nested"]["note"] == "ordinary text", payload
+
+
+def test_antigravity_deep_sanitize_replaces_composite_values_under_sensitive_keys():
+    """Serial-panel round 2, Codex's re-verification pass: the key-only-
+    sensitive fix above checked `isSensitiveKey(keyHint)` only inside the
+    `typeof value === "string"` branch, so a sensitive key whose value is an
+    OBJECT or ARRAY was traversed instead of replaced wholesale --
+    `{password: {value: "hunter2"}}` recursed into the inner object with
+    keyHint reset to the (non-sensitive) inner key "value", so the "password"
+    context was lost one level down and "hunter2" survived untouched. The
+    check now runs BEFORE type dispatch and short-circuits: any string,
+    object, or array under a sensitive key is replaced outright, with no
+    further recursion into it. Numbers/booleans under a sensitive key are
+    deliberately left alone (e.g. a "token_expires_in" duration) -- they
+    cannot carry secret-shaped text, and stringifying one to "[secret]" would
+    be an unrelated type change.
+    """
+    source = (
+        "const sanitize = await import('./" + SANITIZE_LIB + "');"
+        "const obj = {"
+        "  password: { value: 'hunter2', hint: 'first pet' },"
+        "  credentials: ['user1secret', 'user2secret'],"
+        "  token_expires_in: 3600,"
+        "  token_valid: true,"
+        "};"
+        "const out = sanitize.deepSanitizeStrings(obj, sanitize.redactSecrets);"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+    payload = _import_probe(source)
+
+    assert payload["password"] == "[secret]", payload
+    assert payload["credentials"] == "[secret]", payload
+    # Numbers/booleans under a sensitive key are left as-is, not stringified.
+    assert payload["token_expires_in"] == 3600, payload
+    assert payload["token_valid"] is True, payload
+
+
+def _all_indices(haystack, needle):
+    indices = []
+    start = 0
+    while True:
+        found = haystack.find(needle, start)
+        if found == -1:
+            return indices
+        indices.append(found)
+        start = found + 1
 
 
 def test_antigravity_validate_workflow_catches_github_context_in_inline_and_folded_run():
