@@ -18,6 +18,26 @@ PLUGIN = ROOT / "plugins" / "codex"
 NODE = os.environ.get("NODE_BINARY") or shutil.which("node") or "node"
 RELEASE_CHECK_MODULE = PLUGIN / "scripts" / "lib" / "release-check.mjs"
 
+
+def test_conftest_scrubs_ambient_claude_plugin_data():
+    # tests/conftest.py's _LEAKING_COMPANION_ENV_VARS scrub runs once at
+    # collection time. WHY this matters here specifically: CLAUDE_PLUGIN_DATA
+    # (unlike the CODEX_COMPANION_* vars already scrubbed) picks the on-disk
+    # state root every plugin resolves against, so a test suite run *inside a
+    # live session* -- exactly how this one was run when the gap was found --
+    # inherits the host's real plugin-data directory. Confirmed by A/B: with
+    # it ambient, test_codex_state_file_lock_wait_env_controls_timeout throws
+    # a TypeError (state root resolves to the host's real dir instead of the
+    # test's tmp_path); with it scrubbed, the whole suite passes clean. This
+    # assertion pins that the scrub actually ran, not just that it exists in
+    # source, so a future refactor that drops CLAUDE_PLUGIN_DATA from the
+    # scrub list fails loudly here instead of as 17 confusing failures
+    # elsewhere in the suite whenever someone runs pytest from a live session.
+    assert "CLAUDE_PLUGIN_DATA" not in os.environ, (
+        "CLAUDE_PLUGIN_DATA leaked into the test environment; tests/conftest.py "
+        "should have scrubbed it at collection time"
+    )
+
 FALLBACK_MARKETPLACE_CODEX_AUTHOR = {
     "name": "OpenAI",
     "url": "https://github.com/openai/codex-plugin-cc",
@@ -8716,6 +8736,67 @@ def test_codex_sanitizer_covers_credential_keys_without_a_listed_keyword():
     assert "MIIEvQIBADANBgkqhkiG9w0BAQ" not in payload["pkey"]
     assert "wJalrXUtnFEMI" not in payload["aws"]
     for name, redacted in payload.items():
+        assert "[secret]" in redacted, f"{name} was not redacted"
+
+
+def test_codex_sanitizer_does_not_redact_oauth_public_identifiers():
+    # Serial-panel round 2: OAUTH_CLIENT_ID was redacted via two independent
+    # mechanisms -- "oauth" spuriously satisfied the segment-suffix rule
+    # (it ends in "auth" by coincidence of spelling), and separately "client"
+    # + "id" paired as a qualifier + weak segment. Per RFC 6749 section 2.2 the
+    # client identifier "is not a secret", and OAUTH_SCOPE/OAUTH_ISSUER/
+    # OAUTH_REDIRECT_URI are ordinary, routinely-logged configuration -- none
+    # of these should ever be replaced with [secret].
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const cases = {
+          oauthClientId: 'OAUTH_CLIENT_ID=abc123public',
+          clientId: 'CLIENT_ID=abc123public',
+          appClientId: 'APP_CLIENT_ID=abc123public',
+          oauthScope: 'OAUTH_SCOPE=read write',
+          oauthIssuer: 'OAUTH_ISSUER=https://issuer.example.com',
+          oauthRedirectUri: 'OAUTH_REDIRECT_URI=https://app.example.com/callback',
+        };
+        const out = {};
+        for (const [k, v] of Object.entries(cases)) out[k] = sanitizeModelText(v);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for name, redacted in payload.items():
+        assert "[secret]" not in redacted, f"{name} was over-redacted: {redacted}"
+    assert payload["oauthClientId"] == "OAUTH_CLIENT_ID=abc123public"
+    assert payload["clientId"] == "CLIENT_ID=abc123public"
+    assert payload["appClientId"] == "APP_CLIENT_ID=abc123public"
+    assert payload["oauthScope"] == "OAUTH_SCOPE=read write"
+    assert payload["oauthIssuer"] == "OAUTH_ISSUER=https://issuer.example.com"
+    assert payload["oauthRedirectUri"] == "OAUTH_REDIRECT_URI=https://app.example.com/callback"
+
+
+def test_codex_sanitizer_still_redacts_client_secrets_and_credentials():
+    # Guardrail for the fix above: excluding "oauth" from the suffix rule and
+    # demoting the "client"+"id" pair must not weaken any OTHER client-related
+    # or oauth-related credential, which are caught through unrelated, still-
+    # active rules (an exact "secret"/"token"/"credential" segment, or the
+    # "client"+"key"/"cert" qualifier pairing).
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const cases = {
+          oauthClientSecret: 'OAUTH_CLIENT_SECRET=topsecretvalue',
+          clientSecret: 'CLIENT_SECRET=topsecretvalue',
+          oauthToken: 'OAUTH_TOKEN=topsecretvalue',
+          oauthAccessToken: 'OAUTH_ACCESS_TOKEN=topsecretvalue',
+          clientKey: 'CLIENT_KEY=topsecretvalue',
+          clientCredential: 'CLIENT_CREDENTIAL=topsecretvalue',
+        };
+        const out = {};
+        for (const [k, v] of Object.entries(cases)) out[k] = sanitizeModelText(v);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for name, redacted in payload.items():
+        assert "topsecretvalue" not in redacted, f"{name} leaked the value: {redacted}"
         assert "[secret]" in redacted, f"{name} was not redacted"
 
 

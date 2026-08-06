@@ -35,7 +35,7 @@ import {
   withWorkspaceJobLock
 } from "./lib/jobs.mjs";
 import { captureProcessIdentity } from "./lib/process.mjs";
-import { redactLocalPaths, redactSecrets, stripTerminalControls } from "./lib/sanitize.mjs";
+import { deepSanitizeStrings, redactLocalPaths, redactSecrets, stripTerminalControls } from "./lib/sanitize.mjs";
 import {
   classifyJobLiveness,
   deriveJobIdempotencyKey,
@@ -139,6 +139,7 @@ const REPO_ROOT_DIR = path.resolve(ROOT_DIR, "..", "..");
 const COMPANION_PATH = fileURLToPath(import.meta.url);
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const REVIEW_GATE_TIMEOUT_ENV = "ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE_TIMEOUT_MS";
+const REVIEW_GATE_FAIL_OPEN_ENV = "ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE_FAIL_OPEN";
 const REVIEW_GATE_DEFAULT_TIMEOUT_MS = 14 * 60 * 1000;
 const REVIEW_GATE_WRAPPER_TIMEOUT_MS = 870 * 1000;
 const REVIEW_GATE_WRAPPER_GRACE_MS = 30 * 1000;
@@ -564,7 +565,10 @@ function escapeCdata(value) {
 }
 
 function parseScorecardResult(stdout) {
-  return normalizeScorecardOutput(extractJsonObject(stdout));
+  // Parse the RAW text first, then sanitize the decoded object's string
+  // leaves -- sanitizing raw pre-parse text risks corrupting JSON escaping
+  // (see the comment on deepSanitizeStrings in lib/sanitize.mjs).
+  return deepSanitizeStrings(normalizeScorecardOutput(extractJsonObject(stdout)), sanitizeModelText);
 }
 
 function scorecardRoundSummary(command, scorecard, failureCategory = "") {
@@ -608,7 +612,7 @@ function scorecardMultiReviewPayload(results, args, mode = "plugin-managed") {
       return {
         role,
         status: "error",
-        error: (result.stderr || result.error || "Antigravity role review failed").trim()
+        error: sanitizeModelText((result.stderr || result.error || "Antigravity role review failed").trim())
       };
     }
     try {
@@ -1161,8 +1165,30 @@ function reviewGateEnabled() {
   return value !== "" && value !== "off" && value !== "false" && value !== "0";
 }
 
+function reviewGateFailOpen() {
+  const value = String(process.env[REVIEW_GATE_FAIL_OPEN_ENV] ?? "").trim().toLowerCase();
+  return value === "on" || value === "true" || value === "1";
+}
+
 function warnReviewGate(message) {
   process.stderr.write(`[antigravity-for-claude review-gate] ${message}\n`);
+}
+
+// Every tool-failure outcome of the review gate (untrusted context aside --
+// that means there is nothing to review, not that the gate failed) funnels
+// through here. Fail-closed by default, mirroring the codex sibling plugin's
+// stopReviewGateFailOpen (default false): a runtime error, timeout, non-zero
+// exit, or invalid model output during the window the gate exists to police
+// is exactly the window a real problem is most likely to coincide with, so it
+// must not silently let the stop through. Set
+// ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE_FAIL_OPEN=on to restore the previous
+// always-allow-on-failure behavior.
+function reviewGateFailure(message) {
+  warnReviewGate(message);
+  if (reviewGateFailOpen()) {
+    return;
+  }
+  process.stdout.write(`${JSON.stringify({ decision: "block", reason: sanitizeModelText(message) })}\n`);
 }
 
 function parseReviewGateOutput(output) {
@@ -1454,7 +1480,11 @@ function runReview(kind, rawArgs) {
   }
   if (kind === "plan" && args.taskset) {
     try {
-      const taskset = saveTaskset(process.cwd(), extractJsonObject(result.stdout), process.env);
+      // Parse the RAW text first, then sanitize the decoded object's string
+      // leaves -- see the comment on deepSanitizeStrings in lib/sanitize.mjs
+      // for why sanitizing pre-parse text is unsafe here.
+      const sanitizedInput = deepSanitizeStrings(extractJsonObject(result.stdout), sanitizeModelText);
+      const taskset = saveTaskset(process.cwd(), sanitizedInput, process.env);
       const stdout = `${JSON.stringify({
         ok: true,
         tasksetId: taskset.id,
@@ -1488,7 +1518,9 @@ function runReview(kind, rawArgs) {
   let parsed;
   if (args.structured || args.json) {
     try {
-      parsed = validateStructuredReview(extractJsonObject(result.stdout));
+      // Parse RAW, then sanitize the decoded object -- same reasoning as the
+      // taskset branch above.
+      parsed = deepSanitizeStrings(validateStructuredReview(extractJsonObject(result.stdout)), sanitizeModelText);
     } catch (error) {
       const stderr = `Structured review output invalid: ${error.message || String(error)}`;
       const failedResult = {
@@ -2314,30 +2346,25 @@ function runReviewGate(rawArgs) {
   try {
     const context = reviewGateGitContext({ deadline });
     if (!context.trusted) {
-      warnReviewGate(`${context.reason || "repository context unavailable"}; allowing stop`);
-      return;
+      return reviewGateFailure(context.reason || "repository context unavailable");
     }
     if (!context.reviewable) {
       return;
     }
     const preflightBudget = reviewGateRemainingMs(deadline);
     if (preflightBudget <= 0) {
-      warnReviewGate("timeout budget exhausted before preflight; allowing stop");
-      return;
+      return reviewGateFailure("timeout budget exhausted before preflight");
     }
     const preflight = antigravityPreflight(process.env, { ...args, timeout: preflightBudget });
     if (reviewGateRemainingMs(deadline) <= 0) {
-      warnReviewGate("timeout budget exhausted after preflight; allowing stop");
-      return;
+      return reviewGateFailure("timeout budget exhausted after preflight");
     }
     if (!preflight.ok) {
-      warnReviewGate(`runtime unavailable; allowing stop: ${preflight.error || `missing ${preflight.missing.join(", ")}`}`);
-      return;
+      return reviewGateFailure(`runtime unavailable: ${preflight.error || `missing ${preflight.missing.join(", ")}`}`);
     }
     const remaining = reviewGateRemainingMs(deadline);
     if (remaining <= 0) {
-      warnReviewGate("timeout budget exhausted before model call; allowing stop");
-      return;
+      return reviewGateFailure("timeout budget exhausted before model call");
     }
     const prompt = renderCommandPrompt("review-gate", {
       ROLE: "stop-gate",
@@ -2349,13 +2376,11 @@ function runReviewGate(rawArgs) {
     });
     result = antigravityPrint(prompt, { ...args, timeout: remaining, preflight }, process.env);
   } catch (error) {
-    warnReviewGate(`runtime error; allowing stop: ${error.message || String(error)}`);
-    return;
+    return reviewGateFailure(`runtime error: ${error.message || String(error)}`);
   }
 
   if (result.status !== 0) {
-    warnReviewGate(`runtime failed; allowing stop: ${result.stderr || result.error || `exit ${result.status}`}`);
-    return;
+    return reviewGateFailure(`runtime failed: ${result.stderr || result.error || `exit ${result.status}`}`);
   }
 
   const verdict = parseReviewGateOutput(result.stdout);
@@ -2367,7 +2392,7 @@ function runReviewGate(rawArgs) {
   if (verdict.kind === "allow") {
     return;
   }
-  warnReviewGate("invalid output; allowing stop");
+  return reviewGateFailure("invalid output");
 }
 
 async function runMultiReview(rawArgs) {

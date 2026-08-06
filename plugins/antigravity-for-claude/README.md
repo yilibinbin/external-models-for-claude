@@ -1,6 +1,6 @@
 # Antigravity for Claude
 
-Version: 0.1.3
+Version: 0.1.4
 
 Claude Code plugin that invokes the local Antigravity CLI (`agy`) for independent read-only review, planning, adversarial critique, rescue diagnosis, multi-role review, structured reports, background jobs, advisory coordination, GitHub Actions workflow rendering, release checks, and an opt-in Stop hook gate.
 

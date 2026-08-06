@@ -5,6 +5,7 @@ import process from "node:process";
 import { stateDirForCwd } from "./state.mjs";
 import { hasTrustedExpectedIdentity, terminateValidatedCompanionChild, terminateValidatedJobWorker } from "./process.mjs";
 import { classifyJobLiveness } from "./job-lifecycle.mjs";
+import { deepSanitizeStrings, redactLocalPaths, redactSecrets, stripTerminalControls } from "./sanitize.mjs";
 
 export const TERMINAL_JOB_STATUSES = new Set(["succeeded", "failed", "cancelled", "cancel_failed"]);
 export const RESERVABLE_COMMANDS = new Set(["review", "adversarial-review", "multi-review", "plan", "rescue"]);
@@ -137,8 +138,35 @@ function writeJob(job, cwd = process.cwd(), env = process.env) {
   return job;
 }
 
+// A --background --json/--taskset/--scorecard job's stdout is JSON. Sanitizing
+// that RAW text before it is later JSON.parse'd by a consumer (e.g. `result
+// --json`) risks the same corruption deepSanitizeStrings exists to avoid: a
+// redacted span can eat a backslash that was escaping a quote, desyncing the
+// string. So a value that looks like JSON is parsed first and only its
+// decoded string leaves are sanitized; anything that fails to parse (plain
+// text, or genuinely malformed JSON) falls back to whole-text sanitization,
+// unchanged from before.
+function sanitizeOutputText(text) {
+  const stripped = stripTerminalControls(text);
+  const trimmed = stripped.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return JSON.stringify(deepSanitizeStrings(parsed, (leaf) => redactLocalPaths(redactSecrets(leaf))));
+    } catch {
+      // Not actually valid JSON; fall through to whole-text sanitization.
+    }
+  }
+  return redactLocalPaths(redactSecrets(stripped));
+}
+
+// Redact secrets and local paths from job stdout/stderr/error before persisting,
+// mirroring mailbox.mjs's cleanBody: redaction runs before the length cap so a
+// secret is not half-truncated into a partial-but-recoverable form. This is a
+// job-state choke point -- every finishJob caller, present and future,
+// including --background runs that bypass the foreground sanitize call sites.
 function capText(value) {
-  const text = String(value || "").trimEnd();
+  const text = sanitizeOutputText(String(value || "")).trimEnd();
   const bytes = Buffer.from(text, "utf8");
   if (bytes.length < OUTPUT_CAP_BYTES) {
     return text;

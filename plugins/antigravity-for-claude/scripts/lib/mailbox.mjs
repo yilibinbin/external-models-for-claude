@@ -13,7 +13,25 @@ const LOCK_STALE_MS = 30_000;
 
 function mailboxDir(cwd = process.cwd(), env = process.env) {
   const dir = path.join(stateDirForCwd(cwd, env), "mailbox");
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // Best-effort: a pre-existing dir we cannot chmod is one we do not own.
+  }
+  // Verify rather than trust the best-effort chmod above: mkdirSync's own
+  // `mode` does nothing for a directory that already existed, and the
+  // chmodSync above silently swallows its own failure. Fail closed rather
+  // than persist mailbox content (free text, sanitized only by this
+  // plugin's own regex-based redaction) into a directory that turned out
+  // not to actually be owner-only. POSIX only: Windows mode bits do not
+  // reflect real ACL security, so this check does not apply there.
+  if (process.platform !== "win32") {
+    const actualMode = fs.statSync(dir).mode & 0o777;
+    if (actualMode !== 0o700) {
+      throw new Error(`Refusing to use mailbox directory ${dir}: expected mode 0700, got ${actualMode.toString(8)}.`);
+    }
+  }
   return dir;
 }
 
@@ -51,7 +69,7 @@ function now() {
 
 function writeJsonAtomic(file, payload) {
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  const handle = fs.openSync(tmp, "w");
+  const handle = fs.openSync(tmp, "w", 0o600);
   try {
     fs.writeFileSync(handle, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
     fs.fsyncSync(handle);
