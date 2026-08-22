@@ -149,28 +149,21 @@ function writeJob(job, cwd = process.cwd(), env = process.env) {
 function sanitizeOutputText(text) {
   const stripped = stripTerminalControls(text);
   const trimmed = stripped.trim();
-  // A child's captured output can be up to 20 MiB (runChildProcessAsync's own
-  // cap), while capText below truncates to 256 KiB regardless. Attempting
-  // the JSON-aware path first -- a full parse, a recursive sanitize walk,
-  // and a re-stringify -- on something that gets truncated away right after
-  // is wasted work at exactly the size where it costs the most. Skip
-  // straight to whole-text sanitization once the input is already past the
-  // cap; capText's own truncation still applies to the result unchanged.
-  //
-  // Known, accepted narrowing from this: whole-text sanitization cannot
-  // recognize a JSON-quoted key ({"password": "hunter2"} -- readKeyBefore
-  // cannot walk back past the key's own closing quote), so a value that is
-  // sensitive ONLY by its key name, with no shape a regex can key on, is not
-  // caught for an oversized payload specifically. In practice this is not a
-  // meaningful loosening: a truncated JSON blob almost never re-parses as
-  // valid JSON, so an alternative that tried to parse a 256 KiB PREFIX
-  // instead of skipping outright would fall back to this same whole-text
-  // path in the overwhelming majority of real cases anyway -- this just
-  // avoids paying for the doomed attempt first.
-  if (
-    (trimmed.startsWith("{") || trimmed.startsWith("[")) &&
-    Buffer.byteLength(trimmed, "utf8") <= OUTPUT_CAP_BYTES
-  ) {
+  // Whole-text sanitization cannot recognize a JSON-quoted key
+  // ({"password":"hunter2"} -- readKeyBefore cannot walk back past the key's
+  // own closing quote, and JSON has no space after the colon for it to key
+  // on), so a value that is sensitive ONLY by its key name, with no shape a
+  // regex can match, is never redacted by the whole-text path. That makes
+  // the JSON-aware parse+sanitize below load-bearing for correctness, not
+  // just a formatting nicety -- it must run for any JSON-shaped input
+  // regardless of size. This was previously skipped above OUTPUT_CAP_BYTES
+  // as a performance optimization (avoiding wasted work on output that gets
+  // truncated away immediately after); that skip let key-name-only secrets
+  // (e.g. a bare "password" field) leak in oversized payloads, so it was
+  // reverted -- CodeRabbit review of the PR. The remaining parse+sanitize
+  // cost is bounded regardless (runChildProcessAsync caps captured output at
+  // 20 MiB), so this is not unbounded work.
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
       const parsed = JSON.parse(trimmed);
       // 2-space indent matches the foreground taskset/scorecard/--structured

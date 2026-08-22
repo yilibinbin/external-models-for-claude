@@ -1859,34 +1859,35 @@ def test_antigravity_finish_job_sanitizes_json_stdout_without_corrupting_it(tmp_
     assert payload["parsed"]["file"] == "src/config.ts", payload
 
 
-def test_antigravity_finish_job_skips_json_aware_path_over_the_output_cap(tmp_path):
-    """CodeRabbit review of the PR: capText's JSON-aware sanitizeOutputText
-    attempted a full JSON.parse + recursive deepSanitizeStrings walk +
-    re-stringify BEFORE the 256 KiB truncation below it ever ran, even though
-    a child's captured stdout can be up to 20 MiB (runChildProcessAsync's own
-    cap) -- wasted work on output that gets truncated away immediately after,
-    worst exactly where it costs the most. sanitizeOutputText now skips the
-    JSON-aware attempt outright once the trimmed input already exceeds the
-    output cap, falling straight to whole-text sanitization (which still
-    catches SHAPE-based secrets -- an AKIA-style AWS key here -- even at this
-    size; only a purely key-name-sensitive value with no shape signal is
-    affected, a documented, accepted narrowing for this size class only).
+def test_antigravity_finish_job_redacts_key_name_secret_in_oversized_json(tmp_path):
+    """CodeRabbit review of the PR (round 2): an earlier fix to avoid wasted
+    JSON.parse+sanitize work on oversized job stdout (see
+    test_antigravity_structured_output_paths_sanitize_before_writing's
+    neighbor, since reverted) skipped the JSON-aware path entirely once the
+    trimmed input exceeded OUTPUT_CAP_BYTES, falling back to whole-text
+    sanitization. Whole-text sanitization cannot recognize a JSON-quoted key
+    ({"password":"secret"} has no space after the colon for readKeyBefore to
+    walk back over), so a value that is sensitive ONLY by its key name --
+    with no shape a regex can match -- leaked in full for any oversized
+    payload. sanitizeOutputText now always attempts the JSON-aware path for
+    JSON-shaped input regardless of size, so this is redacted structurally
+    instead. The padding is built inside the Node subprocess (not
+    interpolated into the command string) to stay under Windows' ~32,767
+    character CreateProcess command-line limit.
     """
     env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data")}
-    # > 256 KiB once serialized, valid JSON, with a shape-based secret near
-    # the start so it survives the subsequent truncation to inspect.
-    padding = "x" * (300 * 1024)
-    raw_stdout = json.dumps({"note": "AKIAABCDEFGHIJKLMNOP", "padding": padding})
-    assert len(raw_stdout.encode("utf-8")) > 256 * 1024, "fixture must exceed the output cap"
+    secret_value = "hunter2-opaque-secret-value"
     source = (
         "const jobs = await import('./plugins/antigravity-for-claude/scripts/lib/jobs.mjs');"
         "const job = jobs.createJob({ command: 'review', args: [] });"
-        "jobs.finishJob(job.id, { status: 0, "
-        f"stdout: {json.dumps(raw_stdout)}, stderr: '', error: '' }});"
+        "const padding = 'x'.repeat(300 * 1024);"
+        f"const rawStdout = JSON.stringify({{ password: {json.dumps(secret_value)}, padding }});"
+        "jobs.finishJob(job.id, { status: 0, stdout: rawStdout, stderr: '', error: '' });"
         "const reloaded = jobs.readJob(job.id);"
         "process.stdout.write(JSON.stringify({ "
         "stdout: reloaded.stdout, "
-        "byteLength: Buffer.byteLength(reloaded.stdout, 'utf8') "
+        "byteLength: Buffer.byteLength(reloaded.stdout, 'utf8'), "
+        "rawStdoutByteLength: Buffer.byteLength(rawStdout, 'utf8') "
         "}));"
     )
     result = subprocess.run(
@@ -1901,13 +1902,13 @@ def test_antigravity_finish_job_skips_json_aware_path_over_the_output_cap(tmp_pa
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
+    assert payload["rawStdoutByteLength"] > 256 * 1024, "fixture must exceed the output cap"
     # Truncated to the cap (plus marker), not left at the original ~300 KiB.
     assert payload["byteLength"] <= 256 * 1024, payload
-    # The shape-based secret near the start survives truncation and is still
-    # caught by whole-text sanitization, proving the fallback path actually ran.
-    assert "AKIAABCDEFGHIJKLMNOP" not in payload["stdout"], payload
+    # The key-name-only secret (no shape signal) is still redacted, proving
+    # the JSON-aware path ran instead of the whole-text fallback.
+    assert secret_value not in payload["stdout"], payload
     assert "[secret]" in payload["stdout"], payload
-    assert "[output truncated" in payload["stdout"], payload
 
 
 def test_antigravity_structured_output_paths_sanitize_before_writing():
