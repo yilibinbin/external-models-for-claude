@@ -149,7 +149,28 @@ function writeJob(job, cwd = process.cwd(), env = process.env) {
 function sanitizeOutputText(text) {
   const stripped = stripTerminalControls(text);
   const trimmed = stripped.trim();
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+  // A child's captured output can be up to 20 MiB (runChildProcessAsync's own
+  // cap), while capText below truncates to 256 KiB regardless. Attempting
+  // the JSON-aware path first -- a full parse, a recursive sanitize walk,
+  // and a re-stringify -- on something that gets truncated away right after
+  // is wasted work at exactly the size where it costs the most. Skip
+  // straight to whole-text sanitization once the input is already past the
+  // cap; capText's own truncation still applies to the result unchanged.
+  //
+  // Known, accepted narrowing from this: whole-text sanitization cannot
+  // recognize a JSON-quoted key ({"password": "hunter2"} -- readKeyBefore
+  // cannot walk back past the key's own closing quote), so a value that is
+  // sensitive ONLY by its key name, with no shape a regex can key on, is not
+  // caught for an oversized payload specifically. In practice this is not a
+  // meaningful loosening: a truncated JSON blob almost never re-parses as
+  // valid JSON, so an alternative that tried to parse a 256 KiB PREFIX
+  // instead of skipping outright would fall back to this same whole-text
+  // path in the overwhelming majority of real cases anyway -- this just
+  // avoids paying for the doomed attempt first.
+  if (
+    (trimmed.startsWith("{") || trimmed.startsWith("[")) &&
+    Buffer.byteLength(trimmed, "utf8") <= OUTPUT_CAP_BYTES
+  ) {
     try {
       const parsed = JSON.parse(trimmed);
       // 2-space indent matches the foreground taskset/scorecard/--structured
