@@ -51,7 +51,8 @@ Rules:
 - Empty, `off`, `false`, and `0` values disable the runtime gate.
 - Only a first output line beginning `BLOCK:` blocks Stop.
 - `ALLOW:` exits successfully with no hook decision JSON.
-- Antigravity runtime failures, timeouts, invalid output, or wrapper errors warn and fail open.
+- Antigravity runtime failures, timeouts, invalid output, or wrapper errors warn AND fail closed (block Stop) by default. Set `ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE_FAIL_OPEN=on` to restore the old always-allow-on-failure behavior.
+- The gate needs `git` on `PATH` to inspect the working tree; if it is unavailable, the gate treats that as a runtime failure too and blocks Stop unless `ANTIGRAVITY_FOR_CLAUDE_REVIEW_GATE_FAIL_OPEN=on` is set.
 - Do not add a `hooks` field to `.claude-plugin/plugin.json`; `hooks/hooks.json` is auto-discovered by the plugin runtime.
 
 User-facing examples:

@@ -51,13 +51,15 @@ fh.9 re-validation (2026-08-01): `claude plugin validate --strict .claude-plugin
 
 fh.10 re-validation (2026-08-02): `claude plugin validate --strict .claude-plugin/marketplace.json`, `claude plugin validate --strict plugins/codex` and `claude plugin validate --strict plugins/review-chain` were re-run against the bumped `1.1.0-fh.10` manifests and all three exited 0 ("Validation passed"). That is SCHEMA validity only -- the validator does not assert the marketplace metadata version, which stays `0.5.0` and is pinned by `tests/plugin_versions.py`. The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold.
 
+fh.11 re-validation (2026-08-05): `claude plugin validate --strict .claude-plugin/marketplace.json`, `claude plugin validate --strict plugins/codex`, `claude plugin validate --strict plugins/antigravity-for-claude`, and `claude plugin validate --strict plugins/review-chain` were re-run against the bumped `1.1.0-fh.11` codex manifest (and the co-released `0.1.4` antigravity-for-claude manifest, bumped in the same round for its own unrelated fixes) and all four exited 0 ("Validation passed"). The axis flags (`marketplaceEntryVersionSupported: true`, `validatorUnavailable: false`) still hold.
+
 ## Current version axis
 
-These are the values that ship today, each verified by the fh.10 re-validation above.
+These are the values that ship today, each verified by the fh.11 re-validation above.
 
 - Marketplace metadata version: `0.5.0`
-- Codex marketplace entry version: `1.1.0-fh.10`
-- Codex plugin manifest version: `1.1.0-fh.10`
+- Codex marketplace entry version: `1.1.0-fh.11`
+- Codex plugin manifest version: `1.1.0-fh.11`
 
 The marketplace metadata version is no longer pinned inside this plugin (see the `1.1.0-fh.5`
 changelog entry): pinning it here made every marketplace bump edit codex's shipped bytes under

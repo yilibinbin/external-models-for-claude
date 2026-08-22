@@ -271,12 +271,34 @@ function isSensitiveKey(key) {
   }
   // A segment ENDING in a credential word: PGPASSWORD, REDISCLI_AUTH. Suffix
   // rather than substring, so `tokenizer` (token + more) and `author` stay out.
+  // `oauth` is excluded on the same basis: it ends in "auth" by coincidence of
+  // spelling, not because it names a credential -- OAUTH_SCOPE, OAUTH_ISSUER
+  // and OAUTH_REDIRECT_URI are ordinary configuration, and this suffix rule
+  // was wiping every one of them.
   if (
     segments.some((segment) =>
+      segment !== "oauth" &&
       [...STRONG_KEY_SEGMENTS, "auth"].some((word) => segment !== word && segment.endsWith(word))
     )
   ) {
     return true;
+  }
+  // OAUTH_CLIENT_ID / *_CLIENT_ID: an OAuth client identifier is a public
+  // identifier by definition (RFC 6749 section 2.2, "the client identifier is
+  // not a secret"), not a credential -- but ONLY once every independent
+  // positive rule above has already had its chance to fire. Checking this
+  // before those rules (an earlier version of this fix did) demoted
+  // SECRET_CLIENT_ID / TOKEN_CLIENT_ID / API_KEY_CLIENT_ID / PRIVATE_KEY_CLIENT_ID
+  // too -- each already matches its own STRONG_KEY_SEGMENTS/fragment entry on
+  // an EARLIER segment, and the early return short-circuited before that
+  // match could run. Placed here, it only ever suppresses the ONE remaining
+  // mechanism that flags bare CLIENT_ID/OAUTH_CLIENT_ID: the qualifier+weak
+  // pairing loop directly below, which is exactly the trailing "client"+"id"
+  // pairing this demotes -- and nothing else, since every other independently
+  // sensitive shape (CLIENT_KEY, CLIENT_CERT, ...) pairs on a DIFFERENT weak
+  // segment than "id" and is unaffected.
+  if (segments.length > 1 && segments[segments.length - 2] === "client" && segments[segments.length - 1] === "id") {
+    return false;
   }
   // A qualifier anywhere BEFORE the weak word, not just immediately before it.
   // HMAC_ROTATION_KEY / SIGNING_PRIMARY_KEY / TLS_SERVER_KEY put a descriptive

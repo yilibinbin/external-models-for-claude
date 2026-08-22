@@ -88,6 +88,16 @@ export function normalizeTaskset(input) {
 
 export function saveTaskset(cwd, input, env = process.env) {
   const taskset = normalizeTaskset(input);
+  // Only enforced on the SAVE path, not inside normalizeTaskset itself: a
+  // taskset already on disk must stay readable (readTaskset also calls
+  // normalizeTaskset) even if some future flow legitimately empties it out.
+  // Here, though, a zero-subtask result is a degenerate model response --
+  // syntactically valid JSON that did no planning -- and saving it as ok:true
+  // is indistinguishable from a real successful plan to any caller gating on
+  // exit code alone.
+  if (taskset.subtasks.length === 0) {
+    throw new Error("Taskset has no subtasks; the model returned a plan with nothing to do.");
+  }
   taskset.updatedAt = new Date().toISOString();
   const file = tasksetFile(cwd, taskset.id, env);
   atomicWriteJson(file, taskset);

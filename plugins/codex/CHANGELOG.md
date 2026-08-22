@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.0-fh.11
+
+- `OAUTH_CLIENT_ID` (and `*_CLIENT_ID` generally) was fully redacted by two
+  independent mechanisms: the segment-suffix rule treated `oauth` as ending in
+  `auth` (a spelling coincidence, not a credential), and separately `client` +
+  `id` paired as a qualifier and a weak segment. Per RFC 6749 section 2.2 an
+  OAuth client identifier is explicitly not a secret. Both mechanisms are now
+  excepted for this specific shape; every other qualifier/weak-segment pairing
+  (`CLIENT_KEY`, `CLIENT_CERT`, `SESSION_ID`, `AWS_ACCESS_KEY_ID`, ...) is
+  unaffected. This closes the finding flagged but deliberately deferred in
+  1.1.0-fh.10 ("the over-redaction is real but predates this range").
+  The `client`+`id` exception initially ran BEFORE the exact-segment/fragment
+  checks in `isSensitiveKey`, so it short-circuited before `secret`/`token`/
+  `privatekey`/`apikey` ever got a chance to match: `SECRET_CLIENT_ID`,
+  `TOKEN_CLIENT_ID`, `PRIVATE_KEY_CLIENT_ID`, and `API_KEY_CLIENT_ID` leaked
+  their values completely unredacted -- a genuine under-redaction regression,
+  worse than the over-redaction this change set out to fix, caught by
+  CodeRabbit's review of the pull request. Moved to run AFTER every
+  independent positive rule, so it now only ever suppresses the ONE remaining
+  mechanism that flags bare `CLIENT_ID`/`OAUTH_CLIENT_ID` -- the qualifier+
+  weak-segment pairing -- and nothing that matches on an earlier,
+  independently-sensitive segment.
+
 ## 1.1.0-fh.10
 
 Three defects found by the three-model serial panel (Claude / Gemini via

@@ -493,7 +493,30 @@ export function runCommand(command, args, options = {}) {
     input: options.input,
     maxBuffer: MAX_BUFFER,
     timeout: options.timeout || DEFAULT_TIMEOUT_MS,
-    killSignal: options.killSignal || "SIGKILL"
+    killSignal: options.killSignal || "SIGKILL",
+    // ALWAYS false, deliberately, even on win32 -- an earlier version of this
+    // change set shell:true on win32 (copying codex's process.mjs default),
+    // which Codex's stage-2 review of that diff flagged as critical: with
+    // shell:true, Node concatenates command + args into one string with NO
+    // escaping (documented Node behavior), and this call's args carry the
+    // full prompt -- including working-tree diff content -- as a single
+    // `--prompt <text>` argument. Shell metacharacters in reviewed repository
+    // content would then be interpreted by cmd.exe, i.e. command injection.
+    // Codex's own process.mjs is safe with shell:true only because its
+    // win32 default is reserved for TRUSTED, fixed-argv invocations (git.mjs
+    // explicitly overrides back to shell:false for every call carrying
+    // repository-derived arguments); this call always carries untrusted
+    // content, so it belongs on that same explicit-false side of that split.
+    // shell:false does not break .cmd/.bat execution: Node resolves those
+    // via its own internal, escaped argv-to-command-line handling regardless
+    // of the shell option -- that escaping is what CVE-2024-27980 hardened,
+    // and it does not apply when shell is explicitly true.
+    // LITERAL false, not `options.shell ?? false`: this call always carries
+    // untrusted prompt content, so it must not be overridable by a caller
+    // (Codex's re-verification pass caught that `options.shell ?? false`
+    // still lets a caller passing {shell:true} re-enable the exact injection
+    // this fix exists to close).
+    shell: false
   });
   if (result.error?.code === "ETIMEDOUT" || result.signal) {
     cleanupWindowsProcessTree(result.pid, env);
@@ -817,7 +840,10 @@ export function antigravityPrintAsync(prompt, options = {}, env = process.env) {
       cwd: options.cwd || process.cwd(),
       env,
       detached,
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      // LITERAL false -- see the full explanation in the matching runCommand()
+      // comment, including why this is not derived from options.shell.
+      shell: false
     });
     let stdout = "";
     let stderr = "";

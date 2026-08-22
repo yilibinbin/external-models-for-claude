@@ -5,6 +5,7 @@ import process from "node:process";
 import { stateDirForCwd } from "./state.mjs";
 import { hasTrustedExpectedIdentity, terminateValidatedCompanionChild, terminateValidatedJobWorker } from "./process.mjs";
 import { classifyJobLiveness } from "./job-lifecycle.mjs";
+import { deepSanitizeStrings, redactLocalPaths, redactSecrets, stripTerminalControls } from "./sanitize.mjs";
 
 export const TERMINAL_JOB_STATUSES = new Set(["succeeded", "failed", "cancelled", "cancel_failed"]);
 export const RESERVABLE_COMMANDS = new Set(["review", "adversarial-review", "multi-review", "plan", "rescue"]);
@@ -137,8 +138,52 @@ function writeJob(job, cwd = process.cwd(), env = process.env) {
   return job;
 }
 
+// A --background --json/--taskset/--scorecard job's stdout is JSON. Sanitizing
+// that RAW text before it is later JSON.parse'd by a consumer (e.g. `result
+// --json`) risks the same corruption deepSanitizeStrings exists to avoid: a
+// redacted span can eat a backslash that was escaping a quote, desyncing the
+// string. So a value that looks like JSON is parsed first and only its
+// decoded string leaves are sanitized; anything that fails to parse (plain
+// text, or genuinely malformed JSON) falls back to whole-text sanitization,
+// unchanged from before.
+function sanitizeOutputText(text) {
+  const stripped = stripTerminalControls(text);
+  const trimmed = stripped.trim();
+  // Whole-text sanitization cannot recognize a JSON-quoted key
+  // ({"password":"hunter2"} -- readKeyBefore cannot walk back past the key's
+  // own closing quote, and JSON has no space after the colon for it to key
+  // on), so a value that is sensitive ONLY by its key name, with no shape a
+  // regex can match, is never redacted by the whole-text path. That makes
+  // the JSON-aware parse+sanitize below load-bearing for correctness, not
+  // just a formatting nicety -- it must run for any JSON-shaped input
+  // regardless of size. This was previously skipped above OUTPUT_CAP_BYTES
+  // as a performance optimization (avoiding wasted work on output that gets
+  // truncated away immediately after); that skip let key-name-only secrets
+  // (e.g. a bare "password" field) leak in oversized payloads, so it was
+  // reverted -- CodeRabbit review of the PR. The remaining parse+sanitize
+  // cost is bounded regardless (runChildProcessAsync caps captured output at
+  // 20 MiB), so this is not unbounded work.
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      // 2-space indent matches the foreground taskset/scorecard/--structured
+      // branches in runReview, so a background job's persisted stdout has the
+      // same shape /antigravity:result prints for a foreground run.
+      return JSON.stringify(deepSanitizeStrings(parsed, (leaf) => redactLocalPaths(redactSecrets(leaf))), null, 2);
+    } catch {
+      // Not actually valid JSON; fall through to whole-text sanitization.
+    }
+  }
+  return redactLocalPaths(redactSecrets(stripped));
+}
+
+// Redact secrets and local paths from job stdout/stderr/error before persisting,
+// mirroring mailbox.mjs's cleanBody: redaction runs before the length cap so a
+// secret is not half-truncated into a partial-but-recoverable form. This is a
+// job-state choke point -- every finishJob caller, present and future,
+// including --background runs that bypass the foreground sanitize call sites.
 function capText(value) {
-  const text = String(value || "").trimEnd();
+  const text = sanitizeOutputText(String(value || "")).trimEnd();
   const bytes = Buffer.from(text, "utf8");
   if (bytes.length < OUTPUT_CAP_BYTES) {
     return text;

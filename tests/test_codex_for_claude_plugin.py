@@ -4,6 +4,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import time
 import tempfile
 
@@ -17,6 +18,62 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "codex"
 NODE = os.environ.get("NODE_BINARY") or shutil.which("node") or "node"
 RELEASE_CHECK_MODULE = PLUGIN / "scripts" / "lib" / "release-check.mjs"
+
+
+def test_conftest_scrubs_ambient_claude_plugin_data():
+    # tests/conftest.py's _LEAKING_COMPANION_ENV_VARS scrub runs once at
+    # collection time. WHY this matters here specifically: CLAUDE_PLUGIN_DATA
+    # (unlike the CODEX_COMPANION_* vars already scrubbed) picks the on-disk
+    # state root every plugin resolves against, so a test suite run *inside a
+    # live session* -- exactly how this one was run when the gap was found --
+    # inherits the host's real plugin-data directory. Confirmed by A/B: with
+    # it ambient, test_codex_state_file_lock_wait_env_controls_timeout throws
+    # a TypeError (state root resolves to the host's real dir instead of the
+    # test's tmp_path); with it scrubbed, the whole suite passes clean. This
+    # assertion pins that the scrub actually ran, not just that it exists in
+    # source, so a future refactor that drops CLAUDE_PLUGIN_DATA from the
+    # scrub list fails loudly here instead of as 17 confusing failures
+    # elsewhere in the suite whenever someone runs pytest from a live session.
+    assert "CLAUDE_PLUGIN_DATA" not in os.environ, (
+        "CLAUDE_PLUGIN_DATA leaked into the test environment; tests/conftest.py "
+        "should have scrubbed it at collection time"
+    )
+
+
+def test_conftest_scrub_is_deterministic_not_incidental():
+    # CodeRabbit review of the PR: the test above only checks that
+    # CLAUDE_PLUGIN_DATA is ABSENT from the current environment, which is
+    # true whether the scrub actually ran or the variable was simply never
+    # set to begin with in whatever environment happens to run pytest --
+    # it doesn't prove the scrub mechanism works, only that this particular
+    # run's ambient state happened not to have it set. Proven here instead by
+    # explicitly setting a sentinel value BEFORE importing conftest (which
+    # runs _scrub_ambient_companion_env() at module import time, per its own
+    # docstring) in a fresh subprocess, so this fails loudly regardless of
+    # the outer test run's own environment if the scrub is ever removed.
+    env = {**os.environ, "CLAUDE_PLUGIN_DATA": "sentinel-value-that-must-be-scrubbed"}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys; "
+            "sys.path.insert(0, 'tests'); "
+            "assert os.environ.get('CLAUDE_PLUGIN_DATA') == 'sentinel-value-that-must-be-scrubbed'; "
+            "import conftest; "
+            "print('SCRUBBED' if 'CLAUDE_PLUGIN_DATA' not in os.environ else 'NOT_SCRUBBED')",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "SCRUBBED", (
+        f"conftest's import-time scrub did not remove a live sentinel value: {result.stdout!r} {result.stderr!r}"
+    )
 
 FALLBACK_MARKETPLACE_CODEX_AUTHOR = {
     "name": "OpenAI",
@@ -8716,6 +8773,84 @@ def test_codex_sanitizer_covers_credential_keys_without_a_listed_keyword():
     assert "MIIEvQIBADANBgkqhkiG9w0BAQ" not in payload["pkey"]
     assert "wJalrXUtnFEMI" not in payload["aws"]
     for name, redacted in payload.items():
+        assert "[secret]" in redacted, f"{name} was not redacted"
+
+
+def test_codex_sanitizer_does_not_redact_oauth_public_identifiers():
+    # Serial-panel round 2: OAUTH_CLIENT_ID was redacted via two independent
+    # mechanisms -- "oauth" spuriously satisfied the segment-suffix rule
+    # (it ends in "auth" by coincidence of spelling), and separately "client"
+    # + "id" paired as a qualifier + weak segment. Per RFC 6749 section 2.2 the
+    # client identifier "is not a secret", and OAUTH_SCOPE/OAUTH_ISSUER/
+    # OAUTH_REDIRECT_URI are ordinary, routinely-logged configuration -- none
+    # of these should ever be replaced with [secret].
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const cases = {
+          oauthClientId: 'OAUTH_CLIENT_ID=abc123public',
+          clientId: 'CLIENT_ID=abc123public',
+          appClientId: 'APP_CLIENT_ID=abc123public',
+          oauthScope: 'OAUTH_SCOPE=read write',
+          oauthIssuer: 'OAUTH_ISSUER=https://issuer.example.com',
+          oauthRedirectUri: 'OAUTH_REDIRECT_URI=https://app.example.com/callback',
+        };
+        const out = {};
+        for (const [k, v] of Object.entries(cases)) out[k] = sanitizeModelText(v);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for name, redacted in payload.items():
+        assert "[secret]" not in redacted, f"{name} was over-redacted: {redacted}"
+    assert payload["oauthClientId"] == "OAUTH_CLIENT_ID=abc123public"
+    assert payload["clientId"] == "CLIENT_ID=abc123public"
+    assert payload["appClientId"] == "APP_CLIENT_ID=abc123public"
+    assert payload["oauthScope"] == "OAUTH_SCOPE=read write"
+    assert payload["oauthIssuer"] == "OAUTH_ISSUER=https://issuer.example.com"
+    assert payload["oauthRedirectUri"] == "OAUTH_REDIRECT_URI=https://app.example.com/callback"
+
+
+def test_codex_sanitizer_still_redacts_client_secrets_and_credentials():
+    # Guardrail for the fix above: excluding "oauth" from the suffix rule and
+    # demoting the "client"+"id" pair must not weaken any OTHER client-related
+    # or oauth-related credential, which are caught through unrelated, still-
+    # active rules (an exact "secret"/"token"/"credential" segment, or the
+    # "client"+"key"/"cert" qualifier pairing).
+    #
+    # SECRET_CLIENT_ID / TOKEN_CLIENT_ID / PRIVATE_KEY_CLIENT_ID / API_KEY_CLIENT_ID
+    # are here specifically because an earlier version of the client+id demotion
+    # ran BEFORE the exact-segment/fragment checks in isSensitiveKey, so it
+    # short-circuited before "secret"/"token"/"privatekey"/"apikey" ever got a
+    # chance to match -- these four leaked their values completely unredacted.
+    # Caught by CodeRabbit's GitHub-integrated review of the PR (a separate pass
+    # from the local CLI runs earlier in this same review round, which had not
+    # surfaced it). The fix moved the demotion to run AFTER every independent
+    # positive rule, so it only ever suppresses the one remaining mechanism
+    # (the qualifier+weak "client"+"id" pairing) that would otherwise catch
+    # bare CLIENT_ID/OAUTH_CLIENT_ID -- and nothing that matches on an earlier,
+    # independently-sensitive segment.
+    payload = run_node_script(
+        """
+        import { sanitizeModelText } from './plugins/codex/scripts/lib/sanitize.mjs';
+        const cases = {
+          oauthClientSecret: 'OAUTH_CLIENT_SECRET=topsecretvalue',
+          clientSecret: 'CLIENT_SECRET=topsecretvalue',
+          oauthToken: 'OAUTH_TOKEN=topsecretvalue',
+          oauthAccessToken: 'OAUTH_ACCESS_TOKEN=topsecretvalue',
+          clientKey: 'CLIENT_KEY=topsecretvalue',
+          clientCredential: 'CLIENT_CREDENTIAL=topsecretvalue',
+          secretClientId: 'SECRET_CLIENT_ID=topsecretvalue',
+          tokenClientId: 'TOKEN_CLIENT_ID=topsecretvalue',
+          privateKeyClientId: 'PRIVATE_KEY_CLIENT_ID=topsecretvalue',
+          apiKeyClientId: 'API_KEY_CLIENT_ID=topsecretvalue',
+        };
+        const out = {};
+        for (const [k, v] of Object.entries(cases)) out[k] = sanitizeModelText(v);
+        console.log(JSON.stringify(out));
+        """
+    )
+    for name, redacted in payload.items():
+        assert "topsecretvalue" not in redacted, f"{name} leaked the value: {redacted}"
         assert "[secret]" in redacted, f"{name} was not redacted"
 
 
