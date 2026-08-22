@@ -152,7 +152,10 @@ function sanitizeOutputText(text) {
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
       const parsed = JSON.parse(trimmed);
-      return JSON.stringify(deepSanitizeStrings(parsed, (leaf) => redactLocalPaths(redactSecrets(leaf))));
+      // 2-space indent matches the foreground taskset/scorecard/--structured
+      // branches in runReview, so a background job's persisted stdout has the
+      // same shape /antigravity:result prints for a foreground run.
+      return JSON.stringify(deepSanitizeStrings(parsed, (leaf) => redactLocalPaths(redactSecrets(leaf))), null, 2);
     } catch {
       // Not actually valid JSON; fall through to whole-text sanitization.
     }

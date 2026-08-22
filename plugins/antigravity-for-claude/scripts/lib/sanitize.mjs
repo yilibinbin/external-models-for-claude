@@ -111,6 +111,15 @@ const QUOTE_CHARS = new Set(['"', "'", "`"]);
 // The quote characters are kept around the marker so quoted-value syntax
 // stays intact (`"[secret]"`, not a bare `[secret]` where a string was
 // expected).
+//
+// QUOTED_VALUE's `[^\\]` class matches newlines (unlike `.`, a negated
+// character class is not restricted by regex flags), so in multi-line text
+// an opening quote can pair with an unrelated closing quote several lines
+// later, collapsing everything between them to one marker. That is
+// intentional over-redaction, not a bug: this is the same "over-redact
+// rather than leak" tradeoff the rest of this file's threat model already
+// accepts, and the alternative (refusing to close across a newline) risks
+// leaving the actual value exposed past the line break instead.
 function readValueAt(text, index) {
   QUOTED_VALUE.lastIndex = index;
   const quoted = QUOTED_VALUE.exec(text);

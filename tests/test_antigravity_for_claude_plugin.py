@@ -722,7 +722,10 @@ def test_antigravity_review_gate_every_failure_branch_routes_through_fail_closed
         "reviewGateFailure, so it would silently allow-through regardless of "
         "the fail-open setting"
     )
-    assert "if (!context.reviewable) {\n      return;\n    }" in gate_body, gate_body
+    # Whitespace-tolerant: the exact-indentation string match this replaced
+    # pinned six- and four-space indentation, so a source reformat (no
+    # behavior change) would have broken this test for an unrelated reason.
+    assert re.search(r"if \(!context\.reviewable\) \{\s*return;\s*\}", gate_body), gate_body
 
 
 # ---------------------------------------------------------------------------
@@ -1646,11 +1649,17 @@ def test_antigravity_runtime_spawns_never_use_a_shell_for_prompt_bearing_calls()
     )
 
     async_start = runtime.index("export function antigravityPrintAsync(prompt, options = {}, env = process.env)")
-    async_body = runtime[async_start: async_start + 3000]
+    # Bounded by the NEXT export, matching the sync case above -- a fixed
+    # character-count window (the previous version of this test used 3000)
+    # can silently extend past the function it means to check, letting an
+    # unrelated later function's shell:true/shell:false satisfy an assertion
+    # meant for THIS function. antigravityPrintAsync is the last export in
+    # this file, so there is no next boundary; fall back to end-of-file.
+    next_export = runtime.find("\nexport ", async_start + 1)
+    async_body = runtime[async_start: next_export if next_export != -1 else len(runtime)]
     assert "shell: false" in async_body, async_body
     assert "shell: true" not in async_body, async_body
     assert "shell: options" not in async_body, async_body
-    assert "shell: true" not in async_body, async_body
 
 
 def test_antigravity_mailbox_dir_and_thread_file_are_owner_only(tmp_path):
