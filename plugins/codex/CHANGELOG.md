@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.0-fh.12
+
+- `--quality max` no longer routes to a model's true strongest supported
+  reasoning-effort tier -- it is now capped at the literal `max` tier.
+  Previously, a model whose ceiling is `ultra` (e.g. `gpt-5.6-sol`) had
+  `--quality max` reach `ultra` automatically; `ultra` is intended for
+  orchestrating agent swarms, not implied by a single review or task's
+  max-quality request, so it is now reserved for an explicit
+  `--effort ultra`. A model whose own ceiling is already below `max`
+  (e.g. only up to `high`) still degrades gracefully to that ceiling,
+  unchanged from before -- only the escalation past `max` was removed.
+  `effort-policy.mjs` gains `cappedHighestEffort`, used by the
+  `wantsHighestEffort` resolution branch in place of `highestKnownEffort`;
+  explicit `--effort` (including `ultra`) is unaffected.
+
 ## 1.1.0-fh.11
 
 - `OAUTH_CLIENT_ID` (and `*_CLIENT_ID` generally) was fully redacted by two

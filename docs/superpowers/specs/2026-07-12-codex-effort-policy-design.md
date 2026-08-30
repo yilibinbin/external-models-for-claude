@@ -12,6 +12,7 @@
 > - **v4** 用 app-server `model/list` 驱动按模型路由 —— 被三模型串行审阅判 **NO-GO**:**地基错误 N1**(effort 解析层放错——`executeTaskRun`/`executeReviewRun` 在 companion 层拿不到 `client`,`withAppServer` 只在 `codex.mjs` 的 `runAppServerTurn`/`runAppServerReview` 内打开)+ **哨兵对象崩 3 条路径**(task parse 崩 / 两 review 路径静默透传垃圾对象)+ **model/list 失败处理不全**(`validateEffortForModel(v, undefined)` 崩、空数组静默降档、§3.4/§3.5 自相矛盾、native-review 无 effort 通道却被派 discovery)。
 > - **v5**:把解析**下沉到 `codex.mjs` 的 `runAppServerTurn` 回调内单一 resolver**;哨兵双字段契约;model/list 失败 **omit-for-all**;空表 fail-loud;native-review 排除 discovery。两轮三模型审阅判 **GO_WITH_FIXES**:7/8 阻断项真闭合,但 Codex 抓到 **v5 新 HIGH 回归**(照字面改 task `:1094` 为 `normalizeReasoningEffort(options.effort)` 会丢 fast/standard/strong 默认档)+ **N4 PARTIALLY**(`wantsHighestEffort` 未列全 copy hops)+ model/list 契约未声明(Gemini HIGH→Codex MED 反驳收敛)+ §6 漏结构测试。
 > - **v6(本版)**:落地 v5 两轮审阅的 5 项 fix——task `:1094` 保留 `?? quality.effort`(不丢档)、列全 `wantsHighestEffort` copy hops(`executeTaskRun:561`/`buildAdversarialReviewTurnOptions:324`)、model/list 补 `app-server-protocol.d.ts` 契约 + §9 probe 设**硬门禁**、§6 补 fast/standard/strong 回归测试与结构字符串匹配测试、resolveModelEntry 精确匹配文档化;resolver 分支①加 `effort==null` 条件保证 `--effort` 显式优先于哨兵。
+> - **v7(2026-08-29,用户重新裁定)**:推翻**决策2**——`--quality max` 不再路由到模型真·最高档(即不再含 `ultra`),改为**封顶在字面 `max` 档**;`ultra` 只保留给显式 `--effort ultra`。理由:`ultra` 是为编排多 agent 蜂群场景准备的档位,单次审阅/任务没必要隐式触达。实现为 `effort-policy.mjs` 新增 `cappedHighestEffort`(在 `highestKnownEffort` 基础上先按 `EFFORT_ORDER` 过滤到 `<= max` 的档位,模型原本封顶低于 `max` 的仍按原逻辑优雅降级,不受影响);`wantsHighestEffort` 分支改调用它。`highestKnownEffort` 本身、显式 `--effort` 校验路径均未改动。
 
 ---
 
@@ -151,7 +152,7 @@ export function validateEffortForModel(value, supported) {
 
 | 场景 | 当前模型 | `--quality max` → |
 |---|---|---|
-| model=null(默认) | isDefault=`gpt-5.6-sol` | **`ultra`**(主路径到顶,修好 v3 证伪 B) |
+| model=null(默认) | isDefault=`gpt-5.6-sol` | **`max`**(封顶于字面 max 档,v7 推翻含 ultra 的决策2;`ultra` 需显式 `--effort ultra`) |
 | 显式 `--model gpt-5.6-luna` | luna | `max` |
 | 显式 `--model gpt-5.5` | 5.5 | `xhigh` |
 | 显式未知模型 | — | **fail-loud**(不猜) |
@@ -161,9 +162,9 @@ export function validateEffortForModel(value, supported) {
 ## 4. 决策记录(三模型串行审阅收敛 + 用户产品决策)
 
 - **决策1 antigravity**:No touch, no bump。
-- **决策2 `--quality max`(用户已定)**:路由到该模型真·最高档,**含 `ultra`**(实测 ultra 不绕过 governor)。
+- **决策2 `--quality max`(v7 已推翻,见版本演进)**:~~路由到该模型真·最高档,含 `ultra`~~ → 封顶在字面 `max` 档;`ultra` 只保留给显式 `--effort ultra`。
 - **A(数组末项)**:**不盲取末项**,用显式 `EFFORT_ORDER` 取最强,未知档/空表 **fail-loud**。
-- **B(主路径)**:用 `model/list` 的 `isDefault` 拿真实默认模型 → 主路径也到 ultra。
+- **B(主路径)**:用 `model/list` 的 `isDefault` 拿真实默认模型 → 主路径同样吃到 `cappedHighestEffort` 的封顶(v7 前曾到 ultra)。
 - **C(未知模型)**:**fail-loud**,不静默放行。
 - **D(全局白名单)**:删除全局 `VALID_REASONING_EFFORTS`;按模型 `supportedReasoningEfforts` 校验。
 - **N1(v4 地基错误,Codex+Gemini 一致 + 主线复现)**:解析层从 companion 下沉到 `codex.mjs` `runAppServerTurn` 回调内(唯一持 client 处),覆盖全部三入口。

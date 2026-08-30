@@ -10048,6 +10048,48 @@ def test_effort_policy_highest_known_effort_unknown_tier_fails_loud():
     assert r.stdout == "THREW:true"
 
 
+def test_effort_policy_capped_highest_effort_caps_at_max():
+    # A model whose ceiling is ultra (e.g. sol) must cap at "max" for --quality max.
+    r = _run_effort_policy(
+        "process.stdout.write(p.cappedHighestEffort(['low','high','xhigh','max','ultra']));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "max"
+
+
+def test_effort_policy_capped_highest_effort_degrades_gracefully_below_max():
+    # A model whose ceiling is already below "max" (e.g. only up to high) is unaffected by
+    # the cap -- unchanged from highestKnownEffort's own behavior.
+    r = _run_effort_policy(
+        "process.stdout.write(p.cappedHighestEffort(['low','high']));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "high"
+
+
+def test_effort_policy_capped_highest_effort_rejects_unknown_tier_before_capping():
+    # Codex review of the PR: an unknown tier alongside a known one (e.g. a protocol
+    # addition this plugin doesn't recognize yet) must fail loud, not be silently filtered
+    # out by the <= max cap before highestKnownEffort's own unknown-tier check ever runs --
+    # that would make a malformed/drifted model/list response look like a successful
+    # --quality max run at a silently downgraded tier.
+    r = _run_effort_policy(
+        "try{p.cappedHighestEffort(['low','hyper']);process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write('THREW:'+(e.message.includes('hyper')));}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW:true"
+
+
+def test_effort_policy_capped_highest_effort_empty_list_fails_loud():
+    r = _run_effort_policy(
+        "try{p.cappedHighestEffort([]);process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write('THREW');}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW"
+
+
 def test_effort_policy_validate_effort_accepts_supported():
     r = _run_effort_policy(
         "process.stdout.write(p.validateEffortForModel('ultra',['low','high','ultra']));"
@@ -10209,13 +10251,24 @@ def _run_resolver(args_js):
     )
 
 
-def test_resolver_max_sentinel_default_model_resolves_to_ultra():
-    # model=null -> isDefault sol -> highest = ultra (main-path fix for v3-refuted B).
+def test_resolver_max_sentinel_default_model_resolves_to_capped_max():
+    # model=null -> isDefault sol, which supports up to ultra. --quality max is capped at "max"
+    # (cappedHighestEffort in effort-policy.mjs) even though sol supports a higher tier -- ultra is
+    # reserved for an explicit --effort ultra request, never implied by --quality max. Previously
+    # asserted "ultra" here; changed by design decision, not a regression.
     r = _run_resolver("{models:" + _MODELS + ",requestedModel:null,effort:null,wantsHighestEffort:true}")
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
-    assert out["effort"] == "ultra"
+    assert out["effort"] == "max"
     assert out["warning"] is None
+
+
+def test_resolver_explicit_effort_ultra_still_reaches_ultra_on_sol():
+    # Ultra remains reachable, but only via an explicit --effort ultra request (never via
+    # --quality max's wantsHighestEffort sentinel, capped at "max" -- see the test above).
+    r = _run_resolver("{models:" + _MODELS + ",requestedModel:'gpt-5.6-sol',effort:'ultra',wantsHighestEffort:false}")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["effort"] == "ultra"
 
 
 def test_resolver_max_sentinel_luna_resolves_to_max():
@@ -10394,15 +10447,16 @@ def _marker_value(marker_text, key):
     return json.loads(matches[-1])
 
 
-def test_e2e_task_entrypoint_max_reaches_ultra(tmp_path):
+def test_e2e_task_entrypoint_max_reaches_capped_max(tmp_path):
     # Task path (executeTaskRun -> runAppServerTurn): --quality max sets wantsHighestEffort:true,
-    # effort:null. The wiring must query model/list, resolve sol's highest tier, and send `ultra`.
+    # effort:null. The wiring must query model/list and send the capped "max" tier -- not sol's
+    # actual ceiling of "ultra", which is reserved for an explicit --effort ultra request.
     result, marker = _run_turn_e2e(
         tmp_path,
         "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
     )
     assert result.returncode == 0, result.stderr
-    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+    assert _marker_value(marker, "TURN_EFFORT") == "max"
 
 
 def test_e2e_max_without_wants_highest_effort_does_not_reach_ultra(tmp_path):
@@ -10484,16 +10538,18 @@ _E2E_PAGINATED_APP_SERVER = (
 
 def test_e2e_model_list_pagination_follows_next_cursor(tmp_path):
     # CodeRabbit Major: model/list is paginated (limit/cursor/nextCursor per the codex MCP spec).
-    # The default (isDefault) model lives on page 2. The resolver must follow nextCursor to find it,
-    # otherwise --quality max sees "no default model" and cannot reach ultra. Reaching ultra proves
-    # the second page was fetched and merged.
+    # The default (isDefault) model lives on page 2, and its capability list here is
+    # [low, high, ultra] -- no "max" tier -- so --quality max caps at its own ceiling BELOW "max":
+    # "high" (ultra excluded by the cap, same as cappedHighestEffort's non-pagination behavior).
+    # Reaching "high" (rather than the failure path for "no default model") proves the second page
+    # was fetched and merged, otherwise --quality max would see "no default model" and fail loud.
     result, marker = _run_turn_e2e(
         tmp_path,
         "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
         server_js=_E2E_PAGINATED_APP_SERVER,
     )
     assert result.returncode == 0, result.stderr
-    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+    assert _marker_value(marker, "TURN_EFFORT") == "high"
     # The second page must actually have been requested with the opaque cursor from page 1.
     cursors = re.findall(r"^MODEL_LIST_CURSOR=(.+)$", marker, re.MULTILINE)
     assert json.loads(cursors[-1]) == "PAGE2", f"resolver did not page with nextCursor; cursors={cursors}"
@@ -10598,9 +10654,10 @@ _E2E_MALFORMED_PAGE_APP_SERVER = (
 def test_e2e_malformed_page_degrades_to_omit_not_authoritative(tmp_path):
     # Codex confirm-2 MEDIUM: a valid first page followed by a malformed page (missing `data`) must
     # NOT yield an authoritative partial list. Even though page 1 alone contains the isDefault sol
-    # model (which WOULD resolve to ultra), the malformed page 2 makes the listing unconfirmable, so
-    # the resolver must degrade to omit-for-all (effort null), not confidently route to ultra off a
-    # partial list. Reaching ultra here would prove the partial list was wrongly treated as complete.
+    # model (whose {low, ultra} capability list here WOULD resolve to "low" once capped at "max"),
+    # the malformed page 2 makes the listing unconfirmable, so the resolver must degrade to
+    # omit-for-all (effort null), not confidently route to "low" off a partial list. Reaching a
+    # non-null effort here would prove the partial list was wrongly treated as complete.
     result, marker = _run_turn_e2e(
         tmp_path,
         "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
@@ -10648,8 +10705,8 @@ def test_e2e_malformed_cursor_degrades_to_omit_not_authoritative(tmp_path):
     # Codex confirm-3 MEDIUM: nextCursor is declared `string | null`. A falsy non-null value (false,
     # 0, ...) is schema drift; the code must not treat it as clean termination and return the partial
     # page as authoritative. Only null/absent terminates; only a non-empty string continues; anything
-    # else -> unconfirmable -> omit-for-all. Reaching ultra here would prove the partial page was
-    # wrongly treated as a complete listing off a malformed cursor.
+    # else -> unconfirmable -> omit-for-all. Reaching a non-null effort here would prove the partial
+    # page was wrongly treated as a complete listing off a malformed cursor.
     result, marker = _run_turn_e2e(
         tmp_path,
         "{ prompt: 'hi', model: null, effort: null, wantsHighestEffort: true }",
@@ -10697,7 +10754,8 @@ def _run_command_e2e(tmp_path, import_and_call_js, need_git=False):
 def test_e2e_task_command_hop_preserves_wants_highest_effort(tmp_path):
     # Drives executeTaskRun (the task command's copy hop into runAppServerTurn) with a request that
     # carries wantsHighestEffort:true (what resolveQuality('max') + handleTask produce). If the hop
-    # drops the flag, turn/start gets null and this goes RED.
+    # drops the flag, turn/start gets null and this goes RED. The fixture's sol model supports up to
+    # ultra, but --quality max is capped at "max" (see cappedHighestEffort).
     call = (
         "await c.__testHooks.executeTaskRun({"
         "  cwd: WORK, model: null, effort: null, wantsHighestEffort: true,"
@@ -10706,12 +10764,12 @@ def test_e2e_task_command_hop_preserves_wants_highest_effort(tmp_path):
     )
     result, marker = _run_command_e2e(tmp_path, call)
     assert result.returncode == 0, result.stderr
-    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+    assert _marker_value(marker, "TURN_EFFORT") == "max"
 
 
 def test_e2e_task_command_hop_without_flag_omits_effort(tmp_path):
-    # Same path, wantsHighestEffort:false + effort:null -> omit (null). Anchors that the ultra above
-    # is caused by the flag, not by executeTaskRun hardcoding a tier.
+    # Same path, wantsHighestEffort:false + effort:null -> omit (null). Anchors that the capped max
+    # above is caused by the flag, not by executeTaskRun hardcoding a tier.
     call = (
         "await c.__testHooks.executeTaskRun({"
         "  cwd: WORK, model: null, effort: null, wantsHighestEffort: false,"
@@ -10725,7 +10783,9 @@ def test_e2e_task_command_hop_without_flag_omits_effort(tmp_path):
 
 def test_e2e_adversarial_review_command_hop_preserves_wants_highest_effort(tmp_path):
     # Drives executeReviewRun (adversarial) end to end: request.wantsHighestEffort must survive
-    # through buildAdversarialReviewTurnOptions into runAppServerTurn and reach turn/start as ultra.
+    # through buildAdversarialReviewTurnOptions into runAppServerTurn and reach turn/start as the
+    # capped "max" tier (the fixture's sol model supports up to ultra, but --quality max never
+    # auto-escalates past "max" -- see cappedHighestEffort).
     call = (
         "await c.__testHooks.executeReviewRun({"
         "  cwd: WORK, reviewName: 'Adversarial Review', model: null,"
@@ -10734,7 +10794,7 @@ def test_e2e_adversarial_review_command_hop_preserves_wants_highest_effort(tmp_p
     )
     result, marker = _run_command_e2e(tmp_path, call, need_git=True)
     assert result.returncode == 0, result.stderr
-    assert _marker_value(marker, "TURN_EFFORT") == "ultra"
+    assert _marker_value(marker, "TURN_EFFORT") == "max"
 
 
 # ===== §9 hard gate: model/list must be a declared method in the app-server protocol contract =====
