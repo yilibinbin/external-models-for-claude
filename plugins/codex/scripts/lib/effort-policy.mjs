@@ -45,6 +45,27 @@ export function highestKnownEffort(supported) {
     EFFORT_ORDER.indexOf(e) > EFFORT_ORDER.indexOf(best) ? e : best, supported[0]);
 }
 
+// The tier --quality max resolves to: the model's own ceiling when that ceiling is at or below "max"
+// (so a model without a "max" tier still degrades gracefully to whatever it does support, unchanged
+// from before), but never higher than "max" for a model that also supports "ultra" -- ultra is reserved
+// for an explicit --effort ultra request, not implied by --quality max. Fails loud (same policy as
+// highestKnownEffort) if the model supports nothing at or below "max".
+const MAX_QUALITY_EFFORT_CEILING = "max";
+
+export function cappedHighestEffort(supported) {
+  const ceilingIndex = EFFORT_ORDER.indexOf(MAX_QUALITY_EFFORT_CEILING);
+  const eligible = (Array.isArray(supported) ? supported : []).filter(
+    (e) => EFFORT_ORDER.includes(e) && EFFORT_ORDER.indexOf(e) <= ceilingIndex
+  );
+  if (!eligible.length) {
+    throw new Error(
+      `Model supports no reasoning effort at or below "${MAX_QUALITY_EFFORT_CEILING}" ` +
+      `(reported: ${(supported || []).join(", ") || "none"}); refusing to guess a tier for --quality max.`
+    );
+  }
+  return highestKnownEffort(eligible);
+}
+
 // The single session-time effort resolver (spec v6 §3.3/§3.4). Called inside runAppServerTurn's
 // withAppServer callback, the only layer holding the app-server client. Pure given its inputs:
 //   models             — the model/list `data` array, or null when model/list FAILED
@@ -99,7 +120,7 @@ export function resolveTurnEffort({ models, requestedModel, effort, wantsHighest
     return { effort: validateEffortForModel(effort, supported), warning: null };
   }
   if (wantsHighestEffort) {
-    return { effort: highestKnownEffort(supported), warning: null };
+    return { effort: cappedHighestEffort(supported), warning: null };
   }
   return { effort: null, warning: null };
 }

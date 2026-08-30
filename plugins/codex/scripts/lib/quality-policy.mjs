@@ -19,7 +19,9 @@ const POLICIES = {
   },
   max: {
     quality: "max",
-    // effort is resolved per-model at session time (highest tier the current model supports).
+    // effort is resolved per-model at session time, capped at the "max" tier (see
+    // effort-policy.mjs's cappedHighestEffort) -- a model that also supports "ultra" is not
+    // auto-escalated to it; ultra is reserved for an explicit --effort ultra request.
     // Kept null here so the sentinel object never reaches normalizeReasoningEffort/turn/start;
     // the highest-tier intent travels via the wantsHighestEffort boolean instead.
     effort: null,
