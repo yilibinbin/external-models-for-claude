@@ -53,14 +53,18 @@ export function highestKnownEffort(supported) {
 const MAX_QUALITY_EFFORT_CEILING = "max";
 
 export function cappedHighestEffort(supported) {
+  // Validate the FULL reported list, before filtering to the <= max cap -- an unknown tier
+  // anywhere makes the whole capability response untrustworthy (highestKnownEffort's own
+  // rationale), so filtering it out first would let a protocol drift or malformed response
+  // silently resolve to a downgraded known tier instead of failing loud. Caught by Codex
+  // review of the PR.
+  highestKnownEffort(supported);
   const ceilingIndex = EFFORT_ORDER.indexOf(MAX_QUALITY_EFFORT_CEILING);
-  const eligible = (Array.isArray(supported) ? supported : []).filter(
-    (e) => EFFORT_ORDER.includes(e) && EFFORT_ORDER.indexOf(e) <= ceilingIndex
-  );
+  const eligible = supported.filter((e) => EFFORT_ORDER.indexOf(e) <= ceilingIndex);
   if (!eligible.length) {
     throw new Error(
       `Model supports no reasoning effort at or below "${MAX_QUALITY_EFFORT_CEILING}" ` +
-      `(reported: ${(supported || []).join(", ") || "none"}); refusing to guess a tier for --quality max.`
+      `(reported: ${supported.join(", ")}); refusing to guess a tier for --quality max.`
     );
   }
   return highestKnownEffort(eligible);

@@ -10048,6 +10048,48 @@ def test_effort_policy_highest_known_effort_unknown_tier_fails_loud():
     assert r.stdout == "THREW:true"
 
 
+def test_effort_policy_capped_highest_effort_caps_at_max():
+    # A model whose ceiling is ultra (e.g. sol) must cap at "max" for --quality max.
+    r = _run_effort_policy(
+        "process.stdout.write(p.cappedHighestEffort(['low','high','xhigh','max','ultra']));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "max"
+
+
+def test_effort_policy_capped_highest_effort_degrades_gracefully_below_max():
+    # A model whose ceiling is already below "max" (e.g. only up to high) is unaffected by
+    # the cap -- unchanged from highestKnownEffort's own behavior.
+    r = _run_effort_policy(
+        "process.stdout.write(p.cappedHighestEffort(['low','high']));"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "high"
+
+
+def test_effort_policy_capped_highest_effort_rejects_unknown_tier_before_capping():
+    # Codex review of the PR: an unknown tier alongside a known one (e.g. a protocol
+    # addition this plugin doesn't recognize yet) must fail loud, not be silently filtered
+    # out by the <= max cap before highestKnownEffort's own unknown-tier check ever runs --
+    # that would make a malformed/drifted model/list response look like a successful
+    # --quality max run at a silently downgraded tier.
+    r = _run_effort_policy(
+        "try{p.cappedHighestEffort(['low','hyper']);process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write('THREW:'+(e.message.includes('hyper')));}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW:true"
+
+
+def test_effort_policy_capped_highest_effort_empty_list_fails_loud():
+    r = _run_effort_policy(
+        "try{p.cappedHighestEffort([]);process.stdout.write('NO_THROW');}"
+        "catch(e){process.stdout.write('THREW');}"
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "THREW"
+
+
 def test_effort_policy_validate_effort_accepts_supported():
     r = _run_effort_policy(
         "process.stdout.write(p.validateEffortForModel('ultra',['low','high','ultra']));"
