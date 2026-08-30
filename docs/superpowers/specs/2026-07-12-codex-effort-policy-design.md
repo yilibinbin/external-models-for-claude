@@ -152,7 +152,7 @@ export function validateEffortForModel(value, supported) {
 
 | 场景 | 当前模型 | `--quality max` → |
 |---|---|---|
-| model=null(默认) | isDefault=`gpt-5.6-sol` | **`ultra`**(主路径到顶,修好 v3 证伪 B) |
+| model=null(默认) | isDefault=`gpt-5.6-sol` | **`max`**(封顶于字面 max 档,v7 推翻含 ultra 的决策2;`ultra` 需显式 `--effort ultra`) |
 | 显式 `--model gpt-5.6-luna` | luna | `max` |
 | 显式 `--model gpt-5.5` | 5.5 | `xhigh` |
 | 显式未知模型 | — | **fail-loud**(不猜) |
@@ -162,9 +162,9 @@ export function validateEffortForModel(value, supported) {
 ## 4. 决策记录(三模型串行审阅收敛 + 用户产品决策)
 
 - **决策1 antigravity**:No touch, no bump。
-- **决策2 `--quality max`(用户已定)**:路由到该模型真·最高档,**含 `ultra`**(实测 ultra 不绕过 governor)。
+- **决策2 `--quality max`(v7 已推翻,见版本演进)**:~~路由到该模型真·最高档,含 `ultra`~~ → 封顶在字面 `max` 档;`ultra` 只保留给显式 `--effort ultra`。
 - **A(数组末项)**:**不盲取末项**,用显式 `EFFORT_ORDER` 取最强,未知档/空表 **fail-loud**。
-- **B(主路径)**:用 `model/list` 的 `isDefault` 拿真实默认模型 → 主路径也到 ultra。
+- **B(主路径)**:用 `model/list` 的 `isDefault` 拿真实默认模型 → 主路径同样吃到 `cappedHighestEffort` 的封顶(v7 前曾到 ultra)。
 - **C(未知模型)**:**fail-loud**,不静默放行。
 - **D(全局白名单)**:删除全局 `VALID_REASONING_EFFORTS`;按模型 `supportedReasoningEfforts` 校验。
 - **N1(v4 地基错误,Codex+Gemini 一致 + 主线复现)**:解析层从 companion 下沉到 `codex.mjs` `runAppServerTurn` 回调内(唯一持 client 处),覆盖全部三入口。
